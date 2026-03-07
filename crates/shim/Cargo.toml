@@ -1,0 +1,52 @@
+[package]
+name = "containerd-shim-cloudhv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "containerd shim for Cloud Hypervisor microVMs"
+
+[[bin]]
+name = "containerd-shim-cloudhv-v1"
+path = "src/main.rs"
+
+[dependencies]
+cloudhv-proto = { workspace = true }
+cloudhv-common = { workspace = true }
+
+# containerd shim protocol
+containerd-shim = { version = "0.10", features = ["async"] }
+containerd-shim-protos = "0.10"
+
+# Async runtime
+tokio = { workspace = true }
+
+# RPC
+ttrpc = { workspace = true }
+protobuf = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging
+log = { workspace = true }
+env_logger = { workspace = true }
+
+# System
+nix = { workspace = true }
+libc = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Unique IDs
+uuid = { version = "1", features = ["v4"] }
+
+# Async trait support
+async-trait = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

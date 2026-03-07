@@ -1,0 +1,31 @@
+#![allow(dead_code, unused_imports)]
+
+use std::sync::Arc;
+
+use containerd_shim::asynchronous::run;
+use containerd_shim::Config;
+use log::info;
+
+mod config;
+mod instance;
+mod vm;
+mod vsock;
+
+use instance::CloudHvShim;
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    info!(
+        "containerd-shim-cloudhv-v1 starting (version {})",
+        env!("CARGO_PKG_VERSION")
+    );
+
+    let config = Config {
+        no_reaper: false,
+        no_sub_reaper: false,
+        ..Default::default()
+    };
+
+    run::<CloudHvShim>("io.containerd.cloudhv.v1", Some(config)).await;
+}
