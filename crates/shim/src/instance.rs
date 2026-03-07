@@ -142,11 +142,7 @@ impl Task for CloudHvShim {
         Ok(resp)
     }
 
-    async fn kill(
-        &self,
-        _ctx: &TtrpcContext,
-        req: api::KillRequest,
-    ) -> TtrpcResult<api::Empty> {
+    async fn kill(&self, _ctx: &TtrpcContext, req: api::KillRequest) -> TtrpcResult<api::Empty> {
         let container_id = &req.id;
         info!("killing container: {} signal={}", container_id, req.signal);
 

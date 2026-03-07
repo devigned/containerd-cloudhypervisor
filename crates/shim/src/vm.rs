@@ -80,10 +80,7 @@ impl VmManager {
         tokio::fs::create_dir_all(&self.shared_dir)
             .await
             .with_context(|| {
-                format!(
-                    "failed to create shared dir: {}",
-                    self.shared_dir.display()
-                )
+                format!("failed to create shared dir: {}", self.shared_dir.display())
             })?;
         debug!("state directory prepared: {}", self.state_dir.display());
         Ok(())
@@ -98,10 +95,7 @@ impl VmManager {
         );
 
         let child = Command::new(&self.config.virtiofsd_binary)
-            .arg(format!(
-                "--socket-path={}",
-                self.virtiofsd_socket.display()
-            ))
+            .arg(format!("--socket-path={}", self.virtiofsd_socket.display()))
             .arg(format!("--shared-dir={}", self.shared_dir.display()))
             .arg("--cache=never")
             .arg("--sandbox=none")
@@ -201,7 +195,8 @@ impl VmManager {
         debug!("VM config: {}", config_json);
 
         // PUT /api/v1/vm.create
-        let create_resp = self.api_request("PUT", "/api/v1/vm.create", Some(&config_json))
+        let create_resp = self
+            .api_request("PUT", "/api/v1/vm.create", Some(&config_json))
             .await
             .context("failed to create VM")?;
         info!("VM create response: {}", create_resp);
@@ -274,12 +269,7 @@ impl VmManager {
     }
 
     /// Send an HTTP request to the Cloud Hypervisor API over Unix socket.
-    async fn api_request(
-        &self,
-        method: &str,
-        path: &str,
-        body: Option<&str>,
-    ) -> Result<String> {
+    async fn api_request(&self, method: &str, path: &str, body: Option<&str>) -> Result<String> {
         let mut stream = UnixStream::connect(&self.api_socket)
             .await
             .with_context(|| {
@@ -344,7 +334,11 @@ impl VmManager {
         }
 
         let response_str = String::from_utf8_lossy(&response).to_string();
-        debug!("CH API response ({} bytes): {}", response.len(), &response_str[..std::cmp::min(response_str.len(), 200)]);
+        debug!(
+            "CH API response ({} bytes): {}",
+            response.len(),
+            &response_str[..std::cmp::min(response_str.len(), 200)]
+        );
 
         // Parse HTTP status line
         let status_line = response_str.lines().next().unwrap_or("");
@@ -354,7 +348,7 @@ impl VmManager {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
-        if status_code >= 200 && status_code < 300 {
+        if (200..300).contains(&status_code) {
             debug!("API {method} {path} -> {status_code}");
             let body = response_str
                 .split("\r\n\r\n")
@@ -375,15 +369,15 @@ impl VmManager {
 
         // Try graceful shutdown via API
         if self.api_socket.exists() {
-            match self
-                .api_request("PUT", "/api/v1/vm.shutdown", None)
-                .await
-            {
+            match self.api_request("PUT", "/api/v1/vm.shutdown", None).await {
                 Ok(_) => {
                     info!("VM {} shutdown requested via API", self.vm_id);
                 }
                 Err(e) => {
-                    warn!("VM {} API shutdown failed: {}, killing process", self.vm_id, e);
+                    warn!(
+                        "VM {} API shutdown failed: {}, killing process",
+                        self.vm_id, e
+                    );
                 }
             }
         }

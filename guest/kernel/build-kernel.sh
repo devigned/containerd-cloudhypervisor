@@ -37,6 +37,15 @@ cd "${KERNEL_DIR}"
 if [ -f "../${CONFIG_FILE}" ]; then
     cp "../${CONFIG_FILE}" .config
     make olddefconfig
+    # Force-enable PVH boot support (required for Cloud Hypervisor direct kernel boot).
+    # The full dependency chain is: HYPERVISOR_GUEST -> PARAVIRT -> XEN -> XEN_PVH -> PVH
+    # olddefconfig may disable these if deps aren't fully specified in the config fragment.
+    scripts/config --enable HYPERVISOR_GUEST
+    scripts/config --enable PARAVIRT
+    scripts/config --enable XEN
+    scripts/config --enable XEN_PVH
+    scripts/config --enable PVH
+    make olddefconfig
 else
     echo "ERROR: Config file not found: ${CONFIG_FILE}"
     echo "Using Cloud Hypervisor's default config from the kernel tree"

@@ -14,6 +14,12 @@ pub struct AgentServer {
     container_manager: Arc<Mutex<ContainerManager>>,
 }
 
+impl Default for AgentServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AgentServer {
     pub fn new() -> Self {
         Self {
@@ -23,7 +29,10 @@ impl AgentServer {
 
     /// Start the ttrpc server and listen on vsock.
     pub async fn run(&self) -> Result<()> {
-        info!("starting agent ttrpc server on vsock port {}", AGENT_VSOCK_PORT);
+        info!(
+            "starting agent ttrpc server on vsock port {}",
+            AGENT_VSOCK_PORT
+        );
 
         // Bind to vsock
         // The guest-side vsock address is: AF_VSOCK, CID=VMADDR_CID_ANY(u32::MAX), port=10789
@@ -42,7 +51,7 @@ impl AgentServer {
         //       .register_service(health_service)
         //       .start_on_listener(listener)
 
-        let vsock_fd = create_vsock_listener(AGENT_VSOCK_PORT)?;
+        let _vsock_fd = create_vsock_listener(AGENT_VSOCK_PORT)?;
         info!("vsock listener created on port {}", AGENT_VSOCK_PORT);
 
         // TODO: Register ttrpc services and start server
@@ -71,9 +80,7 @@ impl AgentServer {
 /// Only available on Linux (AF_VSOCK).
 #[cfg(target_os = "linux")]
 fn create_vsock_listener(port: u32) -> Result<i32> {
-    use libc::{
-        bind, listen, socket, sockaddr_vm, AF_VSOCK, SOCK_STREAM, VMADDR_CID_ANY,
-    };
+    use libc::{bind, listen, sockaddr_vm, socket, AF_VSOCK, SOCK_STREAM, VMADDR_CID_ANY};
     use std::mem;
 
     unsafe {
@@ -117,6 +124,6 @@ fn create_vsock_listener(port: u32) -> Result<i32> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn create_vsock_listener(port: u32) -> Result<i32> {
+fn create_vsock_listener(_port: u32) -> Result<i32> {
     anyhow::bail!("vsock is only supported on Linux (AF_VSOCK)")
 }

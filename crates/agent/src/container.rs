@@ -30,6 +30,12 @@ pub struct ContainerManager {
     containers: HashMap<String, Container>,
 }
 
+impl Default for ContainerManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ContainerManager {
     pub fn new() -> Self {
         Self {
@@ -229,8 +235,8 @@ impl ContainerManager {
             anyhow::bail!("runc state failed: {}", stderr);
         }
 
-        let state: serde_json::Value = serde_json::from_slice(&output.stdout)
-            .context("failed to parse runc state output")?;
+        let state: serde_json::Value =
+            serde_json::from_slice(&output.stdout).context("failed to parse runc state output")?;
 
         state
             .as_object()

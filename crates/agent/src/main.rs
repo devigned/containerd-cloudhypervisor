@@ -47,7 +47,10 @@ fn init_setup() {
     }
 
     if let Err(e) = mount::mount_virtiofs() {
-        warn!("failed to mount virtio-fs (may not be available yet): {}", e);
+        warn!(
+            "failed to mount virtio-fs (may not be available yet): {}",
+            e
+        );
     }
 
     reaper::set_child_subreaper();

@@ -29,10 +29,8 @@ impl TestFixtures {
             "CLOUDHV_TEST_CH_BIN",
             PathBuf::from("/usr/local/bin/cloud-hypervisor"),
         );
-        let virtiofsd_binary = env_or_default(
-            "CLOUDHV_TEST_VFSD",
-            PathBuf::from("/usr/libexec/virtiofsd"),
-        );
+        let virtiofsd_binary =
+            env_or_default("CLOUDHV_TEST_VFSD", PathBuf::from("/usr/libexec/virtiofsd"));
 
         Some(TestFixtures {
             kernel_path,
@@ -84,9 +82,7 @@ impl TestFixtures {
 }
 
 fn env_or_default(var: &str, default: PathBuf) -> PathBuf {
-    std::env::var(var)
-        .map(PathBuf::from)
-        .unwrap_or(default)
+    std::env::var(var).map(PathBuf::from).unwrap_or(default)
 }
 
 fn project_root() -> PathBuf {
@@ -98,7 +94,10 @@ fn project_root() -> PathBuf {
 
     // If we're in a subcrate (crates/shim), go up to workspace root
     if manifest_dir.ends_with("crates/shim") {
-        manifest_dir.join("../..").canonicalize().unwrap_or(manifest_dir)
+        manifest_dir
+            .join("../..")
+            .canonicalize()
+            .unwrap_or(manifest_dir)
     } else {
         manifest_dir
     }

@@ -34,9 +34,8 @@ fn test_vm_boot_and_agent_health() {
         let vm_id = format!("test-vm-{}", std::process::id());
 
         eprintln!("=== Creating VM: {} ===", vm_id);
-        let mut vm =
-            containerd_shim_cloudhv::vm::VmManager::new(vm_id.clone(), config)
-                .expect("failed to create VmManager");
+        let mut vm = containerd_shim_cloudhv::vm::VmManager::new(vm_id.clone(), config)
+            .expect("failed to create VmManager");
 
         // Prepare state directory
         vm.prepare().await.expect("failed to prepare VM state");
@@ -77,13 +76,14 @@ fn test_vm_boot_and_agent_health() {
 
         // Test vsock connectivity (with timeout — guest agent may not be fully up)
         eprintln!("=== Testing vsock connectivity ===");
-        let vsock_client =
-            containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
+        let vsock_client = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
         match tokio::time::timeout(Duration::from_secs(5), vsock_client.health_check()).await {
             Ok(Ok(true)) => eprintln!("=== vsock health check: PASS ==="),
             Ok(Ok(false)) => eprintln!("=== vsock health check: agent not ready ==="),
             Ok(Err(e)) => eprintln!("=== vsock health check error: {} ===", e),
-            Err(_) => eprintln!("=== vsock health check timed out (5s) — agent may not be fully started ==="),
+            Err(_) => eprintln!(
+                "=== vsock health check timed out (5s) — agent may not be fully started ==="
+            ),
         }
 
         // Shutdown and cleanup
@@ -112,18 +112,15 @@ fn test_vm_state_directory_setup() {
         let config = fixtures.runtime_config();
         let vm_id = format!("test-state-{}", std::process::id());
 
-        let vm =
-            containerd_shim_cloudhv::vm::VmManager::new(vm_id.clone(), config)
-                .expect("failed to create VmManager");
+        let vm = containerd_shim_cloudhv::vm::VmManager::new(vm_id.clone(), config)
+            .expect("failed to create VmManager");
 
         // CID should be >= 3
         assert!(vm.cid() >= 3, "CID should be >= 3, got {}", vm.cid());
 
         // State dir should be under /run/cloudhv/<vm_id>
         assert!(
-            vm.state_dir()
-                .to_string_lossy()
-                .contains(&vm_id),
+            vm.state_dir().to_string_lossy().contains(&vm_id),
             "state dir should contain vm_id"
         );
 
@@ -153,14 +150,10 @@ fn test_unique_cid_allocation() {
     let config = fixtures.runtime_config();
 
     let vm1 =
-        containerd_shim_cloudhv::vm::VmManager::new("cid-test-1".into(), config.clone())
-            .unwrap();
+        containerd_shim_cloudhv::vm::VmManager::new("cid-test-1".into(), config.clone()).unwrap();
     let vm2 =
-        containerd_shim_cloudhv::vm::VmManager::new("cid-test-2".into(), config.clone())
-            .unwrap();
-    let vm3 =
-        containerd_shim_cloudhv::vm::VmManager::new("cid-test-3".into(), config)
-            .unwrap();
+        containerd_shim_cloudhv::vm::VmManager::new("cid-test-2".into(), config.clone()).unwrap();
+    let vm3 = containerd_shim_cloudhv::vm::VmManager::new("cid-test-3".into(), config).unwrap();
 
     assert_ne!(vm1.cid(), vm2.cid(), "VMs should get unique CIDs");
     assert_ne!(vm2.cid(), vm3.cid(), "VMs should get unique CIDs");
@@ -229,10 +222,7 @@ fn test_vm_config_json_generation() {
         parsed["memory"]["size"].as_u64().unwrap(),
         128 * 1024 * 1024
     );
-    assert_eq!(parsed["memory"]["shared"].as_bool().unwrap(), true);
+    assert!(parsed["memory"]["shared"].as_bool().unwrap());
     assert_eq!(parsed["vsock"]["cid"].as_u64().unwrap(), 3);
-    assert_eq!(
-        parsed["serial"]["mode"].as_str().unwrap(),
-        "Off"
-    );
+    assert_eq!(parsed["serial"]["mode"].as_str().unwrap(), "Off");
 }

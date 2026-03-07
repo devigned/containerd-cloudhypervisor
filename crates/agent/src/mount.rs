@@ -13,22 +13,50 @@ pub fn mount_essential_filesystems() -> Result<()> {
 
     info!("mounting essential filesystems");
 
-    let none: Option<&str> = None;
-
-    mount_if_needed("proc", "/proc", "proc", MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC)?;
-    mount_if_needed("sysfs", "/sys", "sysfs", MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC)?;
+    mount_if_needed(
+        "proc",
+        "/proc",
+        "proc",
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+    )?;
+    mount_if_needed(
+        "sysfs",
+        "/sys",
+        "sysfs",
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+    )?;
     mount_if_needed("devtmpfs", "/dev", "devtmpfs", MsFlags::MS_NOSUID)?;
 
     std::fs::create_dir_all("/dev/pts").ok();
-    mount_if_needed("devpts", "/dev/pts", "devpts", MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC)?;
+    mount_if_needed(
+        "devpts",
+        "/dev/pts",
+        "devpts",
+        MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
+    )?;
 
     std::fs::create_dir_all("/dev/shm").ok();
-    mount_if_needed("tmpfs", "/dev/shm", "tmpfs", MsFlags::MS_NOSUID | MsFlags::MS_NODEV)?;
+    mount_if_needed(
+        "tmpfs",
+        "/dev/shm",
+        "tmpfs",
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+    )?;
 
-    mount_if_needed("tmpfs", "/tmp", "tmpfs", MsFlags::MS_NOSUID | MsFlags::MS_NODEV)?;
+    mount_if_needed(
+        "tmpfs",
+        "/tmp",
+        "tmpfs",
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+    )?;
 
     std::fs::create_dir_all("/run").ok();
-    mount_if_needed("tmpfs", "/run", "tmpfs", MsFlags::MS_NOSUID | MsFlags::MS_NODEV)?;
+    mount_if_needed(
+        "tmpfs",
+        "/run",
+        "tmpfs",
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+    )?;
 
     std::fs::create_dir_all("/sys/fs/cgroup").ok();
     mount_if_needed(
@@ -69,9 +97,7 @@ pub fn mount_virtiofs() -> Result<()> {
         MsFlags::empty(),
         None::<&str>,
     )
-    .with_context(|| {
-        format!("failed to mount virtio-fs tag={VIRTIOFS_TAG} at {mount_point}")
-    })?;
+    .with_context(|| format!("failed to mount virtio-fs tag={VIRTIOFS_TAG} at {mount_point}"))?;
 
     info!("virtio-fs mounted at {}", mount_point);
     Ok(())
@@ -85,7 +111,12 @@ pub fn mount_virtiofs() -> Result<()> {
 
 /// Helper: mount a filesystem if the target is not already mounted.
 #[cfg(target_os = "linux")]
-fn mount_if_needed(source: &str, target: &str, fstype: &str, flags: nix::mount::MsFlags) -> Result<()> {
+fn mount_if_needed(
+    source: &str,
+    target: &str,
+    fstype: &str,
+    flags: nix::mount::MsFlags,
+) -> Result<()> {
     use nix::mount::mount;
 
     if is_mounted(target) {
