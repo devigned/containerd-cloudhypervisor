@@ -1,0 +1,14 @@
+[package]
+name = "cloudhv-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Protobuf/ttrpc service definitions for containerd-cloudhypervisor"
+
+[dependencies]
+ttrpc = { workspace = true }
+protobuf = { workspace = true }
+async-trait = "0.1"
+
+[build-dependencies]
+ttrpc-codegen = "0.6"

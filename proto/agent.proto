@@ -1,0 +1,145 @@
+syntax = "proto3";
+
+package cloudhv.agent;
+
+option go_package = "github.com/devigned/containerd-cloudhypervisor/proto";
+
+// AgentService handles container lifecycle inside the guest VM.
+// The host shim calls these methods over ttrpc/vsock.
+service AgentService {
+    // CreateContainer prepares a new container from an OCI bundle.
+    rpc CreateContainer(CreateContainerRequest) returns (CreateContainerResponse);
+
+    // StartContainer starts a previously created container.
+    rpc StartContainer(StartContainerRequest) returns (StartContainerResponse);
+
+    // KillContainer sends a signal to a running container.
+    rpc KillContainer(KillContainerRequest) returns (KillContainerResponse);
+
+    // DeleteContainer removes a stopped container and its resources.
+    rpc DeleteContainer(DeleteContainerRequest) returns (DeleteContainerResponse);
+
+    // WaitContainer blocks until the container exits and returns its exit status.
+    rpc WaitContainer(WaitContainerRequest) returns (WaitContainerResponse);
+
+    // ExecProcess starts a new process inside a running container.
+    rpc ExecProcess(ExecProcessRequest) returns (ExecProcessResponse);
+
+    // StateContainer returns the current state of a container.
+    rpc StateContainer(StateContainerRequest) returns (StateContainerResponse);
+}
+
+// HealthService provides health checking for the guest agent.
+service HealthService {
+    // Check returns whether the agent is ready to accept requests.
+    rpc Check(CheckRequest) returns (CheckResponse);
+}
+
+// --- CreateContainer ---
+
+message CreateContainerRequest {
+    string container_id = 1;
+    // OCI bundle path (relative to the shared virtio-fs mount)
+    string bundle_path = 2;
+    // Stdin/stdout/stderr paths
+    string stdin = 3;
+    string stdout = 4;
+    string stderr = 5;
+    // Terminal mode
+    bool terminal = 6;
+}
+
+message CreateContainerResponse {
+    uint32 pid = 1;
+}
+
+// --- StartContainer ---
+
+message StartContainerRequest {
+    string container_id = 1;
+}
+
+message StartContainerResponse {
+    uint32 pid = 1;
+}
+
+// --- KillContainer ---
+
+message KillContainerRequest {
+    string container_id = 1;
+    uint32 signal = 2;
+    bool all = 3;
+}
+
+message KillContainerResponse {}
+
+// --- DeleteContainer ---
+
+message DeleteContainerRequest {
+    string container_id = 1;
+}
+
+message DeleteContainerResponse {
+    uint32 exit_status = 1;
+    uint32 pid = 2;
+}
+
+// --- WaitContainer ---
+
+message WaitContainerRequest {
+    string container_id = 1;
+}
+
+message WaitContainerResponse {
+    uint32 exit_status = 1;
+    // Timestamp of exit in UTC (RFC 3339)
+    string exited_at = 2;
+}
+
+// --- ExecProcess ---
+
+message ExecProcessRequest {
+    string container_id = 1;
+    string exec_id = 2;
+    // OCI process spec as JSON
+    string spec_json = 3;
+    string stdin = 4;
+    string stdout = 5;
+    string stderr = 6;
+    bool terminal = 7;
+}
+
+message ExecProcessResponse {
+    uint32 pid = 1;
+}
+
+// --- StateContainer ---
+
+enum ContainerState {
+    UNKNOWN = 0;
+    CREATED = 1;
+    RUNNING = 2;
+    STOPPED = 3;
+    PAUSED = 4;
+}
+
+message StateContainerRequest {
+    string container_id = 1;
+}
+
+message StateContainerResponse {
+    string container_id = 1;
+    uint32 pid = 2;
+    ContainerState status = 3;
+    uint32 exit_status = 4;
+    string exited_at = 5;
+}
+
+// --- Health ---
+
+message CheckRequest {}
+
+message CheckResponse {
+    bool ready = 1;
+    string version = 2;
+}

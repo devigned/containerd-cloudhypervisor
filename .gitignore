@@ -1,0 +1,33 @@
+# Build artifacts
+/target/
+**/target/
+
+# Cargo lock for binaries is committed
+# Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build outputs
+*.o
+*.d
+*.img
+*.ext4
+vmlinux
+bzImage
+
+# Cloud Hypervisor runtime
+/run/
+
+# Guest build artifacts
+guest/kernel/linux-*/
+guest/rootfs/*.img
+guest/rootfs/rootfs/

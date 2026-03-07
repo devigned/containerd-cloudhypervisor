@@ -1,0 +1,187 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CH_VERSION: "v44.0"
+  KERNEL_VERSION: "6.12.8"
+
+jobs:
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings -A dead_code -A unused_imports
+
+  unit-test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Run unit tests
+        run: cargo test --workspace
+
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            package: containerd-shim-cloudhv
+            artifact: containerd-shim-cloudhv-v1
+          - target: x86_64-unknown-linux-musl
+            package: cloudhv-agent
+            artifact: cloudhv-agent
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release -p ${{ matrix.package }} --target ${{ matrix.target }}
+
+      - name: Binary info
+        run: |
+          BIN="target/${{ matrix.target }}/release/${{ matrix.artifact }}"
+          ls -lh "$BIN"
+          file "$BIN"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.artifact }}
+
+  integration-test:
+    name: Integration Tests (KVM)
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: integration
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            protobuf-compiler musl-tools \
+            flex bison libelf-dev bc \
+            virtiofsd
+
+      - name: Enable KVM
+        run: |
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
+            echo "KVM_AVAILABLE=true" >> "$GITHUB_ENV"
+            echo "KVM available"
+          else
+            echo "KVM_AVAILABLE=false" >> "$GITHUB_ENV"
+            echo "KVM not available - integration tests will be skipped"
+          fi
+
+      - name: Install Cloud Hypervisor
+        if: env.KVM_AVAILABLE == 'true'
+        run: |
+          wget -q "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${{ env.CH_VERSION }}/cloud-hypervisor-static" \
+            -O /tmp/cloud-hypervisor
+          sudo install -m 755 /tmp/cloud-hypervisor /usr/local/bin/cloud-hypervisor
+          cloud-hypervisor --version
+
+      - name: Download guest agent artifact
+        if: env.KVM_AVAILABLE == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: cloudhv-agent-x86_64-unknown-linux-musl
+          path: /tmp/agent
+
+      - name: Cache guest kernel
+        if: env.KVM_AVAILABLE == 'true'
+        id: kernel-cache
+        uses: actions/cache@v4
+        with:
+          path: guest/kernel/vmlinux
+          key: kernel-${{ env.KERNEL_VERSION }}-${{ hashFiles('guest/kernel/configs/microvm.config') }}
+
+      - name: Build guest kernel
+        if: env.KVM_AVAILABLE == 'true' && steps.kernel-cache.outputs.cache-hit != 'true'
+        run: |
+          cd guest/kernel
+          bash build-kernel.sh ${{ env.KERNEL_VERSION }}
+
+      - name: Verify guest kernel has PVH support
+        if: env.KVM_AVAILABLE == 'true'
+        run: |
+          readelf -n guest/kernel/vmlinux | grep -q Xen \
+            && echo "Kernel has PVH/Xen ELF notes" \
+            || echo "Warning: Kernel may lack PVH support"
+
+      - name: Build guest rootfs
+        if: env.KVM_AVAILABLE == 'true'
+        run: |
+          chmod +x /tmp/agent/cloudhv-agent
+          cd guest/rootfs
+          sudo bash build-rootfs.sh /tmp/agent/cloudhv-agent
+
+      - name: Run integration tests
+        if: env.KVM_AVAILABLE == 'true'
+        run: |
+          sudo -E env "PATH=$PATH" \
+            CLOUDHV_TEST_KERNEL="$PWD/guest/kernel/vmlinux" \
+            CLOUDHV_TEST_ROOTFS="$PWD/guest/rootfs/rootfs.ext4" \
+            CLOUDHV_TEST_CH_BIN="/usr/local/bin/cloud-hypervisor" \
+            CLOUDHV_TEST_VFSD="/usr/libexec/virtiofsd" \
+            cargo test -p containerd-shim-cloudhv --test integration -- --nocapture
+
+      - name: Skip notice
+        if: env.KVM_AVAILABLE != 'true'
+        run: echo "::warning::Integration tests skipped because KVM is not available on this runner"

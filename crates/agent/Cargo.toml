@@ -1,0 +1,39 @@
+[package]
+name = "cloudhv-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "In-VM guest agent for containerd-cloudhypervisor"
+
+[[bin]]
+name = "cloudhv-agent"
+path = "src/main.rs"
+
+[dependencies]
+cloudhv-proto = { workspace = true }
+cloudhv-common = { workspace = true }
+
+# Async runtime (single-threaded for minimal memory)
+tokio = { workspace = true }
+
+# RPC
+ttrpc = { workspace = true }
+protobuf = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging
+log = { workspace = true }
+env_logger = { workspace = true }
+
+# System
+nix = { workspace = true }
+libc = { workspace = true }
+
+# Time
+chrono = { workspace = true }
