@@ -52,8 +52,8 @@ impl TestFixtures {
         if !self.virtiofsd_binary.exists() {
             missing.push(format!("virtiofsd: {}", self.virtiofsd_binary.display()));
         }
-        if !Path::new("/dev/kvm").exists() {
-            missing.push("KVM: /dev/kvm".to_string());
+        if !Path::new("/dev/kvm").exists() && !Path::new("/dev/mshv").exists() {
+            missing.push("hypervisor: /dev/kvm or /dev/mshv".to_string());
         }
 
         missing
