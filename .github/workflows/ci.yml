@@ -177,13 +177,14 @@ jobs:
 
       - name: Run integration tests
         if: env.KVM_AVAILABLE == 'true'
+        timeout-minutes: 10
         run: |
           sudo -E env "PATH=$PATH" \
             CLOUDHV_TEST_KERNEL="$PWD/guest/kernel/vmlinux" \
             CLOUDHV_TEST_ROOTFS="$PWD/guest/rootfs/rootfs.ext4" \
             CLOUDHV_TEST_CH_BIN="/usr/local/bin/cloud-hypervisor" \
             CLOUDHV_TEST_VFSD="/usr/libexec/virtiofsd" \
-            cargo test -p containerd-shim-cloudhv --test integration -- --nocapture
+            cargo test -p containerd-shim-cloudhv --test integration -- --nocapture --test-threads=1
 
       - name: Skip notice
         if: env.KVM_AVAILABLE != 'true'

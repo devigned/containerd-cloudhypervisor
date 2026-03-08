@@ -101,17 +101,29 @@ impl VmPool {
         vm.create_and_boot_vm().await.context("failed to boot VM")?;
         vm.wait_for_agent().await.context("agent not ready")?;
 
+        // Retry ttrpc connect — the agent may need a moment after vsock socket appears
         let vsock_client = VsockClient::new(vm.vsock_socket());
-        let (agent, health) = vsock_client
-            .connect_ttrpc()
-            .await
-            .context("failed to connect ttrpc")?;
-
-        Ok(WarmVm {
-            vm,
-            agent,
-            _health: health,
-        })
+        let mut last_err = None;
+        for attempt in 1..=5 {
+            match vsock_client.connect_ttrpc().await {
+                Ok((agent, health)) => {
+                    info!("ttrpc connected on attempt {attempt}");
+                    return Ok(WarmVm {
+                        vm,
+                        agent,
+                        _health: health,
+                    });
+                }
+                Err(e) => {
+                    debug!("ttrpc connect attempt {attempt} failed: {e}");
+                    last_err = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| anyhow::anyhow!("ttrpc connect failed"))
+            .context("failed to connect ttrpc after 5 attempts"))
     }
 
     /// Refill the pool back to target size (call periodically or after acquire).
