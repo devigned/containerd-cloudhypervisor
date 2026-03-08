@@ -40,6 +40,23 @@ pub struct RuntimeConfig {
     /// Enable debug logging
     #[serde(default)]
     pub debug: bool,
+
+    /// Number of pre-warmed VMs in the pool (0 = no pooling)
+    #[serde(default = "default_pool_size")]
+    pub pool_size: usize,
+
+    /// Maximum containers per VM (1 = one container per VM)
+    #[serde(default = "default_max_containers_per_vm")]
+    pub max_containers_per_vm: usize,
+
+    /// Hotplug memory size in MiB (0 = no hotplug).
+    /// When set, VMs are created with this additional reservable memory.
+    #[serde(default = "default_hotplug_memory_mb")]
+    pub hotplug_memory_mb: u64,
+
+    /// Memory hotplug method: "acpi" (default) or "virtio-mem"
+    #[serde(default = "default_hotplug_method")]
+    pub hotplug_method: String,
 }
 
 fn default_ch_binary() -> String {
@@ -62,6 +79,18 @@ fn default_agent_timeout() -> u64 {
 }
 fn default_kernel_args() -> String {
     "console=hvc0 root=/dev/vda rw quiet".to_string()
+}
+fn default_pool_size() -> usize {
+    crate::DEFAULT_POOL_SIZE
+}
+fn default_max_containers_per_vm() -> usize {
+    crate::DEFAULT_MAX_CONTAINERS_PER_VM
+}
+fn default_hotplug_memory_mb() -> u64 {
+    crate::DEFAULT_HOTPLUG_MEMORY_MB
+}
+fn default_hotplug_method() -> String {
+    "acpi".to_string()
 }
 
 /// Cloud Hypervisor VM configuration (JSON sent to CH API)
@@ -105,6 +134,8 @@ pub struct VmMemory {
     pub shared: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hotplug_size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hotplug_method: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

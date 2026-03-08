@@ -8,6 +8,7 @@ use log::info;
 
 mod config;
 mod instance;
+mod pool;
 mod vm;
 mod vsock;
 

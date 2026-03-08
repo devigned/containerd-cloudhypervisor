@@ -77,6 +77,10 @@ impl TestFixtures {
             agent_startup_timeout_secs: 15,
             kernel_args: "console=hvc0 root=/dev/vda rw quiet".to_string(),
             debug: true,
+            pool_size: 0,
+            max_containers_per_vm: 1,
+            hotplug_memory_mb: 0,
+            hotplug_method: "acpi".to_string(),
         }
     }
 }

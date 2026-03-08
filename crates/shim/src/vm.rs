@@ -166,12 +166,21 @@ impl VmManager {
             },
             cpus: VmCpus {
                 boot_vcpus: self.config.default_vcpus,
-                max_vcpus: self.config.default_vcpus,
+                max_vcpus: std::cmp::max(self.config.default_vcpus, 4),
             },
             memory: VmMemory {
                 size: self.config.default_memory_mb * 1024 * 1024,
                 shared: true,
-                hotplug_size: None,
+                hotplug_size: if self.config.hotplug_memory_mb > 0 {
+                    Some(self.config.hotplug_memory_mb * 1024 * 1024)
+                } else {
+                    None
+                },
+                hotplug_method: if self.config.hotplug_method == "virtio-mem" {
+                    Some("VirtioMem".to_string())
+                } else {
+                    None
+                },
             },
             disks: vec![VmDisk {
                 path: self.config.rootfs_path.clone(),
@@ -361,6 +370,44 @@ impl VmManager {
             error!("Response body: {response_str}");
             anyhow::bail!("CH API error: {status_code} for {method} {path}: {response_str}")
         }
+    }
+
+    /// Resize VM resources (vCPUs and/or memory) via the CH API.
+    ///
+    /// Uses PUT /api/v1/vm.resize to dynamically adjust resources.
+    /// Only works if the VM was created with hotplug_size > 0.
+    pub async fn resize(
+        &self,
+        desired_vcpus: Option<u32>,
+        desired_memory_bytes: Option<u64>,
+    ) -> Result<()> {
+        let mut resize_body = serde_json::Map::new();
+        if let Some(vcpus) = desired_vcpus {
+            resize_body.insert(
+                "desired_vcpus".to_string(),
+                serde_json::Value::Number(vcpus.into()),
+            );
+        }
+        if let Some(mem) = desired_memory_bytes {
+            resize_body.insert(
+                "desired_ram".to_string(),
+                serde_json::Value::Number(mem.into()),
+            );
+        }
+
+        if resize_body.is_empty() {
+            return Ok(());
+        }
+
+        let body = serde_json::to_string(&serde_json::Value::Object(resize_body))?;
+        info!("resizing VM {}: {}", self.vm_id, body);
+
+        self.api_request("PUT", "/api/v1/vm.resize", Some(&body))
+            .await
+            .context("failed to resize VM")?;
+
+        info!("VM {} resized successfully", self.vm_id);
+        Ok(())
     }
 
     /// Shutdown the VM gracefully.

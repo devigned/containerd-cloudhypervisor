@@ -11,6 +11,7 @@ use containerd_shim_protos::ttrpc::r#async::TtrpcContext;
 use log::{debug, info};
 
 use crate::config::load_config;
+use crate::pool::VmPool;
 use crate::vm::VmManager;
 use crate::vsock::VsockClient;
 
@@ -39,6 +40,8 @@ pub struct CloudHvShim {
     vms: Arc<Mutex<HashMap<String, VmState>>>,
     /// Containers keyed by container ID, referencing their VM.
     containers: Arc<Mutex<HashMap<String, ContainerState>>>,
+    /// Pool of pre-warmed VMs for instant container start.
+    pool: Arc<tokio::sync::Mutex<VmPool>>,
 }
 
 #[async_trait]
@@ -46,10 +49,37 @@ impl Shim for CloudHvShim {
     type T = CloudHvShim;
 
     async fn new(_runtime_id: &str, _args: &Flags, _config: &mut Config) -> Self {
+        // Load config to initialize pool
+        let rt_config = load_config(None).unwrap_or_else(|_| {
+            // If config doesn't exist, use defaults (pool_size=0 means no pooling)
+            cloudhv_common::types::RuntimeConfig {
+                cloud_hypervisor_binary: cloudhv_common::DEFAULT_CH_BINARY.to_string(),
+                virtiofsd_binary: cloudhv_common::DEFAULT_VIRTIOFSD_BINARY.to_string(),
+                kernel_path: String::new(),
+                rootfs_path: String::new(),
+                default_vcpus: cloudhv_common::DEFAULT_VCPUS,
+                default_memory_mb: cloudhv_common::DEFAULT_MEMORY_MB,
+                vsock_port: cloudhv_common::AGENT_VSOCK_PORT,
+                agent_startup_timeout_secs: cloudhv_common::AGENT_STARTUP_TIMEOUT_SECS,
+                kernel_args: "console=hvc0 root=/dev/vda rw quiet".to_string(),
+                debug: false,
+                pool_size: 0,
+                max_containers_per_vm: 1,
+                hotplug_memory_mb: 0,
+                hotplug_method: "acpi".to_string(),
+            }
+        });
+
+        let mut pool = VmPool::new(rt_config);
+        if let Err(e) = pool.warm().await {
+            info!("VM pool warm failed (non-fatal): {e}");
+        }
+
         CloudHvShim {
             exit: Arc::new(ExitSignal::default()),
             vms: Arc::new(Mutex::new(HashMap::new())),
             containers: Arc::new(Mutex::new(HashMap::new())),
+            pool: Arc::new(tokio::sync::Mutex::new(pool)),
         }
     }
 
@@ -111,38 +141,23 @@ impl Task for CloudHvShim {
             containerd_shim_protos::ttrpc::Error::Others(format!("config error: {e}"))
         })?;
 
-        // For now, each container gets its own VM. The vm_id matches the container_id.
-        // Future: support VM reuse by looking up an existing VM first.
-        let vm_id = container_id.clone();
-
-        let mut vm = VmManager::new(vm_id.clone(), config).map_err(|e| {
-            containerd_shim_protos::ttrpc::Error::Others(format!("VM creation error: {e}"))
-        })?;
-
-        vm.prepare().await.map_err(|e| {
-            containerd_shim_protos::ttrpc::Error::Others(format!("VM prepare error: {e}"))
-        })?;
-
-        vm.start_virtiofsd().await.map_err(|e| {
-            containerd_shim_protos::ttrpc::Error::Others(format!("virtiofsd error: {e}"))
-        })?;
-
-        vm.start_vmm().await.map_err(|e| {
-            containerd_shim_protos::ttrpc::Error::Others(format!("VMM start error: {e}"))
-        })?;
-
-        vm.create_and_boot_vm().await.map_err(|e| {
-            containerd_shim_protos::ttrpc::Error::Others(format!("VM boot error: {e}"))
-        })?;
-
-        vm.wait_for_agent().await.map_err(|e| {
-            containerd_shim_protos::ttrpc::Error::Others(format!("agent not ready: {e}"))
-        })?;
-
-        let vsock_client = VsockClient::new(vm.vsock_socket());
-        let (agent, _health) = vsock_client.connect_ttrpc().await.map_err(|e| {
-            containerd_shim_protos::ttrpc::Error::Others(format!("ttrpc connect error: {e}"))
-        })?;
+        // Try to acquire a pre-warmed VM from the pool, otherwise create one
+        let (vm, agent) = {
+            let mut pool = self.pool.lock().await;
+            if let Some(warm) = pool.try_acquire() {
+                info!("acquired VM {} from pool", warm.vm.vm_id());
+                (warm.vm, warm.agent)
+            } else {
+                // No pool VM available — create on demand
+                let vm_id = container_id.clone();
+                let pool_ref = VmPool::new(config.clone());
+                let warm = pool_ref.create_warm_vm_with_id(vm_id).await.map_err(|e| {
+                    containerd_shim_protos::ttrpc::Error::Others(format!("VM creation error: {e}"))
+                })?;
+                (warm.vm, warm.agent)
+            }
+        };
+        let vm_id = vm.vm_id().to_string();
 
         // Set up I/O files in the virtio-fs shared directory
         let io_dir = vm.shared_dir().join("io").join(&container_id);

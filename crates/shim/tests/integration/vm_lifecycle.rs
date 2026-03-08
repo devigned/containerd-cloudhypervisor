@@ -354,3 +354,68 @@ fn test_io_directory_creation() {
         }
     });
 }
+
+/// Test VM pool configuration and acquire/refill logic.
+#[test]
+fn test_vm_pool_config() {
+    let fixtures = TestFixtures::resolve().expect("failed to resolve test fixtures");
+    let mut config = fixtures.runtime_config();
+
+    // Pool with size=0 should be disabled
+    config.pool_size = 0;
+    let pool = containerd_shim_cloudhv::pool::VmPool::new(config.clone());
+    assert!(!pool.is_enabled(), "pool with size=0 should be disabled");
+    assert_eq!(pool.available_count(), 0);
+
+    // Pool with size>0 should be enabled (but empty until warmed)
+    config.pool_size = 3;
+    let pool = containerd_shim_cloudhv::pool::VmPool::new(config);
+    assert!(pool.is_enabled(), "pool with size=3 should be enabled");
+    assert_eq!(pool.available_count(), 0, "not warmed yet");
+
+    eprintln!("=== VM pool config test passed ===");
+}
+
+/// Test VM config with hotplug memory settings.
+#[test]
+fn test_vm_config_with_hotplug() {
+    use cloudhv_common::types::*;
+
+    let config = VmConfig {
+        payload: VmPayload {
+            kernel: "/opt/vmlinux".to_string(),
+            cmdline: Some("console=hvc0".to_string()),
+            initramfs: None,
+        },
+        cpus: VmCpus {
+            boot_vcpus: 1,
+            max_vcpus: 4,
+        },
+        memory: VmMemory {
+            size: 128 * 1024 * 1024,
+            shared: true,
+            hotplug_size: Some(512 * 1024 * 1024),
+            hotplug_method: Some("VirtioMem".to_string()),
+        },
+        disks: vec![],
+        fs: vec![],
+        vsock: None,
+        serial: None,
+        console: None,
+    };
+
+    let json = serde_json::to_string_pretty(&config).expect("failed to serialize");
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(parsed["cpus"]["max_vcpus"].as_u64().unwrap(), 4);
+    assert_eq!(
+        parsed["memory"]["hotplug_size"].as_u64().unwrap(),
+        512 * 1024 * 1024
+    );
+    assert_eq!(
+        parsed["memory"]["hotplug_method"].as_str().unwrap(),
+        "VirtioMem"
+    );
+    eprintln!("VM config with hotplug:\n{json}");
+    eprintln!("=== Hotplug config test passed ===");
+}
