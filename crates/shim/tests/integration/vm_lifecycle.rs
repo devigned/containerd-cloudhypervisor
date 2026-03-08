@@ -674,3 +674,278 @@ fn test_pool_vs_cold_boot_timing() {
         }
     });
 }
+
+/// End-to-end benchmark: VM boot → ttrpc connect → container create → start → wait → delete → cleanup.
+///
+/// Measures the complete latency a user would experience from "create container"
+/// to "container exited", broken down into shim overhead, guest overhead, and
+/// container workload time.
+///
+/// Run with: sudo cargo test -p containerd-shim-cloudhv --test integration -- --nocapture test_e2e_container
+#[test]
+fn test_e2e_container_lifecycle_benchmark() {
+    let fixtures = TestFixtures::resolve().expect("failed to resolve test fixtures");
+    skip_if_missing!(fixtures);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let config = fixtures.runtime_config();
+        let vm_id = format!("e2e-bench-{}", std::process::id());
+
+        eprintln!("\n╔══════════════════════════════════════════════════════════╗");
+        eprintln!("║  End-to-End Container Lifecycle Benchmark               ║");
+        eprintln!("╚══════════════════════════════════════════════════════════╝");
+        let e2e_start = std::time::Instant::now();
+
+        // ── Phase 1: Boot VM ──────────────────────────────────────────
+        let phase1_start = std::time::Instant::now();
+        let pool = containerd_shim_cloudhv::pool::VmPool::new(config.clone());
+        let warm = match pool.create_warm_vm_with_id(vm_id.clone()).await {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("SKIPPING: VM boot failed (needs root + KVM): {e}");
+                return;
+            }
+        };
+        let vm_boot_time = phase1_start.elapsed();
+
+        let mut vm = warm.vm;
+        let agent = warm.agent;
+
+        eprintln!(
+            "  Phase 1 │ VM boot (full):                {:>9.1?}",
+            vm_boot_time
+        );
+
+        // ── Phase 2: ttrpc connect ────────────────────────────────────
+        // Already done by pool.create_warm_vm — measure a second connect for reference
+        let phase2_start = std::time::Instant::now();
+        let vsock_client = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
+        let ttrpc_ok = match tokio::time::timeout(
+            Duration::from_secs(10),
+            vsock_client.health_check(),
+        )
+        .await
+        {
+            Ok(Ok(true)) => true,
+            _ => false,
+        };
+        let ttrpc_connect_time = phase2_start.elapsed();
+        eprintln!(
+            "  Phase 2 │ ttrpc health check:            {:>9.1?} (ok={})",
+            ttrpc_connect_time, ttrpc_ok
+        );
+
+        // ── Phase 3: Create container via agent RPC ───────────────────
+        // Create a minimal OCI bundle in the shared dir
+        let container_id = format!("e2e-ctr-{}", std::process::id());
+        let bundle_dir = vm.shared_dir().join(&container_id);
+        std::fs::create_dir_all(bundle_dir.join("rootfs")).unwrap_or_default();
+
+        // Write a minimal OCI config.json
+        let oci_config = serde_json::json!({
+            "ociVersion": "1.0.2",
+            "process": {
+                "terminal": false,
+                "user": { "uid": 0, "gid": 0 },
+                "args": ["/bin/sh", "-c", "echo hello-from-microvm && sleep 0.1"],
+                "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+                "cwd": "/"
+            },
+            "root": { "path": "rootfs", "readonly": true },
+            "linux": { "namespaces": [{"type": "pid"}, {"type": "mount"}] }
+        });
+        std::fs::write(
+            bundle_dir.join("config.json"),
+            serde_json::to_string_pretty(&oci_config).unwrap(),
+        )
+        .expect("failed to write OCI config");
+
+        // I/O files
+        let io_dir = vm.shared_dir().join("io").join(&container_id);
+        std::fs::create_dir_all(&io_dir).unwrap_or_default();
+        let stdout_guest = format!(
+            "{}/io/{}/stdout",
+            cloudhv_common::VIRTIOFS_GUEST_MOUNT,
+            container_id
+        );
+        let stderr_guest = format!(
+            "{}/io/{}/stderr",
+            cloudhv_common::VIRTIOFS_GUEST_MOUNT,
+            container_id
+        );
+        let stdout_host = io_dir.join("stdout");
+
+        let phase3_start = std::time::Instant::now();
+        let mut create_req = cloudhv_proto::CreateContainerRequest::new();
+        create_req.container_id = container_id.clone();
+        create_req.bundle_path =
+            format!("{}/{}", cloudhv_common::VIRTIOFS_GUEST_MOUNT, container_id);
+        create_req.stdout = stdout_guest;
+        create_req.stderr = stderr_guest;
+        let ctx = ttrpc::context::with_timeout(30);
+        let create_result = agent.create_container(ctx, &create_req).await;
+        let create_time = phase3_start.elapsed();
+
+        match &create_result {
+            Ok(resp) => eprintln!(
+                "  Phase 3 │ CreateContainer RPC:          {:>9.1?} (pid={})",
+                create_time, resp.pid
+            ),
+            Err(e) => {
+                eprintln!(
+                    "  Phase 3 │ CreateContainer RPC:          {:>9.1?} (FAILED: {e})",
+                    create_time
+                );
+                eprintln!(
+                    "  Note: Container create requires runc + rootfs in guest. This is expected"
+                );
+                eprintln!(
+                    "  to fail in CI without a full container image. RPC path was exercised."
+                );
+            }
+        }
+
+        // ── Phase 4: Start container ──────────────────────────────────
+        let phase4_start = std::time::Instant::now();
+        if create_result.is_ok() {
+            let mut start_req = cloudhv_proto::StartContainerRequest::new();
+            start_req.container_id = container_id.clone();
+            let ctx = ttrpc::context::with_timeout(30);
+            match agent.start_container(ctx, &start_req).await {
+                Ok(resp) => eprintln!(
+                    "  Phase 4 │ StartContainer RPC:           {:>9.1?} (pid={})",
+                    phase4_start.elapsed(),
+                    resp.pid
+                ),
+                Err(e) => eprintln!(
+                    "  Phase 4 │ StartContainer RPC:           {:>9.1?} (FAILED: {e})",
+                    phase4_start.elapsed()
+                ),
+            }
+        } else {
+            eprintln!(
+                "  Phase 4 │ StartContainer RPC:           {:>9} (skipped — create failed)",
+                "—"
+            );
+        }
+        let start_time = phase4_start.elapsed();
+
+        // ── Phase 5: Wait for container exit ──────────────────────────
+        let phase5_start = std::time::Instant::now();
+        if create_result.is_ok() {
+            let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
+            wait_req.container_id = container_id.clone();
+            let ctx = ttrpc::context::with_timeout(30);
+            match tokio::time::timeout(
+                Duration::from_secs(10),
+                agent.wait_container(ctx, &wait_req),
+            )
+            .await
+            {
+                Ok(Ok(resp)) => eprintln!(
+                    "  Phase 5 │ WaitContainer RPC:            {:>9.1?} (exit={})",
+                    phase5_start.elapsed(),
+                    resp.exit_status
+                ),
+                Ok(Err(e)) => eprintln!(
+                    "  Phase 5 │ WaitContainer RPC:            {:>9.1?} (FAILED: {e})",
+                    phase5_start.elapsed()
+                ),
+                Err(_) => eprintln!(
+                    "  Phase 5 │ WaitContainer RPC:            {:>9.1?} (timeout)",
+                    phase5_start.elapsed()
+                ),
+            }
+        } else {
+            eprintln!(
+                "  Phase 5 │ WaitContainer RPC:            {:>9} (skipped)",
+                "—"
+            );
+        }
+        let wait_time = phase5_start.elapsed();
+
+        // ── Phase 6: Delete container ─────────────────────────────────
+        let phase6_start = std::time::Instant::now();
+        let mut del_req = cloudhv_proto::DeleteContainerRequest::new();
+        del_req.container_id = container_id.clone();
+        let ctx = ttrpc::context::with_timeout(10);
+        match agent.delete_container(ctx, &del_req).await {
+            Ok(resp) => eprintln!(
+                "  Phase 6 │ DeleteContainer RPC:          {:>9.1?} (exit={})",
+                phase6_start.elapsed(),
+                resp.exit_status
+            ),
+            Err(e) => eprintln!(
+                "  Phase 6 │ DeleteContainer RPC:          {:>9.1?} ({e})",
+                phase6_start.elapsed()
+            ),
+        }
+        let delete_time = phase6_start.elapsed();
+
+        // ── Phase 7: Read stdout ──────────────────────────────────────
+        if stdout_host.exists() {
+            match std::fs::read_to_string(&stdout_host) {
+                Ok(output) if !output.is_empty() => {
+                    eprintln!(
+                        "  Phase 7 │ Container stdout:              \"{}\"",
+                        output.trim()
+                    );
+                }
+                _ => eprintln!("  Phase 7 │ Container stdout:              (empty)"),
+            }
+        } else {
+            eprintln!("  Phase 7 │ Container stdout:              (no file)");
+        }
+
+        // ── Phase 8: Cleanup VM ───────────────────────────────────────
+        let phase8_start = std::time::Instant::now();
+        vm.cleanup().await.expect("cleanup failed");
+        let cleanup_time = phase8_start.elapsed();
+        eprintln!(
+            "  Phase 8 │ VM shutdown + cleanup:         {:>9.1?}",
+            cleanup_time
+        );
+
+        // ── Summary ───────────────────────────────────────────────────
+        let e2e_total = e2e_start.elapsed();
+        let shim_overhead =
+            ttrpc_connect_time + create_time + start_time + delete_time + cleanup_time;
+        let guest_overhead = vm_boot_time;
+        let workload_time = wait_time;
+
+        eprintln!("  ─────────┼──────────────────────────────────────────");
+        eprintln!(
+            "  Total    │ End-to-end:                  {:>9.1?}",
+            e2e_total
+        );
+        eprintln!(
+            "           │ VM boot (guest):             {:>9.1?} ({:.0}%)",
+            guest_overhead,
+            pct(guest_overhead, e2e_total)
+        );
+        eprintln!(
+            "           │ Shim/RPC overhead:           {:>9.1?} ({:.0}%)",
+            shim_overhead,
+            pct(shim_overhead, e2e_total)
+        );
+        eprintln!(
+            "           │ Workload (container run):    {:>9.1?} ({:.0}%)",
+            workload_time,
+            pct(workload_time, e2e_total)
+        );
+        eprintln!("╚══════════════════════════════════════════════════════════╝\n");
+    });
+}
+
+fn pct(part: Duration, total: Duration) -> f64 {
+    if total.as_nanos() == 0 {
+        0.0
+    } else {
+        part.as_secs_f64() / total.as_secs_f64() * 100.0
+    }
+}
