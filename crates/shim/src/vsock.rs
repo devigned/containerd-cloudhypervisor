@@ -1,4 +1,3 @@
-use std::os::unix::io::IntoRawFd;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -81,6 +80,7 @@ impl VsockClient {
 
     /// Send a health check to the guest agent via ttrpc.
     /// Returns true if the agent is healthy and responding.
+    #[allow(dead_code)]
     pub async fn health_check(&self) -> Result<bool> {
         match self.connect_ttrpc().await {
             Ok((_agent, health)) => {

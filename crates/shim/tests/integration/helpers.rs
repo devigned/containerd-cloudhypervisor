@@ -1,9 +1,7 @@
-#![allow(dead_code, unused_imports, unused_macros)]
-
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Test fixture paths, resolved from env vars or project defaults.
+#[allow(dead_code)]
 pub struct TestFixtures {
     pub kernel_path: PathBuf,
     pub rootfs_path: PathBuf,
@@ -14,6 +12,7 @@ pub struct TestFixtures {
 
 impl TestFixtures {
     /// Resolve test fixture paths. Returns None if essential fixtures are missing.
+    #[allow(dead_code)]
     pub fn resolve() -> Option<Self> {
         let project_root = project_root();
 
@@ -42,6 +41,7 @@ impl TestFixtures {
     }
 
     /// Check that all required files exist. Returns a list of missing items.
+    #[allow(dead_code)]
     pub fn check_prerequisites(&self) -> Vec<String> {
         let mut missing = Vec::new();
 
@@ -65,6 +65,7 @@ impl TestFixtures {
     }
 
     /// Build a RuntimeConfig suitable for testing.
+    #[allow(dead_code)]
     pub fn runtime_config(&self) -> cloudhv_common::types::RuntimeConfig {
         cloudhv_common::types::RuntimeConfig {
             cloud_hypervisor_binary: self.ch_binary.to_string_lossy().to_string(),
@@ -86,10 +87,12 @@ impl TestFixtures {
     }
 }
 
+#[allow(dead_code)]
 fn env_or_default(var: &str, default: PathBuf) -> PathBuf {
     std::env::var(var).map(PathBuf::from).unwrap_or(default)
 }
 
+#[allow(dead_code)]
 fn project_root() -> PathBuf {
     // CARGO_MANIFEST_DIR points to crates/shim/ for this crate.
     // The workspace root is two levels up.

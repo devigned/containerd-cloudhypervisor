@@ -1,4 +1,6 @@
-use log::{debug, warn};
+use log::debug;
+#[cfg(target_os = "linux")]
+use log::warn;
 
 /// Set this process as a child subreaper.
 #[cfg(target_os = "linux")]
@@ -41,6 +43,7 @@ pub extern "C" fn sigchld_handler(_signal: libc::c_int) {
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 pub extern "C" fn sigchld_handler(_signal: libc::c_int) {
     // no-op on non-Linux
 }

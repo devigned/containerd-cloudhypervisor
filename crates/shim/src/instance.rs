@@ -13,7 +13,6 @@ use log::{debug, info};
 use crate::config::load_config;
 use crate::pool::VmPool;
 use crate::vm::VmManager;
-use crate::vsock::VsockClient;
 
 /// A running VM that may host multiple containers.
 struct VmState {
@@ -27,9 +26,9 @@ struct ContainerState {
     vm_id: String,
     pid: Option<u32>,
     exit_code: Option<u32>,
-    exited_at: Option<chrono::DateTime<Utc>>,
-    stdout_path: Option<std::path::PathBuf>,
-    stderr_path: Option<std::path::PathBuf>,
+    _exited_at: Option<chrono::DateTime<Utc>>,
+    _stdout_path: Option<std::path::PathBuf>,
+    _stderr_path: Option<std::path::PathBuf>,
 }
 
 /// The Cloud Hypervisor containerd shim implementation.
@@ -211,9 +210,9 @@ impl Task for CloudHvShim {
                 vm_id,
                 pid: Some(create_resp.pid),
                 exit_code: None,
-                exited_at: None,
-                stdout_path: Some(stdout_host_path),
-                stderr_path: Some(stderr_host_path),
+                _exited_at: None,
+                _stdout_path: Some(stdout_host_path),
+                _stderr_path: Some(stderr_host_path),
             },
         );
 

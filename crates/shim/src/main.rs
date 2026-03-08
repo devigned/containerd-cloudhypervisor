@@ -1,7 +1,3 @@
-#![allow(dead_code, unused_imports)]
-
-use std::sync::Arc;
-
 use containerd_shim::asynchronous::run;
 use containerd_shim::Config;
 use log::info;

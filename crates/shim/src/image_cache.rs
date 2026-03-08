@@ -18,6 +18,7 @@ use log::{debug, info};
 /// Guest layout:
 ///   /containers/layers/<digest>/     — mounted via virtio-fs
 ///   /containers/<container_id>/      — overlayfs: layers + writable upper
+#[allow(dead_code)]
 pub struct ImageLayerCache {
     /// Base directory for cached layers on the host.
     cache_dir: PathBuf,
@@ -38,6 +39,7 @@ impl ImageLayerCache {
     }
 
     /// Create from the default state directory.
+    #[allow(dead_code)]
     pub fn default_cache() -> Self {
         Self::new(PathBuf::from(cloudhv_common::RUNTIME_STATE_DIR).join("layers"))
     }
@@ -46,6 +48,7 @@ impl ImageLayerCache {
     ///
     /// If the layer is already cached, increments its reference count.
     /// If not, creates the directory (caller must populate it).
+    #[allow(dead_code)]
     pub fn ensure_layer(&mut self, digest: &str) -> Result<PathBuf> {
         if let Some(path) = self.layers.get(digest) {
             *self.refcounts.entry(digest.to_string()).or_insert(0) += 1;
@@ -67,6 +70,7 @@ impl ImageLayerCache {
     }
 
     /// Release a reference to a layer. Removes from disk when refcount reaches 0.
+    #[allow(dead_code)]
     pub fn release_layer(&mut self, digest: &str) {
         if let Some(count) = self.refcounts.get_mut(digest) {
             *count = count.saturating_sub(1);
@@ -83,21 +87,25 @@ impl ImageLayerCache {
     }
 
     /// Check if a layer is already cached.
+    #[allow(dead_code)]
     pub fn is_cached(&self, digest: &str) -> bool {
         self.layers.contains_key(digest)
     }
 
     /// Get the host path for a cached layer.
+    #[allow(dead_code)]
     pub fn layer_path(&self, digest: &str) -> Option<&Path> {
         self.layers.get(digest).map(|p| p.as_path())
     }
 
     /// Number of cached layers.
+    #[allow(dead_code)]
     pub fn cached_count(&self) -> usize {
         self.layers.len()
     }
 
     /// Clean up all cached layers.
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         info!("clearing image layer cache ({} layers)", self.layers.len());
         for (_, path) in self.layers.drain() {
@@ -109,6 +117,7 @@ impl ImageLayerCache {
 
 /// Sanitize a digest string for use as a directory name.
 /// Replaces ':' with '_' (e.g., "sha256:abc123" -> "sha256_abc123").
+#[allow(dead_code)]
 fn sanitize_digest(digest: &str) -> String {
     digest.replace(':', "_")
 }

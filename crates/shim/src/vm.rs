@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -433,6 +432,7 @@ impl VmManager {
     ///
     /// Uses PUT /api/v1/vm.resize to dynamically adjust resources.
     /// Only works if the VM was created with hotplug_size > 0.
+    #[allow(dead_code)]
     pub async fn resize(
         &self,
         desired_vcpus: Option<u32>,
@@ -471,6 +471,7 @@ impl VmManager {
     ///
     /// The VM must be paused first. Creates config.json, memory-ranges,
     /// and state.json in the destination directory.
+    #[allow(dead_code)]
     pub async fn snapshot(&self, destination_dir: &Path) -> Result<()> {
         info!(
             "snapshotting VM {} to {}",
@@ -504,6 +505,7 @@ impl VmManager {
     ///
     /// Creates a new VM from the saved state. The VM starts in a paused
     /// state and must be resumed with resume().
+    #[allow(dead_code)]
     pub async fn restore(api_socket: &Path, source_dir: &Path) -> Result<()> {
         info!("restoring VM from {}", source_dir.display());
 
@@ -536,6 +538,7 @@ impl VmManager {
     }
 
     /// Resume a paused VM (used after snapshot or restore).
+    #[allow(dead_code)]
     pub async fn resume(&self) -> Result<()> {
         self.api_request("PUT", "/api/v1/vm.resume", None)
             .await
@@ -548,6 +551,7 @@ impl VmManager {
     ///
     /// The destination CH must be running and have called receive_migration.
     /// Transport: "unix:/path/to/socket" for same-host, "tcp:host:port" for remote.
+    #[allow(dead_code)]
     pub async fn send_migration(&self, transport_uri: &str, local: bool) -> Result<()> {
         info!("sending VM {} migration to {}", self.vm_id, transport_uri);
 
@@ -570,6 +574,7 @@ impl VmManager {
     }
 
     /// Prepare to receive a VM via live migration.
+    #[allow(dead_code)]
     pub async fn receive_migration(api_socket: &Path, transport_uri: &str) -> Result<()> {
         info!("preparing to receive migration on {}", transport_uri);
 
@@ -671,6 +676,7 @@ impl VmManager {
         &self.shared_dir
     }
 
+    #[allow(dead_code)]
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
     }

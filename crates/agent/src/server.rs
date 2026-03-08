@@ -1,11 +1,10 @@
-use std::os::unix::io::FromRawFd;
 use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use cloudhv_proto::generated::agent::*;
 use cloudhv_proto::generated::agent_ttrpc::{self, AgentService, HealthService};
-use log::{debug, error, info};
+use log::{debug, info};
 use tokio::signal::unix::{signal, SignalKind};
 use ttrpc::r#async::TtrpcContext;
 

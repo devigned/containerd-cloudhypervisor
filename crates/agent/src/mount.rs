@@ -1,6 +1,11 @@
-use anyhow::{Context, Result};
-use log::{debug, error, info, warn};
+#[cfg(target_os = "linux")]
+use anyhow::Context;
+use anyhow::Result;
+#[cfg(target_os = "linux")]
+use log::debug;
+use log::info;
 
+#[cfg(target_os = "linux")]
 use cloudhv_common::{VIRTIOFS_GUEST_MOUNT, VIRTIOFS_TAG};
 
 /// Mount essential filesystems for a minimal init environment.
@@ -9,7 +14,7 @@ use cloudhv_common::{VIRTIOFS_GUEST_MOUNT, VIRTIOFS_TAG};
 /// Only available on Linux.
 #[cfg(target_os = "linux")]
 pub fn mount_essential_filesystems() -> Result<()> {
-    use nix::mount::{mount, MsFlags};
+    use nix::mount::MsFlags;
 
     info!("mounting essential filesystems");
 

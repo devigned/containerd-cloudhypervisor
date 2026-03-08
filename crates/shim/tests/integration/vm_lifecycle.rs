@@ -3,7 +3,6 @@
 //! These tests boot real Cloud Hypervisor VMs with a minimal guest kernel
 //! and rootfs containing the cloudhv-agent.
 
-use std::path::Path;
 use std::time::Duration;
 
 use crate::helpers::TestFixtures;

@@ -12,7 +12,7 @@ use crate::vsock::VsockClient;
 pub struct WarmVm {
     pub vm: VmManager,
     pub agent: cloudhv_proto::AgentServiceClient,
-    pub health: cloudhv_proto::HealthServiceClient,
+    pub _health: cloudhv_proto::HealthServiceClient,
 }
 
 /// Pool of pre-warmed Cloud Hypervisor VMs for instant container start.
@@ -107,10 +107,15 @@ impl VmPool {
             .await
             .context("failed to connect ttrpc")?;
 
-        Ok(WarmVm { vm, agent, health })
+        Ok(WarmVm {
+            vm,
+            agent,
+            _health: health,
+        })
     }
 
     /// Refill the pool back to target size (call periodically or after acquire).
+    #[allow(dead_code)]
     pub async fn refill(&mut self) {
         while self.available.len() < self.target_size {
             match self.create_warm_vm().await {
@@ -127,6 +132,7 @@ impl VmPool {
     }
 
     /// Shut down and clean up all VMs in the pool.
+    #[allow(dead_code)]
     pub async fn drain(&mut self) {
         info!("draining VM pool ({} VMs)", self.available.len());
         while let Some(mut warm) = self.available.pop_front() {
@@ -135,11 +141,13 @@ impl VmPool {
     }
 
     /// Number of available VMs in the pool.
+    #[allow(dead_code)]
     pub fn available_count(&self) -> usize {
         self.available.len()
     }
 
     /// Whether pooling is enabled.
+    #[allow(dead_code)]
     pub fn is_enabled(&self) -> bool {
         self.target_size > 0
     }

@@ -1,5 +1,3 @@
-#![allow(dead_code, unused_imports)]
-
 use log::{error, info, warn};
 use nix::unistd::getpid;
 

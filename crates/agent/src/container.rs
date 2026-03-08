@@ -1,9 +1,9 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
-use log::{debug, error, info};
+use log::{error, info};
 use tokio::process::Command;
 
 use cloudhv_common::VIRTIOFS_GUEST_MOUNT;
@@ -11,13 +11,13 @@ use cloudhv_common::VIRTIOFS_GUEST_MOUNT;
 /// Tracks the state of a container managed by the agent.
 #[derive(Debug)]
 struct Container {
-    id: String,
-    bundle_path: PathBuf,
+    _id: String,
+    _bundle_path: PathBuf,
     pid: Option<u32>,
     exit_code: Option<i32>,
     state: ContainerState,
-    stdout_path: Option<PathBuf>,
-    stderr_path: Option<PathBuf>,
+    _stdout_path: Option<PathBuf>,
+    _stderr_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -118,13 +118,13 @@ impl ContainerManager {
         let pid = self.get_container_pid(container_id).await?;
 
         let container = Container {
-            id: container_id.to_string(),
-            bundle_path: bundle,
+            _id: container_id.to_string(),
+            _bundle_path: bundle,
             pid: Some(pid),
             exit_code: None,
             state: ContainerState::Created,
-            stdout_path: stdout_path.map(PathBuf::from),
-            stderr_path: stderr_path.map(PathBuf::from),
+            _stdout_path: stdout_path.map(PathBuf::from),
+            _stderr_path: stderr_path.map(PathBuf::from),
         };
 
         self.containers.insert(container_id.to_string(), container);
