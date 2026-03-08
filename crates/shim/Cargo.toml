@@ -50,3 +50,8 @@ async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "vm_overhead"
+harness = false
