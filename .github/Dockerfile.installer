@@ -5,6 +5,10 @@
 
 FROM debian:bookworm-slim
 
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY opt/cloudhv/ /opt/cloudhv/
 
 RUN chmod +x /opt/cloudhv/containerd-shim-cloudhv-v1 \
