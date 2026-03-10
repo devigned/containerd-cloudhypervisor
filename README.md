@@ -9,11 +9,12 @@ that runs container workloads inside lightweight microVMs with maximum density a
 
 Choose this shim when you are building a **platform** where you control the stack and need:
 
-- **Fast cold start** — ~460ms sandbox boot + container start on 8-vCPU host
+- **Fast cold start** — ~460ms full boot, or **~55ms from snapshot restore** with pre-warmed pool
 - **VM isolation** — each pod runs in its own Cloud Hypervisor microVM with dedicated kernel
 - **Block device rootfs** — container images delivered as hot-plugged virtio-blk disks (no FUSE)
 - **Dual hypervisor support** — same binary runs on KVM (Linux) and MSHV (Azure/Hyper-V)
 - **Multi-container pods** — mount + PID namespace isolation within the VM
+- **Snapshot restore** — golden VM snapshots for ~55ms restore (vs ~460ms cold boot)
 - **Pod networking** — transparent CNI integration via TAP + TC redirect
 
 This is ideal for serverless/FaaS platforms, container-as-a-service offerings, and security-sensitive
@@ -33,7 +34,7 @@ Choose [Kata Containers](https://katacontainers.io/) when:
 
 | | containerd-cloudhypervisor | Kata Containers |
 | --- | --- | --- |
-| **Cold start** | ~460ms (VM boot + container start) | ~500ms–1s |
+| **Cold start** | ~460ms boot, ~55ms snapshot restore | ~500ms–1s |
 | **Shim binary** | 2.4 MB | ~50 MB |
 | **Agent binary** | 1.5 MB (static) | ~20 MB |
 | **Hypervisors** | Cloud Hypervisor only | CH, QEMU, Firecracker |
@@ -46,6 +47,8 @@ Choose [Kata Containers](https://katacontainers.io/) when:
 
 Measured on Azure D8s_v5 (KVM, 8 vCPU):
 
+### Cold Boot (full VM boot)
+
 | Phase | Latency |
 | ------- | --------- |
 | VM boot (sandbox) | **257ms** |
@@ -53,6 +56,19 @@ Measured on Azure D8s_v5 (KVM, 8 vCPU):
 | Container start (crun run) | **145ms** |
 | **Total cold start** | **~460ms** |
 | Sandbox stop + cleanup | **92ms** |
+
+### Snapshot Restore (pre-warmed pool)
+
+| Phase | Latency |
+| ------- | --------- |
+| Golden snapshot creation (one-time) | **~170ms** |
+| VM restore from snapshot | **~55ms** |
+| Network hot-add (post-restore) | **~50ms** |
+| **Total restore + networking** | **~105ms** |
+
+The golden snapshot is created lazily on first use and reused for all
+subsequent restores. It captures a fully-booted VM with the agent running,
+so restored VMs skip kernel boot and agent initialization entirely.
 
 | Resource | Overhead |
 | ---------- | ---------- |
@@ -143,6 +159,23 @@ Infrastructure errors (VM boot failures, API errors, disk hot-plug issues) are l
 via the shim's own logger and appear in the containerd log (`journalctl -u containerd`),
 keeping operator diagnostics separate from application output.
 
+### Snapshot/Restore
+
+The `SnapshotManager` captures a **golden snapshot** of a fully-booted VM (kernel up,
+agent running) and restores copies in ~55ms instead of cold-booting (~460ms):
+
+1. **Golden snapshot creation** (one-time, ~170ms): boot a minimal VM (disk + vsock,
+   no virtiofs), verify agent health, pause, snapshot to disk, shut down
+2. **Restore** (~55ms): start new CH process, restore from snapshot with per-instance
+   config.json (rewritten vsock paths, symlinked memory file), resume
+3. **Post-restore networking** (~50ms): hot-add virtio-net via `vm.add-net` API
+
+The golden snapshot excludes virtiofs because the vhost-user protocol state cannot
+reconnect to a fresh virtiofsd after restore. Container operations that need the
+shared directory (disk image hot-plug, I/O file forwarding) use full VM boot.
+The VM pool uses snapshot restore when a golden snapshot is available, falling back
+to cold boot transparently.
+
 ### Components
 
 - **Host shim** (`containerd-shim-cloudhv-v1`): containerd shim v2, manages VM lifecycle,
@@ -165,6 +198,7 @@ keeping operator diagnostics separate from application output.
 - **Block device rootfs**: Hot-plugged virtio-blk disks via CH `vm.add-disk` API
 - **Multi-container per VM**: Mount + PID namespace isolation per container
 - **Pod networking**: TAP + TC redirect with kernel IP_PNP — zero guest userspace networking
+- **Snapshot/restore**: Golden VM snapshots for ~55ms restore; pool warming from snapshots
 
 ### Security
 

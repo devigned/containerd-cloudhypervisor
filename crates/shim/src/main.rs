@@ -6,6 +6,7 @@ mod hypervisor;
 mod image_cache;
 mod instance;
 mod pool;
+mod snapshot;
 mod vm;
 mod vsock;
 
