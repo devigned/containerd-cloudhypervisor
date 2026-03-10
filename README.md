@@ -338,19 +338,26 @@ cargo bench -p containerd-shim-cloudhv --bench vm_overhead
 sudo cargo test -p containerd-shim-cloudhv --test integration -- --nocapture test_vm_lifecycle_timing
 ```
 
-### AKS Example
+### crictl Example (Bare Linux)
 
-See [`example/aks/`](example/aks/) for a complete example of running VM-isolated containers on Azure Kubernetes Service. The example includes:
-
-- DaemonSet installer that deploys the shim, kernel, rootfs, and cloud-hypervisor onto AKS nodes
-- RuntimeClass configuration for the `cloudhv` runtime
-- Setup/teardown scripts for AKS cluster provisioning
+See [`example/crictl/`](example/crictl/) for a step-by-step guide to running
+VM-isolated containers on a bare Linux machine — no Kubernetes required. Includes
+a demo script that boots a microVM and runs an HTTP echo server:
 
 ```bash
-# Quick test on an AKS cluster with the cloudhv runtime installed:
+# After setup (see example/crictl/README.md):
+sudo bash example/crictl/demo.sh
+# → boots a microVM, starts http-echo, curls the endpoint
+```
+
+### AKS Example (Kubernetes)
+
+See [`example/aks/`](example/aks/) for running VM-isolated containers on Azure
+Kubernetes Service with a DaemonSet installer, RuntimeClass, and setup/teardown scripts.
+
+```bash
 kubectl run test --image=busybox:latest --restart=Never --runtime-class=cloudhv -- echo hello
 kubectl logs test
-kubectl delete pod test
 ```
 
 ## Contributing
