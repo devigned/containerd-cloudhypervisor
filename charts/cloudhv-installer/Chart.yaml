@@ -1,0 +1,17 @@
+apiVersion: v2
+name: cloudhv-installer
+description: Installs the containerd-cloudhypervisor shim, guest kernel, rootfs, and Cloud Hypervisor onto Kubernetes nodes via a DaemonSet.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - containerd
+  - cloud-hypervisor
+  - microvm
+  - vm-isolation
+  - kata
+home: https://github.com/devigned/containerd-cloudhypervisor
+sources:
+  - https://github.com/devigned/containerd-cloudhypervisor
+maintainers:
+  - name: devigned

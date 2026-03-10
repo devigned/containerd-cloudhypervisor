@@ -1,0 +1,14 @@
+# Lightweight installer image for the release workflow.
+# This Dockerfile packages pre-built binaries (not compiled here).
+# The release workflow builds each component separately and copies
+# them into the build context before running this Dockerfile.
+
+FROM debian:bookworm-slim
+
+COPY opt/cloudhv/ /opt/cloudhv/
+
+RUN chmod +x /opt/cloudhv/containerd-shim-cloudhv-v1 \
+             /opt/cloudhv/virtiofsd \
+             /opt/cloudhv/install.sh
+
+ENTRYPOINT ["/opt/cloudhv/install.sh"]
