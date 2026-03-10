@@ -52,10 +52,6 @@ fn init_setup() {
     }
 
     reaper::set_child_subreaper();
-    // NOTE: Do NOT install a custom SIGCHLD handler — it races with tokio's
-    // internal child reaper and causes ECHILD errors when spawning processes
-    // via tokio::process::Command. Instead, orphan reaping is handled by a
-    // background tokio task (see run_agent).
     info!("init setup complete");
 }
 

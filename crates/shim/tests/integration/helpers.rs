@@ -70,7 +70,7 @@ impl TestFixtures {
             default_memory_mb: 512,
             vsock_port: cloudhv_common::AGENT_VSOCK_PORT,
             agent_startup_timeout_secs: 30,
-            kernel_args: "console=ttyS0 root=/dev/vda rw init=/init".to_string(),
+            kernel_args: "console=ttyS0 root=/dev/vda rw init=/init net.ifnames=0".to_string(),
             debug: true,
             pool_size: 0,
             max_containers_per_vm: 1,

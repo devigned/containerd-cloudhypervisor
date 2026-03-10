@@ -57,7 +57,8 @@ COPY --from=builder /src/target/x86_64-unknown-linux-musl/release/cloudhv-agent 
 # Build rootfs without mount (Docker doesn't allow loopback mounts).
 # Use genext2fs to create an ext2 image directly from a directory tree.
 RUN mkdir -p rootfs/bin rootfs/dev/pts rootfs/dev/shm rootfs/etc \
-        rootfs/proc rootfs/sys rootfs/tmp rootfs/run rootfs/var rootfs/containers && \
+        rootfs/proc rootfs/sys rootfs/tmp rootfs/run rootfs/var rootfs/containers \
+&& \
     cp /tmp/cloudhv-agent rootfs/init && chmod 755 rootfs/init && \
     cp /tmp/cloudhv-agent rootfs/bin/cloudhv-agent && chmod 755 rootfs/bin/cloudhv-agent && \
     CRUN_VERSION="1.20" && \

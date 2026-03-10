@@ -64,7 +64,8 @@ impl Shim for CloudHvShim {
                 default_memory_mb: cloudhv_common::DEFAULT_MEMORY_MB,
                 vsock_port: cloudhv_common::AGENT_VSOCK_PORT,
                 agent_startup_timeout_secs: cloudhv_common::AGENT_STARTUP_TIMEOUT_SECS,
-                kernel_args: "console=hvc0 root=/dev/vda rw quiet init=/init".to_string(),
+                kernel_args: "console=hvc0 root=/dev/vda rw quiet init=/init net.ifnames=0"
+                    .to_string(),
                 debug: false,
                 pool_size: 0,
                 max_containers_per_vm: 1,
@@ -229,14 +230,17 @@ impl CloudHvShim {
                     containerd_shim_protos::ttrpc::Error::Others(format!("prepare: {e}"))
                 })?;
 
-                // Write network config to the shared dir for the agent to read
-                // (must be after prepare() which creates the shared directory)
+                // Configure guest network via kernel boot parameters.
+                // CONFIG_IP_PNP + net.ifnames=0 ensures the kernel assigns
+                // the pod IP to eth0 at boot — no agent-side config needed.
                 if let Some((ref ip_cidr, ref gw)) = ip_config {
-                    info!("network config for agent: ip={} gw={}", ip_cidr, gw);
-                    let net_config = format!("{ip_cidr}\n{gw}\n");
-                    std::fs::write(vm.shared_dir().join("net.conf"), &net_config).map_err(|e| {
-                        containerd_shim_protos::ttrpc::Error::Others(format!("write net.conf: {e}"))
-                    })?;
+                    let parts: Vec<&str> = ip_cidr.split('/').collect();
+                    let ip = parts[0];
+                    let prefix: u32 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(24);
+                    let mask = prefix_to_netmask(prefix);
+                    let ip_param = format!(" ip={ip}::{gw}:{mask}::eth0:off");
+                    vm.append_kernel_args(&ip_param);
+                    info!("kernel network: {}", ip_param.trim());
                 }
 
                 vm.start_swtpm().await.map_err(|e| {
@@ -1140,4 +1144,20 @@ fn setup_tap_in_netns(netns_path: &str, vm_id: &str) -> anyhow::Result<TapInfo> 
         ip_cidr,
         gateway,
     })
+}
+
+/// Convert a CIDR prefix length to a dotted-decimal netmask.
+fn prefix_to_netmask(prefix: u32) -> String {
+    let mask: u32 = if prefix == 0 {
+        0
+    } else {
+        !0u32 << (32 - prefix)
+    };
+    format!(
+        "{}.{}.{}.{}",
+        (mask >> 24) & 0xff,
+        (mask >> 16) & 0xff,
+        (mask >> 8) & 0xff,
+        mask & 0xff,
+    )
 }

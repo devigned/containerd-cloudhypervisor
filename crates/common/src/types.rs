@@ -106,6 +106,8 @@ pub struct VmConfig {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub disks: Vec<VmDisk>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub net: Vec<VmNet>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub fs: Vec<VmFs>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vsock: Option<VmVsock>,
@@ -168,6 +170,16 @@ fn default_fs_queues() -> u32 {
 }
 fn default_fs_queue_size() -> u32 {
     128
+}
+
+/// Network device configuration (virtio-net backed by TAP).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmNet {
+    /// Name of the host TAP device (created by tc-redirect-tap CNI plugin).
+    pub tap: String,
+    /// MAC address (must match the CNI-assigned MAC for transparent bridging).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

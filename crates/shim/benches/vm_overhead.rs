@@ -94,6 +94,7 @@ fn bench_vm_config_serialization(c: &mut Criterion) {
             readonly: false,
             id: None,
         }],
+        net: vec![],
         fs: vec![VmFs {
             tag: "containerfs".to_string(),
             socket: "/run/cloudhv/vm-1/virtiofsd.sock".to_string(),

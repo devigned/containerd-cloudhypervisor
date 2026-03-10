@@ -57,6 +57,9 @@ if [ -f "../${CONFIG_FILE}" ]; then
     scripts/config --enable BPF_JIT
     # ACPI PCI hot-plug for block device delivery to containers
     scripts/config --enable HOTPLUG_PCI
+    scripts/config --enable NETDEVICES
+    scripts/config --enable NET_CORE
+    scripts/config --enable IP_PNP
     scripts/config --enable HOTPLUG_PCI_ACPI
     make olddefconfig
 

@@ -53,7 +53,7 @@ fn test_vm_boot_and_agent_health() {
 
         // Create and boot VM
         eprintln!("=== Creating and booting VM ===");
-        vm.create_and_boot_vm()
+        vm.create_and_boot_vm(None, None)
             .await
             .expect("failed to create and boot VM");
 
@@ -172,6 +172,7 @@ fn test_vm_config_json_generation() {
             readonly: false,
             id: None,
         }],
+        net: vec![],
         fs: vec![VmFs {
             tag: "containerfs".to_string(),
             socket: "/run/virtiofsd.sock".to_string(),
@@ -231,7 +232,9 @@ fn test_ttrpc_health_check_rpc() {
         vm.prepare().await.expect("VM prepare failed");
         vm.start_virtiofsd().await.expect("virtiofsd failed");
         vm.start_vmm().await.expect("VMM failed");
-        vm.create_and_boot_vm().await.expect("boot failed");
+        vm.create_and_boot_vm(None, None)
+            .await
+            .expect("boot failed");
 
         // Wait for agent with extended timeout
         tokio::time::timeout(Duration::from_secs(30), vm.wait_for_agent())
@@ -418,7 +421,9 @@ fn test_vm_lifecycle_timing_breakdown() {
 
         // Phase 4: VM create + boot
         let t3 = std::time::Instant::now();
-        vm.create_and_boot_vm().await.expect("boot failed");
+        vm.create_and_boot_vm(None, None)
+            .await
+            .expect("boot failed");
         let boot_time = t3.elapsed();
         eprintln!("  [4] VM create + boot (CH API):   {:>8.1?}", boot_time);
 
@@ -531,7 +536,9 @@ fn test_vm_resize_api() {
 
         vm.start_virtiofsd().await.expect("virtiofsd failed");
         vm.start_vmm().await.expect("VMM failed");
-        vm.create_and_boot_vm().await.expect("boot failed");
+        vm.create_and_boot_vm(None, None)
+            .await
+            .expect("boot failed");
 
         // Try resize — may fail if hotplug not fully supported by kernel
         eprintln!("=== Testing VM resize ===");

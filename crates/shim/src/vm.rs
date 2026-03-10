@@ -164,19 +164,40 @@ impl VmManager {
     }
 
     /// Start the Cloud Hypervisor VMM process.
-    /// Returns immediately after spawning — use `wait_vmm_ready()` to wait.
-    pub fn spawn_vmm(&mut self) -> Result<()> {
+    /// If `netns` is provided, CH runs inside that network namespace
+    /// so it can access TAP devices created there.
+    pub fn spawn_vmm_in_netns(&mut self, netns: Option<&str>) -> Result<()> {
         let ch_binary = &self.config.cloud_hypervisor_binary;
-        let child = Command::new(ch_binary)
-            .arg("--api-socket")
-            .arg(&self.api_socket)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| format!("failed to spawn cloud-hypervisor at {ch_binary}"))?;
+        let child = if let Some(ns) = netns {
+            let netns_arg = format!("--net={ns}");
+            Command::new("nsenter")
+                .arg(netns_arg)
+                .arg("--")
+                .arg(ch_binary)
+                .arg("--api-socket")
+                .arg(&self.api_socket)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .with_context(|| format!("nsenter + cloud-hypervisor in {ns}"))?
+        } else {
+            Command::new(ch_binary)
+                .arg("--api-socket")
+                .arg(&self.api_socket)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .with_context(|| format!("failed to spawn cloud-hypervisor at {ch_binary}"))?
+        };
         self.ch_process = Some(child);
         Ok(())
+    }
+
+    /// Start CH without a network namespace.
+    pub fn spawn_vmm(&mut self) -> Result<()> {
+        self.spawn_vmm_in_netns(None)
     }
 
     /// Wait for CH API socket to appear.
@@ -203,7 +224,23 @@ impl VmManager {
     }
 
     /// Create and boot the VM via the Cloud Hypervisor HTTP API.
-    pub async fn create_and_boot_vm(&self) -> Result<()> {
+    ///
+    /// If `tap_device` is provided, a virtio-net device is attached to the
+    /// VM using the named TAP device. The kernel cmdline should include
+    /// `ip=...` parameters for network configuration.
+    pub async fn create_and_boot_vm(
+        &self,
+        tap_device: Option<&str>,
+        tap_mac: Option<&str>,
+    ) -> Result<()> {
+        let net = match tap_device {
+            Some(tap) => vec![VmNet {
+                tap: tap.to_string(),
+                mac: tap_mac.map(|m| m.to_string()),
+            }],
+            None => vec![],
+        };
+
         let vm_config = VmConfig {
             payload: VmPayload {
                 kernel: self.config.kernel_path.clone(),
@@ -239,6 +276,7 @@ impl VmManager {
                 readonly: false,
                 id: None,
             }],
+            net,
             fs: vec![VmFs {
                 tag: VIRTIOFS_TAG.to_string(),
                 socket: self.virtiofsd_socket.to_string_lossy().to_string(),
@@ -703,6 +741,11 @@ impl VmManager {
 
     pub fn api_socket_path(&self) -> &Path {
         &self.api_socket
+    }
+
+    /// Append extra parameters to the kernel command line.
+    pub fn append_kernel_args(&mut self, args: &str) {
+        self.config.kernel_args.push_str(args);
     }
 
     /// Get the PIDs of child processes for debugging.

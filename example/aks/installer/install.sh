@@ -33,7 +33,7 @@ cat > "$HOST/opt/cloudhv/config.json" << 'CONFIG'
   "virtiofsd_binary": "/usr/libexec/virtiofsd",
   "kernel_path": "/opt/cloudhv/vmlinux",
   "rootfs_path": "/opt/cloudhv/rootfs.ext4",
-  "kernel_args": "console=ttyS0 root=/dev/vda rw init=/init",
+  "kernel_args": "console=ttyS0 root=/dev/vda rw init=/init net.ifnames=0",
   "default_vcpus": 1,
   "default_memory_mb": 512,
   "pool_size": 2,

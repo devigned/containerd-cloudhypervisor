@@ -106,7 +106,9 @@ impl VmPool {
         vfsd_result.context("virtiofsd not ready")?;
         vmm_result.context("VMM not ready")?;
 
-        vm.create_and_boot_vm().await.context("failed to boot VM")?;
+        vm.create_and_boot_vm(None, None)
+            .await
+            .context("failed to boot VM")?;
         vm.wait_for_agent().await.context("agent not ready")?;
 
         // Retry ttrpc connect — the agent may need a moment after vsock socket appears
