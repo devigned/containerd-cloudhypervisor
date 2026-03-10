@@ -721,10 +721,9 @@ fn test_e2e_container_lifecycle_benchmark() {
             start_time
         );
 
-        // ── Phase 5: Verify container is running (give it time to bind) ──
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        // Read stdout to verify the container produced output
+        // ── Phase 5: Check container stdout ───────────────────────────
+        // http-echo is a long-running server; stdout may be empty (it logs to stderr).
+        // The container being started successfully is the key assertion.
         if stdout_host.exists() {
             match std::fs::read_to_string(&stdout_host) {
                 Ok(output) if !output.is_empty() => {
