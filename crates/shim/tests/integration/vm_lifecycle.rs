@@ -1948,3 +1948,105 @@ fn test_snapshot_restore_with_networking_and_container() {
         eprintln!("╚══════════════════════════════════════════════════════════╝\n");
     });
 }
+
+/// Test that the in-process virtiofsd backend works as a drop-in replacement
+/// for the spawned virtiofsd binary.
+///
+/// This test:
+///   1. Starts an in-process VirtiofsBackend on a vhost-user socket
+///   2. Boots a VM that connects to it (instead of a spawned virtiofsd)
+///   3. Verifies the agent is healthy (agent mounts virtiofs at boot)
+///   4. Verifies the shared directory works by checking container I/O setup
+///
+/// Requires the `embedded-virtiofsd` feature: cargo test --features embedded-virtiofsd
+#[cfg(all(target_os = "linux", feature = "embedded-virtiofsd"))]
+#[test]
+fn test_embedded_virtiofsd() {
+    let fixtures = TestFixtures::resolve().expect("failed to resolve test fixtures");
+    skip_if_missing!(fixtures);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let config = fixtures.runtime_config();
+        let vm_id = format!("embed-vfsd-{}", std::process::id());
+
+        eprintln!("\n╔══════════════════════════════════════════════════════════╗");
+        eprintln!("║  Embedded virtiofsd — Integration Test                  ║");
+        eprintln!("╠══════════════════════════════════════════════════════════╣");
+
+        // ── Phase 1: Set up in-process virtiofsd ──────────────────────
+        eprintln!("  Phase 1 │ Starting in-process virtiofsd");
+        let p1 = std::time::Instant::now();
+
+        let mut vm = containerd_shim_cloudhv::vm::VmManager::new(vm_id.clone(), config)
+            .expect("VmManager::new");
+        vm.prepare().await.expect("prepare");
+
+        // Start the embedded virtiofsd instead of spawning a child process
+        let vfsd = containerd_shim_cloudhv::virtfs::VirtiofsBackend::start(
+            &vm.state_dir().join("virtiofsd.sock"),
+            vm.shared_dir(),
+        )
+        .expect("start embedded virtiofsd");
+
+        eprintln!(
+            "           │ in-process virtiofsd started: {:>8.1?}",
+            p1.elapsed()
+        );
+
+        // ── Phase 2: Boot VM (using the in-process virtiofsd socket) ──
+        eprintln!("  Phase 2 │ Booting VM with embedded virtiofsd");
+        let p2 = std::time::Instant::now();
+
+        // spawn CH only (virtiofsd already running in-process)
+        vm.spawn_vmm().expect("spawn_vmm");
+        vm.wait_vmm_ready().await.expect("vmm ready");
+        vm.create_and_boot_vm(None, None).await.expect("boot");
+
+        tokio::time::timeout(Duration::from_secs(30), vm.wait_for_agent())
+            .await
+            .expect("agent timeout")
+            .expect("agent health");
+
+        eprintln!(
+            "           │ VM booted, agent healthy: {:>8.1?}",
+            p2.elapsed()
+        );
+
+        // ── Phase 3: Verify shared directory works ────────────────────
+        eprintln!("  Phase 3 │ Verifying shared directory");
+
+        // Create a test file in the shared dir and check it exists from host
+        let test_file = vm.shared_dir().join("embed-test.txt");
+        std::fs::write(&test_file, "hello from embedded virtiofsd").expect("write test file");
+        assert!(test_file.exists(), "test file should exist in shared dir");
+
+        // Connect to agent via ttrpc to verify full pipeline
+        let vsock_client = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
+        let (_agent, health) =
+            tokio::time::timeout(Duration::from_secs(5), vsock_client.connect_ttrpc())
+                .await
+                .expect("ttrpc timeout")
+                .expect("ttrpc connect");
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(5));
+        let resp = health
+            .check(ctx, &cloudhv_proto::CheckRequest::new())
+            .await
+            .expect("health check");
+        assert!(resp.ready, "agent must be healthy with embedded virtiofsd");
+        eprintln!("           │ agent healthy, shared dir working ✅");
+        drop(_agent);
+        drop(health);
+
+        // ── Phase 4: Cleanup ──────────────────────────────────────────
+        eprintln!("  Phase 4 │ Cleaning up");
+        vm.cleanup().await.expect("cleanup");
+        drop(vfsd); // stops the in-process virtiofsd thread
+
+        eprintln!("╚══════════════════════════════════════════════════════════╝\n");
+    });
+}

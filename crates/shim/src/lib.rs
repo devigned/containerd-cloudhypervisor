@@ -4,5 +4,6 @@ pub mod image_cache;
 pub mod instance;
 pub mod pool;
 pub mod snapshot;
+pub mod virtfs;
 pub mod vm;
 pub mod vsock;

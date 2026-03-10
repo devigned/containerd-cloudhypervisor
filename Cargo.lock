@@ -481,7 +481,10 @@ dependencies = [
  "tokio",
  "ttrpc 0.9.0",
  "uuid",
+ "vhost",
+ "vhost-user-backend",
  "virtiofsd",
+ "vm-memory",
 ]
 
 [[package]]

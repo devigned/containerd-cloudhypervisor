@@ -7,6 +7,7 @@ mod image_cache;
 mod instance;
 mod pool;
 mod snapshot;
+mod virtfs;
 mod vm;
 mod vsock;
 
