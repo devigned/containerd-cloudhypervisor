@@ -3,5 +3,6 @@ pub mod hypervisor;
 pub mod image_cache;
 pub mod instance;
 pub mod pool;
+pub mod snapshot;
 pub mod vm;
 pub mod vsock;

@@ -81,6 +81,50 @@ impl VmManager {
         })
     }
 
+    /// Create a VmManager from a snapshot-restored VM.
+    ///
+    /// Wraps an already-running Cloud Hypervisor process (restored from
+    /// a golden snapshot) into a VmManager. The VM is already booted and
+    /// the agent is reachable — no boot sequence needed.
+    ///
+    /// Note: restored VMs have no virtiofs (snapshot excludes it), so
+    /// `shared_dir()` exists but virtiofs is not mounted inside the guest.
+    #[allow(dead_code)]
+    pub fn from_restored(restored: crate::snapshot::RestoredVm, config: RuntimeConfig) -> Self {
+        let vm_id = restored
+            .state_dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let cid = allocate_cid();
+        let state_dir = restored.state_dir;
+        let shared_dir = state_dir.join("shared");
+        let virtiofsd_socket = state_dir.join("virtiofsd.sock");
+        let tpm_socket = state_dir.join("tpm.sock");
+
+        info!(
+            "VmManager from restored snapshot: vm_id={}, state_dir={}",
+            vm_id,
+            state_dir.display()
+        );
+
+        Self {
+            vm_id,
+            cid,
+            state_dir,
+            api_socket: restored.api_socket,
+            vsock_socket: restored.vsock_socket,
+            virtiofsd_socket,
+            shared_dir,
+            tpm_socket,
+            ch_process: Some(restored.ch_process),
+            virtiofsd_process: None,
+            swtpm_process: None,
+            config,
+        }
+    }
+
     /// Prepare the state directory and shared filesystem.
     pub async fn prepare(&self) -> Result<()> {
         tokio::fs::create_dir_all(&self.shared_dir)
@@ -317,6 +361,72 @@ impl VmManager {
         Ok(())
     }
 
+    /// Create and boot a minimal VM suitable for snapshotting.
+    ///
+    /// This boots without virtiofs (which blocks snapshot/restore due to
+    /// vhost-user protocol state). The VM has only: kernel, rootfs disk,
+    /// and vsock — enough for the agent to boot and be reachable.
+    ///
+    /// After restoring from a snapshot of this VM, virtiofs is not available.
+    /// Container operations that need the shared directory should use a full
+    /// VM boot via `create_and_boot_vm()` instead.
+    #[allow(dead_code)]
+    pub async fn create_and_boot_vm_for_snapshot(&self) -> Result<()> {
+        let vm_config = VmConfig {
+            payload: VmPayload {
+                kernel: self.config.kernel_path.clone(),
+                cmdline: Some(self.config.kernel_args.clone()),
+                initramfs: None,
+            },
+            cpus: VmCpus {
+                boot_vcpus: self.config.default_vcpus,
+                max_vcpus: std::cmp::max(
+                    self.config.default_vcpus,
+                    std::thread::available_parallelism()
+                        .map(|n| n.get() as u32)
+                        .unwrap_or(self.config.default_vcpus),
+                ),
+            },
+            memory: VmMemory {
+                size: self.config.default_memory_mb * 1024 * 1024,
+                shared: false,
+                hotplug_size: None,
+                hotplug_method: None,
+            },
+            disks: vec![VmDisk {
+                path: self.config.rootfs_path.clone(),
+                readonly: false,
+                id: None,
+            }],
+            net: vec![],
+            fs: vec![],
+            vsock: Some(VmVsock {
+                cid: self.cid,
+                socket: self.vsock_socket.to_string_lossy().to_string(),
+            }),
+            serial: Some(VmConsoleConfig::off()),
+            console: Some(VmConsoleConfig::off()),
+            tpm: None,
+        };
+
+        let config_json = serde_json::to_string(&vm_config)?;
+        debug!("VM snapshot config: {}", config_json);
+
+        self.api_request("PUT", "/api/v1/vm.create", Some(&config_json))
+            .await
+            .context("failed to create VM for snapshot")?;
+
+        self.api_request("PUT", "/api/v1/vm.boot", None)
+            .await
+            .context("failed to boot VM for snapshot")?;
+
+        info!(
+            "VM {} created for snapshot (cid={}, no virtiofs)",
+            self.vm_id, self.cid
+        );
+        Ok(())
+    }
+
     /// Wait for the guest agent to become responsive.
     pub async fn wait_for_agent(&self) -> Result<()> {
         info!(
@@ -529,6 +639,59 @@ impl VmManager {
         Ok(())
     }
 
+    /// Hot-add a virtio-net device backed by a TAP device.
+    ///
+    /// Used to add networking to a snapshot-restored VM (golden snapshots
+    /// exclude network devices). The TAP device must already exist in the
+    /// appropriate network namespace.
+    #[allow(dead_code)]
+    pub async fn add_net(&self, tap_name: &str, mac: Option<&str>) -> Result<()> {
+        let mut net_config = serde_json::json!({
+            "tap": tap_name,
+        });
+        if let Some(m) = mac {
+            net_config["mac"] = serde_json::Value::String(m.to_string());
+        }
+        let body = serde_json::to_string(&net_config)?;
+        info!(
+            "hot-adding net to VM {}: tap={} mac={:?}",
+            self.vm_id, tap_name, mac
+        );
+
+        self.api_request("PUT", "/api/v1/vm.add-net", Some(&body))
+            .await
+            .context("failed to hot-add net device")?;
+
+        info!(
+            "net device hot-added to VM {} (tap={})",
+            self.vm_id, tap_name
+        );
+        Ok(())
+    }
+
+    /// Hot-add a net device to a VM via its API socket (static version).
+    ///
+    /// Used for snapshot-restored VMs that don't have a VmManager.
+    #[allow(dead_code)]
+    pub async fn add_net_to_socket(
+        api_socket: &Path,
+        tap_name: &str,
+        mac: Option<&str>,
+    ) -> Result<()> {
+        let mut net_config = serde_json::json!({
+            "tap": tap_name,
+        });
+        if let Some(m) = mac {
+            net_config["mac"] = serde_json::Value::String(m.to_string());
+        }
+        let body = serde_json::to_string(&net_config)?;
+
+        Self::api_request_to_socket(api_socket, "PUT", "/api/v1/vm.add-net", Some(&body))
+            .await
+            .context("failed to hot-add net device")?;
+        Ok(())
+    }
+
     /// Snapshot the VM state to a directory.
     ///
     /// The VM must be paused first. Creates config.json, memory-ranges,
@@ -576,27 +739,12 @@ impl VmManager {
             "source_url": url
         }))?;
 
-        // Connect to the (new) CH instance API socket and send restore
-        let mut stream = UnixStream::connect(api_socket)
+        Self::api_request_to_socket(api_socket, "PUT", "/api/v1/vm.restore", Some(&body))
             .await
-            .context("failed to connect to CH API for restore")?;
+            .context("failed to restore VM")?;
 
-        let request = format!(
-            "PUT /api/v1/vm.restore HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(request.as_bytes()).await?;
-
-        let mut response = vec![0u8; 4096];
-        let n = stream.read(&mut response).await?;
-        let resp_str = String::from_utf8_lossy(&response[..n]);
-
-        if resp_str.contains("200") || resp_str.contains("204") {
-            info!("VM restored from {}", source_dir.display());
-            Ok(())
-        } else {
-            anyhow::bail!("restore failed: {resp_str}")
-        }
+        info!("VM restored from {}", source_dir.display());
+        Ok(())
     }
 
     /// Resume a paused VM (used after snapshot or restore).
@@ -644,26 +792,17 @@ impl VmManager {
             "receiver_url": transport_uri
         }))?;
 
-        let mut stream = UnixStream::connect(api_socket)
-            .await
-            .context("failed to connect to CH API for receive-migration")?;
+        Self::api_request_to_socket(
+            api_socket,
+            "PUT",
+            "/api/v1/vm.receive-migration",
+            Some(&body),
+        )
+        .await
+        .context("failed to receive migration")?;
 
-        let request = format!(
-            "PUT /api/v1/vm.receive-migration HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(request.as_bytes()).await?;
-
-        let mut response = vec![0u8; 4096];
-        let n = stream.read(&mut response).await?;
-        let resp_str = String::from_utf8_lossy(&response[..n]);
-
-        if resp_str.contains("200") || resp_str.contains("204") {
-            info!("VM migration received on {}", transport_uri);
-            Ok(())
-        } else {
-            anyhow::bail!("receive-migration failed: {resp_str}")
-        }
+        info!("VM migration received on {}", transport_uri);
+        Ok(())
     }
 
     /// Shutdown the VM gracefully.
@@ -752,6 +891,12 @@ impl VmManager {
     #[allow(dead_code)]
     pub fn virtiofsd_pid(&self) -> Option<u32> {
         self.virtiofsd_process.as_ref().and_then(|c| c.id())
+    }
+
+    /// Get the Cloud Hypervisor process PID.
+    #[allow(dead_code)]
+    pub fn ch_pid(&self) -> Option<u32> {
+        self.ch_process.as_ref().and_then(|c| c.id())
     }
 
     #[allow(dead_code)]
