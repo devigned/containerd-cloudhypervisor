@@ -236,19 +236,30 @@ fn test_ttrpc_health_check_rpc() {
             .await
             .expect("boot failed");
 
-        // Wait for agent with extended timeout
         tokio::time::timeout(Duration::from_secs(30), vm.wait_for_agent())
             .await
             .expect("agent wait timed out (30s)")
             .expect("agent must be reachable");
         eprintln!("=== Agent ready ===");
 
-        // TODO: ttrpc RPC over Cloud Hypervisor's vsock has a protocol issue —
-        // the CONNECT handshake succeeds but ttrpc RPCs time out with
-        // "Receive packet timeout". This needs investigation into ttrpc
-        // framing over CH's vsock stream forwarding.
-        // For now, verify the vsock CONNECT layer works (agent reachable).
-        eprintln!("=== ttrpc RPC over vsock: known issue, skipping RPC verification ===");
+        // Connect ttrpc and verify health check RPC
+        let vsock_client = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
+        let (_agent, health) =
+            tokio::time::timeout(Duration::from_secs(5), vsock_client.connect_ttrpc())
+                .await
+                .expect("ttrpc connect timed out")
+                .expect("ttrpc connect failed");
+
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(5));
+        let resp = health
+            .check(ctx, &cloudhv_proto::CheckRequest::new())
+            .await
+            .expect("health check RPC failed");
+        assert!(resp.ready, "agent must report ready=true");
+        eprintln!("=== ttrpc health check: ready={} ===", resp.ready);
+
+        drop(_agent);
+        drop(health);
 
         eprintln!("=== Cleaning up ===");
         vm.cleanup().await.expect("cleanup failed");
