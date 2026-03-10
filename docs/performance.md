@@ -1,18 +1,31 @@
 # Performance
 
-All measurements on Azure D8s_v5 (8 vCPU, 32 GB, KVM via nested virtualization).
+All measurements from CI (GitHub Actions, ubuntu-latest, KVM via nested virtualization).
 
 ## Cold Boot
 
-Full VM boot from scratch — kernel boots, agent starts, container created and started.
+Full VM lifecycle from scratch — kernel boots, agent starts, ttrpc connects.
 
 | Phase | Latency |
 |-------|---------|
-| VM boot (sandbox) | **257ms** |
-| Container create (disk image + hot-plug) | **58ms** |
-| Container start (crun run) | **145ms** |
-| **Total cold start** | **~460ms** |
-| Sandbox stop + cleanup | **92ms** |
+| Shim setup (new + prepare) | **~0.1ms** |
+| virtiofsd startup | **~6ms** |
+| Cloud Hypervisor startup | **~6ms** |
+| VM create + boot (CH API) | **~16ms** |
+| Guest boot + agent ready | **~231ms** |
+| ttrpc connect | **~0.3ms** |
+| **Total cold start** | **~280ms** |
+| Shutdown + cleanup | **~19ms** |
+
+End-to-end container lifecycle (boot + disk create + hot-plug + container start):
+
+| Phase | Latency |
+|-------|---------|
+| VM boot | **~250ms** |
+| Disk image create | **~31ms** |
+| Hot-plug + CreateContainer | **~64ms** |
+| StartContainer | **~2ms** |
+| **Total** | **~350ms** |
 
 ## Snapshot Restore
 
@@ -20,10 +33,10 @@ Restore from a pre-captured golden snapshot — skips kernel boot and agent init
 
 | Phase | Latency |
 |-------|---------|
-| Golden snapshot creation (one-time) | **~170ms** |
-| VM restore from snapshot | **~55ms** |
+| Golden snapshot creation (one-time) | **~115ms** |
+| VM restore from snapshot | **~32ms** |
 | Network hot-add (post-restore) | **~50ms** |
-| **Total restore + networking** | **~105ms** |
+| **Total restore + networking** | **~82ms** |
 
 The golden snapshot captures a fully-booted VM with the agent running. It's created
 lazily on first use and reused for all subsequent restores. Pool warming uses snapshot
@@ -72,7 +85,7 @@ With 512 MB guest memory:
 
 | | containerd-cloudhypervisor | Kata Containers |
 |---|---|---|
-| **Cold start** | ~460ms boot, ~55ms snapshot restore | ~500ms–1s |
+| **Cold start** | ~300ms boot, ~30ms snapshot restore | ~500ms–1s |
 | **Shim binary** | 2.4 MB | ~50 MB |
 | **Agent binary** | 1.5 MB (static) | ~20 MB |
 | **Guest rootfs** | 16 MB (agent + crun only) | ~150 MB |

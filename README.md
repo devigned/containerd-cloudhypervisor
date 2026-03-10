@@ -5,7 +5,7 @@ that runs container workloads inside lightweight microVMs with maximum density a
 
 ## Highlights
 
-- **~460ms cold start**, or **~55ms from snapshot restore** with pre-warmed pool
+- **~300ms cold start**, or **~30ms from snapshot restore** with pre-warmed pool
 - **VM isolation** — each pod runs in its own Cloud Hypervisor microVM with dedicated kernel
 - **Block device rootfs** — container images delivered as hot-plugged virtio-blk disks (no FUSE)
 - **Dual hypervisor** — same binary runs on KVM (Linux) and MSHV (Azure/Hyper-V)
@@ -24,7 +24,7 @@ migration, consider [Kata Containers](https://katacontainers.io/) instead.
 
 | | containerd-cloudhypervisor | Kata Containers |
 | --- | --- | --- |
-| **Cold start** | ~460ms boot, ~55ms snapshot restore | ~500ms–1s |
+| **Cold start** | ~300ms boot, ~30ms snapshot restore | ~500ms–1s |
 | **Shim binary** | 2.4 MB | ~50 MB |
 | **Guest rootfs** | 16 MB (agent + crun) | ~150 MB |
 | **Language** | Rust | Go |

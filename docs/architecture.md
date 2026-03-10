@@ -96,11 +96,11 @@ keeping operator diagnostics separate from application output.
 ## Snapshot/Restore
 
 The `SnapshotManager` captures a **golden snapshot** of a fully-booted VM (kernel up,
-agent running) and restores copies in ~55ms instead of cold-booting (~460ms):
+agent running) and restores copies in ~30ms instead of cold-booting (~300ms):
 
-1. **Golden snapshot creation** (one-time, ~170ms): boot a minimal VM (disk + vsock,
+1. **Golden snapshot creation** (one-time, ~115ms): boot a minimal VM (disk + vsock,
    no virtiofs), verify agent health, pause, snapshot to disk, shut down
-2. **Restore** (~55ms): start new CH process, restore from snapshot with per-instance
+2. **Restore** (~32ms): start new CH process, restore from snapshot with per-instance
    config.json (rewritten vsock paths, symlinked memory file), resume
 3. **Post-restore networking** (~50ms): hot-add virtio-net via `vm.add-net` API
 
