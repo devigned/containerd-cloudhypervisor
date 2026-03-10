@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use chrono::Utc;
 use containerd_shim::api;
 use containerd_shim::asynchronous::{spawn, ExitSignal, Shim};
 use containerd_shim::{Config, Error, Flags, StartOpts, TtrpcResult};
@@ -27,9 +26,12 @@ struct ContainerState {
     vm_id: String,
     pid: Option<u32>,
     exit_code: Option<u32>,
-    _exited_at: Option<chrono::DateTime<Utc>>,
-    _stdout_path: Option<std::path::PathBuf>,
-    _stderr_path: Option<std::path::PathBuf>,
+    /// Host-side file in the virtio-fs shared dir (agent writes crun output here)
+    stdout_shared_path: Option<std::path::PathBuf>,
+    stderr_shared_path: Option<std::path::PathBuf>,
+    /// Containerd's FIFO paths (shim must write container output here)
+    stdout_fifo: Option<String>,
+    stderr_fifo: Option<String>,
 }
 
 /// The Cloud Hypervisor containerd shim implementation.
@@ -146,10 +148,65 @@ impl CloudHvShim {
         Ok(vm_state.agent.clone())
     }
 
-    /// Create a sandbox: boot the VM. The VM IS the sandbox — it provides
-    /// network, PID, and mount isolation. No pause container is needed.
-    async fn create_sandbox(&self, sandbox_id: &str) -> TtrpcResult<api::CreateTaskResponse> {
+    /// Create a sandbox: boot the VM with networking.
+    ///
+    /// Reads the network namespace from the OCI spec (assigned by containerd's
+    /// CNI), creates a TAP device in that namespace, and boots the VM with
+    /// virtio-net connected to the TAP. The guest kernel gets the pod IP
+    /// via boot parameters.
+    async fn create_sandbox(
+        &self,
+        sandbox_id: &str,
+        bundle_path: &str,
+    ) -> TtrpcResult<api::CreateTaskResponse> {
         info!("creating sandbox (VM): {}", sandbox_id);
+
+        // Extract network namespace and IP from the OCI spec
+        let spec_path = std::path::Path::new(bundle_path).join("config.json");
+        let (netns_path, _pod_ip, _gateway) = if let Ok(data) = std::fs::read_to_string(&spec_path)
+        {
+            if let Ok(spec) = serde_json::from_str::<serde_json::Value>(&data) {
+                let netns = spec
+                    .pointer("/linux/namespaces")
+                    .and_then(|v| v.as_array())
+                    .and_then(|ns| {
+                        ns.iter()
+                            .find(|n| n.get("type").and_then(|t| t.as_str()) == Some("network"))
+                    })
+                    .and_then(|n| n.get("path").and_then(|p| p.as_str()))
+                    .map(String::from);
+                info!("sandbox netns: {:?}", netns);
+                (netns, None::<String>, None::<String>)
+            } else {
+                (None, None, None)
+            }
+        } else {
+            (None, None, None)
+        };
+
+        // Set up TAP device in the pod's network namespace
+        let (tap_name, tap_mac, ip_config) = if let Some(ref netns) = netns_path {
+            match setup_tap_in_netns(netns, sandbox_id) {
+                Ok(info) => {
+                    info!(
+                        "TAP created: dev={} mac={} ip={} gw={}",
+                        info.tap_name, info.mac, info.ip_cidr, info.gateway
+                    );
+                    (
+                        Some(info.tap_name),
+                        Some(info.mac),
+                        Some((info.ip_cidr, info.gateway)),
+                    )
+                }
+                Err(e) => {
+                    info!("TAP setup failed (proceeding without network): {e}");
+                    (None, None, None)
+                }
+            }
+        } else {
+            info!("no network namespace — VM will boot without networking");
+            (None, None, None)
+        };
 
         let config = load_config(None).map_err(|e| {
             containerd_shim_protos::ttrpc::Error::Others(format!("config error: {e}"))
@@ -159,18 +216,64 @@ impl CloudHvShim {
             let mut pool = self.pool.lock().await;
             if let Some(warm) = pool.try_acquire() {
                 info!("acquired VM {} from pool", warm.vm.vm_id());
+                // Pool VMs don't have networking — would need TAP added later
                 (warm.vm, warm.agent)
             } else {
-                let pool_ref = VmPool::new(config);
-                let warm = pool_ref
-                    .create_warm_vm_with_id(sandbox_id.to_string())
+                // Create VM with networking support
+                let mut vm = crate::vm::VmManager::new(sandbox_id.to_string(), config.clone())
+                    .map_err(|e| {
+                        containerd_shim_protos::ttrpc::Error::Others(format!("VmManager: {e}"))
+                    })?;
+
+                vm.prepare().await.map_err(|e| {
+                    containerd_shim_protos::ttrpc::Error::Others(format!("prepare: {e}"))
+                })?;
+
+                // Write network config to the shared dir for the agent to read
+                // (must be after prepare() which creates the shared directory)
+                if let Some((ref ip_cidr, ref gw)) = ip_config {
+                    info!("network config for agent: ip={} gw={}", ip_cidr, gw);
+                    let net_config = format!("{ip_cidr}\n{gw}\n");
+                    std::fs::write(vm.shared_dir().join("net.conf"), &net_config).map_err(|e| {
+                        containerd_shim_protos::ttrpc::Error::Others(format!("write net.conf: {e}"))
+                    })?;
+                }
+
+                vm.start_swtpm().await.map_err(|e| {
+                    containerd_shim_protos::ttrpc::Error::Others(format!("swtpm: {e}"))
+                })?;
+
+                vm.spawn_virtiofsd().map_err(|e| {
+                    containerd_shim_protos::ttrpc::Error::Others(format!("virtiofsd: {e}"))
+                })?;
+                vm.spawn_vmm_in_netns(netns_path.as_deref()).map_err(|e| {
+                    containerd_shim_protos::ttrpc::Error::Others(format!("vmm: {e}"))
+                })?;
+
+                let (vfsd_r, vmm_r) = tokio::join!(vm.wait_virtiofsd_ready(), vm.wait_vmm_ready(),);
+                vfsd_r.map_err(|e| {
+                    containerd_shim_protos::ttrpc::Error::Others(format!("virtiofsd: {e}"))
+                })?;
+                vmm_r.map_err(|e| {
+                    containerd_shim_protos::ttrpc::Error::Others(format!("vmm: {e}"))
+                })?;
+
+                vm.create_and_boot_vm(tap_name.as_deref(), tap_mac.as_deref())
                     .await
                     .map_err(|e| {
-                        containerd_shim_protos::ttrpc::Error::Others(format!(
-                            "VM creation error: {e}"
-                        ))
+                        containerd_shim_protos::ttrpc::Error::Others(format!("boot: {e}"))
                     })?;
-                (warm.vm, warm.agent)
+
+                vm.wait_for_agent().await.map_err(|e| {
+                    containerd_shim_protos::ttrpc::Error::Others(format!("agent: {e}"))
+                })?;
+
+                let vsock_client = crate::vsock::VsockClient::new(vm.vsock_socket());
+                let (agent, _health) = vsock_client.connect_ttrpc().await.map_err(|e| {
+                    containerd_shim_protos::ttrpc::Error::Others(format!("ttrpc: {e}"))
+                })?;
+
+                (vm, agent)
             }
         };
         let shared_dir = vm.shared_dir().to_path_buf();
@@ -193,9 +296,10 @@ impl CloudHvShim {
                 vm_id,
                 pid: Some(1), // agent is PID 1 inside the VM
                 exit_code: None,
-                _exited_at: None,
-                _stdout_path: None,
-                _stderr_path: None,
+                stdout_shared_path: None,
+                stderr_shared_path: None,
+                stdout_fifo: None,
+                stderr_fifo: None,
             },
         );
 
@@ -377,9 +481,18 @@ impl CloudHvShim {
                 vm_id: sandbox_id,
                 pid: Some(create_resp.pid),
                 exit_code: None,
-                _exited_at: None,
-                _stdout_path: Some(stdout_host_path),
-                _stderr_path: Some(stderr_host_path),
+                stdout_shared_path: Some(stdout_host_path),
+                stderr_shared_path: Some(stderr_host_path),
+                stdout_fifo: if req.stdout.is_empty() {
+                    None
+                } else {
+                    Some(req.stdout.clone())
+                },
+                stderr_fifo: if req.stderr.is_empty() {
+                    None
+                } else {
+                    Some(req.stderr.clone())
+                },
             },
         );
 
@@ -415,7 +528,7 @@ impl Task for CloudHvShim {
         };
 
         if is_sandbox {
-            self.create_sandbox(&container_id).await
+            self.create_sandbox(&container_id, &req.bundle).await
         } else {
             self.create_container(&container_id, &req).await
         }
@@ -449,6 +562,27 @@ impl Task for CloudHvShim {
                 ))
             })?;
             resp.pid = start_resp.pid;
+
+            // Forward container I/O: shared dir files → containerd FIFOs
+            let (shared_stdout, shared_stderr, fifo_stdout, fifo_stderr) = {
+                let containers = self.containers.lock().unwrap();
+                if let Some(state) = containers.get(container_id) {
+                    (
+                        state.stdout_shared_path.clone(),
+                        state.stderr_shared_path.clone(),
+                        state.stdout_fifo.clone(),
+                        state.stderr_fifo.clone(),
+                    )
+                } else {
+                    (None, None, None, None)
+                }
+            };
+            if let (Some(src), Some(dst)) = (shared_stdout, fifo_stdout) {
+                tokio::spawn(forward_output(src, dst));
+            }
+            if let (Some(src), Some(dst)) = (shared_stderr, fifo_stderr) {
+                tokio::spawn(forward_output(src, dst));
+            }
         }
         Ok(resp)
     }
@@ -781,4 +915,229 @@ fn dir_size(path: &std::path::Path) -> anyhow::Result<u64> {
         }
     }
     Ok(total)
+}
+
+/// Forward container output from a shared dir file to a containerd FIFO.
+///
+/// The agent writes crun's stdout/stderr to files in the virtio-fs shared
+/// directory. This task tails the file and writes to containerd's FIFO so
+/// that `crictl logs` and `kubectl logs` work.
+async fn forward_output(src: std::path::PathBuf, dst: String) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    // Wait for the source file to appear (agent creates it on start)
+    for _ in 0..100 {
+        if src.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let src_file = match tokio::fs::File::open(&src).await {
+        Ok(f) => f,
+        Err(e) => {
+            info!("I/O forward: can't open source {}: {e}", src.display());
+            return;
+        }
+    };
+
+    // Open the containerd FIFO for writing (this blocks until a reader connects)
+    let dst_file = match tokio::fs::OpenOptions::new().write(true).open(&dst).await {
+        Ok(f) => f,
+        Err(e) => {
+            info!("I/O forward: can't open FIFO {}: {e}", dst);
+            return;
+        }
+    };
+
+    let mut reader = BufReader::new(src_file);
+    let mut writer = dst_file;
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => {
+                // EOF — file may still be written to, poll
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                // Check if source file has grown
+                match tokio::fs::metadata(&src).await {
+                    Ok(_) => continue,
+                    Err(_) => break, // File removed, stop
+                }
+            }
+            Ok(_) => {
+                if writer.write_all(line.as_bytes()).await.is_err() {
+                    break; // FIFO reader disconnected
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// Information about a TAP device created for VM networking.
+struct TapInfo {
+    tap_name: String,
+    mac: String,
+    ip_cidr: String,
+    gateway: String,
+}
+
+/// Create a TAP device in the pod's network namespace and set up
+/// traffic redirection between the CNI veth and the TAP.
+///
+/// This implements the same pattern as firecracker-containerd's
+/// tc-redirect-tap CNI plugin:
+/// 1. Enter the network namespace
+/// 2. Find the veth device (created by CNI)
+/// 3. Create a TAP device
+/// 4. Set up TC u32 filters to redirect veth ↔ TAP
+/// 5. Return TAP info for Cloud Hypervisor's virtio-net config
+fn setup_tap_in_netns(netns_path: &str, vm_id: &str) -> anyhow::Result<TapInfo> {
+    use anyhow::Context;
+    use std::process::Command;
+
+    let tap_name = format!("tap_{}", &vm_id[..8.min(vm_id.len())]);
+    let netns_arg = format!("--net={netns_path}");
+
+    // Run the setup commands inside the network namespace using nsenter
+    // Create TAP device
+    let status = Command::new("nsenter")
+        .args([
+            &netns_arg, "--", "ip", "tuntap", "add", &tap_name, "mode", "tap",
+        ])
+        .status()
+        .context("create TAP")?;
+    if !status.success() {
+        anyhow::bail!("ip tuntap add failed: {status}");
+    }
+
+    // Bring TAP up
+    let status = Command::new("nsenter")
+        .args([&netns_arg, "--", "ip", "link", "set", &tap_name, "up"])
+        .status()
+        .context("ip link set tap up")?;
+    if !status.success() {
+        anyhow::bail!("ip link set tap up failed: {status}");
+    }
+
+    // Find the veth device and its IP/MAC
+    let output = Command::new("nsenter")
+        .args([&netns_arg, "--", "ip", "-j", "addr", "show"])
+        .output()
+        .context("ip addr show")?;
+    let addrs: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or(serde_json::json!([]));
+
+    let mut veth_name = String::new();
+    let mut ip_cidr = String::new();
+    let mut mac = String::new();
+
+    if let Some(interfaces) = addrs.as_array() {
+        for iface in interfaces {
+            let name = iface.get("ifname").and_then(|n| n.as_str()).unwrap_or("");
+            // Skip loopback and our TAP
+            if name == "lo" || name == tap_name {
+                continue;
+            }
+            if let Some(addr_info) = iface.get("addr_info").and_then(|a| a.as_array()) {
+                for addr in addr_info {
+                    if addr.get("family").and_then(|f| f.as_str()) == Some("inet") {
+                        ip_cidr = format!(
+                            "{}/{}",
+                            addr.get("local").and_then(|l| l.as_str()).unwrap_or(""),
+                            addr.get("prefixlen").and_then(|p| p.as_u64()).unwrap_or(24)
+                        );
+                        veth_name = name.to_string();
+                        mac = iface
+                            .get("address")
+                            .and_then(|a| a.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        break;
+                    }
+                }
+            }
+            if !veth_name.is_empty() {
+                break;
+            }
+        }
+    }
+
+    if veth_name.is_empty() || ip_cidr.is_empty() {
+        anyhow::bail!("could not find veth with IP in netns {netns_path}");
+    }
+
+    // Get default gateway
+    let output = Command::new("nsenter")
+        .args([&netns_arg, "--", "ip", "-j", "route", "show", "default"])
+        .output()
+        .context("ip route show default")?;
+    let routes: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or(serde_json::json!([]));
+    let gateway = routes
+        .as_array()
+        .and_then(|r| r.first())
+        .and_then(|r| r.get("gateway"))
+        .and_then(|g| g.as_str())
+        .unwrap_or("10.88.0.1")
+        .to_string();
+
+    // Set up TC redirect: veth ingress → TAP egress, TAP ingress → veth egress
+    for cmd in [
+        // Add ingress qdisc to veth
+        vec!["tc", "qdisc", "add", "dev", &veth_name, "ingress"],
+        // Redirect veth ingress → TAP
+        vec![
+            "tc", "filter", "add", "dev", &veth_name, "parent", "ffff:", "protocol", "all", "u32",
+            "match", "u32", "0", "0", "action", "mirred", "egress", "redirect", "dev", &tap_name,
+        ],
+        // Add ingress qdisc to TAP
+        vec!["tc", "qdisc", "add", "dev", &tap_name, "ingress"],
+        // Redirect TAP ingress → veth
+        vec![
+            "tc", "filter", "add", "dev", &tap_name, "parent", "ffff:", "protocol", "all", "u32",
+            "match", "u32", "0", "0", "action", "mirred", "egress", "redirect", "dev", &veth_name,
+        ],
+    ] {
+        let mut nsenter_cmd = vec!["nsenter", &netns_arg, "--"];
+        nsenter_cmd.extend(cmd.iter().copied());
+
+        let status = Command::new(nsenter_cmd[0])
+            .args(&nsenter_cmd[1..])
+            .status()
+            .with_context(|| format!("tc command: {:?}", cmd))?;
+        if !status.success() {
+            log::warn!("tc command failed (may be ok): {:?} -> {}", cmd, status);
+        }
+    }
+
+    // Remove the IP from the netns veth so packets destined for the pod IP
+    // are forwarded through TC redirect to the TAP → VM, instead of being
+    // handled locally by the netns kernel stack.
+    let status = Command::new("nsenter")
+        .args([&netns_arg, "--", "ip", "addr", "flush", "dev", &veth_name])
+        .status()
+        .context("flush IP from veth")?;
+    if !status.success() {
+        log::warn!("failed to flush IP from veth (may cause routing issues)");
+    }
+
+    log::info!(
+        "TAP {} set up in netns {}: veth={} ip={} gw={} mac={}",
+        tap_name,
+        netns_path,
+        veth_name,
+        ip_cidr,
+        gateway,
+        mac
+    );
+
+    Ok(TapInfo {
+        tap_name,
+        mac,
+        ip_cidr,
+        gateway,
+    })
 }
