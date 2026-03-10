@@ -73,9 +73,13 @@ so restored VMs skip kernel boot and agent initialization entirely.
 | Resource | Overhead |
 | ---------- | ---------- |
 | Cloud Hypervisor (VMM) | ~50 MB RSS |
-| virtiofsd | ~5 MB RSS |
+| virtiofsd | ~5 MB RSS (0 with embedded mode) |
 | Shim process | ~10 MB RSS |
 | VM guest memory | 512 MB (configurable) |
+
+> **Embedded virtiofsd**: with `--features embedded-virtiofsd`, virtiofsd runs as a
+> thread inside the shim process instead of a separate daemon, eliminating ~5 MB RSS
+> per VM and reducing startup from ~10ms to ~277µs. See [Getting Started](#getting-started-kvm).
 
 ## Architecture
 
@@ -199,6 +203,8 @@ to cold boot transparently.
 - **Multi-container per VM**: Mount + PID namespace isolation per container
 - **Pod networking**: TAP + TC redirect with kernel IP_PNP — zero guest userspace networking
 - **Snapshot/restore**: Golden VM snapshots for ~55ms restore; pool warming from snapshots
+- **Embedded virtiofsd**: Optional in-process vhost-user-fs backend (`--features embedded-virtiofsd`),
+  eliminating ~5 MB RSS and one process per VM
 
 ### Security
 
@@ -306,6 +312,10 @@ make build-agent    # Build agent only (static musl)
 make fmt            # Format code
 make clippy         # Run clippy
 make test           # Run unit tests
+
+# With embedded virtiofsd (eliminates ~5MB RSS per VM):
+cargo build --release -p containerd-shim-cloudhv --features embedded-virtiofsd
+# Requires libseccomp-dev and libcap-ng-dev on Linux
 ```
 
 ### Remote Development (macOS → Linux VM)

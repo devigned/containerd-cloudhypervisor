@@ -17,7 +17,6 @@ mod inner {
     use vhost::vhost_user::Listener;
     use vhost_user_backend::VhostUserDaemon;
     use virtiofsd::passthrough::{self, PassthroughFs};
-    use virtiofsd::sandbox::{Sandbox, SandboxMode};
     use virtiofsd::vhost_user::VhostUserFsBackendBuilder;
     use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
 
@@ -73,6 +72,7 @@ mod inner {
         }
 
         /// Path to the vhost-user socket.
+        #[allow(dead_code)]
         pub fn socket_path(&self) -> &Path {
             &self.socket_path
         }
@@ -80,11 +80,27 @@ mod inner {
 
     impl Drop for VirtiofsBackend {
         fn drop(&mut self) {
-            // Remove the socket to unblock the daemon's accept() loop
+            // Remove the socket file. This won't stop an already-connected
+            // daemon (it's blocked in daemon.wait()), but ensures no new
+            // connections can be made. The daemon thread exits when CH
+            // (the vhost-user client) disconnects or is killed — which
+            // happens in VmManager's Drop/shutdown before this runs.
             let _ = std::fs::remove_file(&self.socket_path);
-            // The thread will exit when the daemon detects disconnection
+
             if let Some(thread) = self.thread.take() {
-                let _ = thread.join();
+                match thread.join() {
+                    Ok(_) => {}
+                    Err(panic_payload) => {
+                        error!(
+                            "virtiofsd thread panicked: {:?}",
+                            panic_payload
+                                .downcast_ref::<String>()
+                                .map(|s| s.as_str())
+                                .or_else(|| panic_payload.downcast_ref::<&str>().copied())
+                                .unwrap_or("unknown panic")
+                        );
+                    }
+                }
             }
         }
     }
