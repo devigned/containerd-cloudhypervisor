@@ -8,6 +8,7 @@
 | [Configuration](configuration.md) | Runtime config reference and pod annotation overrides |
 | [Performance](performance.md) | Benchmarks, cold boot, snapshot restore, resource overhead |
 | [Development](development.md) | Building, testing, contributing, code quality standards |
+| [Releasing](releasing.md) | Release process, Helm chart, GHCR artifacts |
 
 ## Overview
 
