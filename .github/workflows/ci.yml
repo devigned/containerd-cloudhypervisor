@@ -29,8 +29,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libseccomp-dev libcap-ng-dev
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -123,7 +123,8 @@ jobs:
           sudo apt-get install -y \
             protobuf-compiler musl-tools \
             flex bison libelf-dev bc \
-            virtiofsd
+            virtiofsd \
+            iproute2 util-linux e2fsprogs curl
 
       - name: Enable KVM
         run: |
@@ -143,6 +144,17 @@ jobs:
             -O /tmp/cloud-hypervisor
           sudo install -m 755 /tmp/cloud-hypervisor /usr/local/bin/cloud-hypervisor
           cloud-hypervisor --version
+
+      - name: Install http-echo (for container integration tests)
+        if: env.KVM_AVAILABLE == 'true'
+        run: |
+          # http-echo is a static Go binary; extract from the Docker image
+          docker pull hashicorp/http-echo:latest
+          CID=$(docker create hashicorp/http-echo:latest)
+          docker cp "$CID:/http-echo" /tmp/http-echo
+          docker rm "$CID"
+          sudo install -m 755 /tmp/http-echo /usr/local/bin/http-echo
+          echo "http-echo installed: $(file /usr/local/bin/http-echo)"
 
       - name: Download guest agent artifact
         if: env.KVM_AVAILABLE == 'true'
@@ -188,6 +200,7 @@ jobs:
             CLOUDHV_TEST_ROOTFS="$PWD/guest/rootfs/rootfs.ext4" \
             CLOUDHV_TEST_CH_BIN="/usr/local/bin/cloud-hypervisor" \
             CLOUDHV_TEST_VFSD="/usr/libexec/virtiofsd" \
+            CLOUDHV_TEST_HTTP_ECHO="/usr/local/bin/http-echo" \
             cargo test -p containerd-shim-cloudhv --test integration -- --nocapture --test-threads=1
 
       - name: Fix cargo cache permissions
