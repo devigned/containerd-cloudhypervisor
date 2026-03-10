@@ -67,7 +67,7 @@ RUN mkdir -p rootfs/bin rootfs/dev/pts rootfs/dev/shm rootfs/etc \
     echo 'root:x:0:' > rootfs/etc/group && \
     echo '127.0.0.1 localhost' > rootfs/etc/hosts && \
     echo 'nameserver 8.8.8.8' > rootfs/etc/resolv.conf && \
-    genext2fs -b 262144 -d rootfs rootfs.ext4
+    genext2fs -b 16384 -d rootfs rootfs.ext4
 
 # --- Stage 4: Final installer image ---
 FROM debian:bookworm-slim

@@ -17,7 +17,7 @@ set -euo pipefail
 AGENT_BINARY="${1:?Usage: build-rootfs.sh <path-to-cloudhv-agent-binary>}"
 ROOTFS_DIR="rootfs"
 IMAGE_FILE="rootfs.ext4"
-IMAGE_SIZE_MB=64
+IMAGE_SIZE_MB=16
 
 echo "=== Building minimal guest rootfs ==="
 
