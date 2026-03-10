@@ -1,0 +1,124 @@
+# Architecture
+
+## System Overview
+
+```text
+                     ┌─────────────────────────────────────────────────────────┐
+                     │  Pod Network Namespace                                  │
+containerd           │                                                         │
+   │                 │  ┌──────┐  TC redirect  ┌──────┐                        │
+   │ ttrpc           │  │ veth ├──────────────►│ TAP  │                        │
+   │                 │  │(eth0)│◄──────────────┤      │                        │
+   ▼                 │  └───┬──┘               └──┬───┘                        │
+┌──────────────┐     │      │                     │                            │
+│  shim-v1     ├─────┤      │ IP flushed          │ virtio-net                 │
+│              │     │      │ (VM owns pod IP)    │                            │
+│  • disk img  │     │  ┌───┴─────────────────────┴────────────────────────┐   │
+│  • hot-plug  │     │  │  cloud-hypervisor (VMM)                          │   │
+│  • logs      │     │  │  ┌─────────────────────────────────────────────┐ │   │
+│              │     │  │  │  Guest VM (custom kernel)                   │ │   │
+└──────┬───────┘     │  │  │                                             │ │   │
+       │ vsock       │  │  │  eth0 ← kernel ip= (IP_PNP at boot)         │ │   │
+       │             │  │  │                                             │ │   │
+       │             │  │  │  ┌───────────┐     ┌──────┐                 │ │   │
+       └─────────────┤  │  │  │   Agent   │────►│ crun │ (containers)    │ │   │
+                     │  │  │  │  (PID 1)  │     └──────┘                 │ │   │
+                     │  │  │  └───────────┘                              │ │   │
+                     │  │  └─────────────────────────────────────────────┘ │   │
+                     │  └──────────────────────────────────────────────────┘   │
+                     └─────────────────────────────────────────────────────────┘
+```
+
+## Components
+
+- **Host shim** (`containerd-shim-cloudhv-v1`): containerd shim v2, manages VM lifecycle,
+  creates disk images, hot-plugs block devices, sets up networking, forwards logs.
+- **Guest agent** (`cloudhv-agent`): PID 1 in the VM, discovers hot-plugged disks, adapts
+  OCI specs, delegates to crun.
+- **Communication**: vsock + ttrpc — no network stack for the control plane.
+- **Container runtime**: crun (1.8 MB static) — lighter than runc (10 MB).
+- **Kernel**: Custom kernel (~27 MB) with PVH boot, virtio, vsock, BPF, ACPI hot-plug,
+  IP_PNP, and virtio-net.
+
+## Sandbox and Container Split
+
+The shim uses the `io.kubernetes.cri.container-type` annotation to distinguish between
+sandbox creation and application containers:
+
+- **Sandbox** (`container-type=sandbox`): boots the Cloud Hypervisor VM. The VM **is** the
+  sandbox — no pause container needed. Networking (TAP + TC redirect) is set up at this stage.
+- **App container** (`container-type=container`): creates an ext4 disk image from the container
+  rootfs, hot-plugs it into the running VM, and the guest agent runs it with crun.
+
+## Container Rootfs via Block Devices
+
+Following the same approach as [firecracker-containerd](https://github.com/firecracker-microvm/firecracker-containerd):
+
+1. Host shim mounts the container rootfs from containerd's overlayfs snapshot
+2. Creates an ext4 disk image containing the OCI bundle + rootfs
+3. Hot-plugs the disk into the running VM via Cloud Hypervisor's `vm.add-disk` API
+4. Guest agent discovers the new `/dev/vdX` block device and mounts it
+5. `crun` runs the container with mount + PID namespaces on the real ext4 filesystem
+
+This avoids FUSE in the container data path and enables proper `pivot_root`.
+
+## Networking
+
+VM networking follows the [tc-redirect-tap](https://github.com/firecracker-microvm/firecracker-containerd)
+pattern used by firecracker-containerd, adapted for Cloud Hypervisor:
+
+1. **TAP creation**: the shim creates a TAP device inside the pod's network namespace
+2. **TC redirect**: bidirectional `tc filter` rules redirect all traffic between the
+   CNI veth and the TAP device at layer 2
+3. **IP flush**: the pod IP is removed from the veth so packets traverse TC into the VM
+4. **Kernel IP_PNP**: the pod IP, gateway, and netmask are passed as a kernel boot
+   parameter (`ip=<addr>::<gw>:<mask>::eth0:off`), so the guest kernel configures the
+   interface at boot — no agent-side networking code needed
+5. **CH in netns**: Cloud Hypervisor is launched inside the pod network namespace
+   (via `nsenter`) so it can access the TAP device
+
+The result is that the VM's `eth0` has the pod IP and responds to traffic on the pod
+network, fully transparent to CNI and Kubernetes services.
+
+## Container Logs
+
+Container stdout/stderr flows from the guest to `kubectl logs` without any agent-side
+log infrastructure:
+
+1. `crun` inside the VM writes stdout/stderr to files on the virtio-fs shared directory
+2. The host shim tails these files and forwards lines to containerd's stdio FIFOs
+3. containerd delivers them as standard container logs (`crictl logs`, `kubectl logs`)
+
+Infrastructure errors (VM boot failures, API errors, disk hot-plug issues) are logged
+via the shim's own logger and appear in the containerd log (`journalctl -u containerd`),
+keeping operator diagnostics separate from application output.
+
+## Snapshot/Restore
+
+The `SnapshotManager` captures a **golden snapshot** of a fully-booted VM (kernel up,
+agent running) and restores copies in ~55ms instead of cold-booting (~460ms):
+
+1. **Golden snapshot creation** (one-time, ~170ms): boot a minimal VM (disk + vsock,
+   no virtiofs), verify agent health, pause, snapshot to disk, shut down
+2. **Restore** (~55ms): start new CH process, restore from snapshot with per-instance
+   config.json (rewritten vsock paths, symlinked memory file), resume
+3. **Post-restore networking** (~50ms): hot-add virtio-net via `vm.add-net` API
+
+The golden snapshot excludes virtiofs because the vhost-user protocol state cannot
+reconnect to a fresh virtiofsd after restore. Container operations that need the
+shared directory (disk image hot-plug, I/O file forwarding) use full VM boot.
+The VM pool uses snapshot restore when a golden snapshot is available, falling back
+to cold boot transparently.
+
+## Embedded virtiofsd
+
+With the `embedded-virtiofsd` feature, virtiofsd runs as a thread inside the shim
+process instead of a separate daemon. This eliminates ~5 MB RSS per VM and reduces
+virtiofsd startup from ~10ms to ~277µs. The vhost-user socket is still created —
+Cloud Hypervisor connects to it the same way — but no child process is spawned.
+
+```bash
+cargo build --release -p containerd-shim-cloudhv --features embedded-virtiofsd
+```
+
+Requires `libseccomp-dev` and `libcap-ng-dev` on Linux.
