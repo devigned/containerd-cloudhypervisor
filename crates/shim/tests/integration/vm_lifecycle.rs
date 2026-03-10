@@ -170,6 +170,7 @@ fn test_vm_config_json_generation() {
         disks: vec![VmDisk {
             path: "/opt/rootfs.ext4".to_string(),
             readonly: false,
+            id: None,
         }],
         fs: vec![VmFs {
             tag: "containerfs".to_string(),
@@ -689,7 +690,7 @@ fn test_e2e_container_lifecycle_benchmark() {
             format!("{}/{}", cloudhv_common::VIRTIOFS_GUEST_MOUNT, container_id);
         create_req.stdout = stdout_guest;
         create_req.stderr = stderr_guest;
-        let ctx = ttrpc::context::with_timeout(30);
+        let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
         let create_result = agent.create_container(ctx, &create_req).await;
         let create_time = phase3_start.elapsed();
 
@@ -717,7 +718,7 @@ fn test_e2e_container_lifecycle_benchmark() {
         if create_result.is_ok() {
             let mut start_req = cloudhv_proto::StartContainerRequest::new();
             start_req.container_id = container_id.clone();
-            let ctx = ttrpc::context::with_timeout(30);
+            let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
             match agent.start_container(ctx, &start_req).await {
                 Ok(resp) => eprintln!(
                     "  Phase 4 │ StartContainer RPC:           {:>9.1?} (pid={})",
@@ -742,7 +743,7 @@ fn test_e2e_container_lifecycle_benchmark() {
         if create_result.is_ok() {
             let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
             wait_req.container_id = container_id.clone();
-            let ctx = ttrpc::context::with_timeout(30);
+            let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
             match tokio::time::timeout(
                 Duration::from_secs(10),
                 agent.wait_container(ctx, &wait_req),
@@ -775,7 +776,7 @@ fn test_e2e_container_lifecycle_benchmark() {
         let phase6_start = std::time::Instant::now();
         let mut del_req = cloudhv_proto::DeleteContainerRequest::new();
         del_req.container_id = container_id.clone();
-        let ctx = ttrpc::context::with_timeout(10);
+        let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(10));
         match agent.delete_container(ctx, &del_req).await {
             Ok(resp) => eprintln!(
                 "  Phase 6 │ DeleteContainer RPC:          {:>9.1?} (exit={})",
