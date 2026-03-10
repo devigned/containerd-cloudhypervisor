@@ -37,6 +37,7 @@ impl VmPool {
     }
 
     /// Pre-warm the pool by booting VMs up to the target size.
+    #[allow(dead_code)]
     pub async fn warm(&mut self) -> Result<()> {
         if self.target_size == 0 {
             debug!("VM pool disabled (pool_size=0)");
@@ -94,10 +95,17 @@ impl VmPool {
 
         vm.prepare().await.context("failed to prepare VM")?;
         vm.start_swtpm().await.context("failed to start swtpm")?;
-        vm.start_virtiofsd()
-            .await
-            .context("failed to start virtiofsd")?;
-        vm.start_vmm().await.context("failed to start VMM")?;
+
+        // Optimization: spawn virtiofsd and CH VMM in parallel
+        vm.spawn_virtiofsd().context("failed to spawn virtiofsd")?;
+        vm.spawn_vmm().context("failed to spawn VMM")?;
+
+        // Wait for both sockets in parallel
+        let (vfsd_result, vmm_result) =
+            tokio::join!(vm.wait_virtiofsd_ready(), vm.wait_vmm_ready(),);
+        vfsd_result.context("virtiofsd not ready")?;
+        vmm_result.context("VMM not ready")?;
+
         vm.create_and_boot_vm().await.context("failed to boot VM")?;
         vm.wait_for_agent().await.context("agent not ready")?;
 

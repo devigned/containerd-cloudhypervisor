@@ -40,7 +40,7 @@ impl AgentService for AgentServiceHandler {
         let pid = mgr
             .create(&req.container_id, &req.bundle_path, stdout, stderr)
             .await
-            .map_err(|e| ttrpc::Error::Others(format!("create_container failed: {e}")))?;
+            .map_err(|e| ttrpc::Error::Others(format!("create_container failed: {e:#}")))?;
         let mut resp = CreateContainerResponse::new();
         resp.pid = pid;
         Ok(resp)

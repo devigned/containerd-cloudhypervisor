@@ -92,6 +92,7 @@ fn bench_vm_config_serialization(c: &mut Criterion) {
         disks: vec![VmDisk {
             path: "/opt/cloudhv/rootfs.ext4".to_string(),
             readonly: false,
+            id: None,
         }],
         fs: vec![VmFs {
             tag: "containerfs".to_string(),

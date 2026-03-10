@@ -4,7 +4,7 @@
 #
 # Contents:
 # - cloudhv-agent binary (statically linked, as PID 1)
-# - runc binary (statically linked)
+# - crun binary (statically linked, lightweight OCI runtime)
 # - Minimal /etc (passwd, group)
 # - Essential directory structure
 #
@@ -50,23 +50,23 @@ chmod 755 "${ROOTFS_DIR}/init"
 cp "${AGENT_BINARY}" "${ROOTFS_DIR}/bin/cloudhv-agent"
 chmod 755 "${ROOTFS_DIR}/bin/cloudhv-agent"
 
-# Install runc
-echo "Installing runc..."
-if command -v runc &>/dev/null; then
-    cp "$(command -v runc)" "${ROOTFS_DIR}/bin/runc"
-    chmod 755 "${ROOTFS_DIR}/bin/runc"
+# Install crun (lightweight OCI runtime, ~1.5MB static binary)
+echo "Installing crun..."
+if command -v crun &>/dev/null; then
+    cp "$(command -v crun)" "${ROOTFS_DIR}/bin/crun"
+    chmod 755 "${ROOTFS_DIR}/bin/crun"
 else
-    echo "WARNING: runc not found in PATH. Downloading static binary..."
-    RUNC_VERSION="v1.2.4"
+    echo "WARNING: crun not found in PATH. Downloading static binary..."
+    CRUN_VERSION="1.20"
     ARCH=$(uname -m)
     case "${ARCH}" in
-        x86_64) RUNC_ARCH="amd64" ;;
-        aarch64) RUNC_ARCH="arm64" ;;
+        x86_64) CRUN_ARCH="amd64" ;;
+        aarch64) CRUN_ARCH="arm64" ;;
         *) echo "Unsupported arch: ${ARCH}"; exit 1 ;;
     esac
-    wget -q "https://github.com/opencontainers/runc/releases/download/${RUNC_VERSION}/runc.${RUNC_ARCH}" \
-        -O "${ROOTFS_DIR}/bin/runc"
-    chmod 755 "${ROOTFS_DIR}/bin/runc"
+    wget -q "https://github.com/containers/crun/releases/download/${CRUN_VERSION}/crun-${CRUN_VERSION}-linux-${CRUN_ARCH}-disable-systemd" \
+        -O "${ROOTFS_DIR}/bin/crun"
+    chmod 755 "${ROOTFS_DIR}/bin/crun"
 fi
 
 # Minimal /etc

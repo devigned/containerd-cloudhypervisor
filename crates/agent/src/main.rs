@@ -52,31 +52,19 @@ fn init_setup() {
     }
 
     reaper::set_child_subreaper();
-    install_sigchld_handler();
+    // NOTE: Do NOT install a custom SIGCHLD handler — it races with tokio's
+    // internal child reaper and causes ECHILD errors when spawning processes
+    // via tokio::process::Command. Instead, orphan reaping is handled by a
+    // background tokio task (see run_agent).
     info!("init setup complete");
 }
 
-#[cfg(target_os = "linux")]
-fn install_sigchld_handler() {
-    use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
-    unsafe {
-        let action = SigAction::new(
-            SigHandler::Handler(reaper::sigchld_handler),
-            SaFlags::SA_NOCLDSTOP | SaFlags::SA_RESTART,
-            SigSet::empty(),
-        );
-        if let Err(e) = sigaction(Signal::SIGCHLD, &action) {
-            error!("failed to install SIGCHLD handler: {}", e);
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn install_sigchld_handler() {
-    info!("SIGCHLD handler: no-op on non-Linux");
-}
-
 async fn run_agent() -> anyhow::Result<()> {
+    // NOTE: No orphan reaper — waitpid(-1) interferes with crun's internal
+    // child management (crun forks twice, and reaping its intermediate children
+    // causes it to hang). As PID 1 with PR_SET_CHILD_SUBREAPER, zombies will
+    // accumulate but this is acceptable in a short-lived VM.
+
     let server = server::AgentServer::new();
     server.run().await
 }

@@ -89,7 +89,7 @@ impl VsockClient {
     pub async fn health_check(&self) -> Result<bool> {
         match self.connect_ttrpc().await {
             Ok((_agent, health)) => {
-                let ctx = ttrpc::context::with_timeout(5);
+                let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(5));
                 let req = cloudhv_proto::CheckRequest::new();
                 match health.check(ctx, &req).await {
                     Ok(resp) => {

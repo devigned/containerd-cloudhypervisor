@@ -149,6 +149,8 @@ pub struct VmDisk {
     pub path: String,
     #[serde(default)]
     pub readonly: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,12 +179,21 @@ pub struct VmVsock {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmConsoleConfig {
     pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
 }
 
 impl VmConsoleConfig {
     pub fn off() -> Self {
         Self {
             mode: "Off".to_string(),
+            file: None,
+        }
+    }
+    pub fn file(path: &str) -> Self {
+        Self {
+            mode: "File".to_string(),
+            file: Some(path.to_string()),
         }
     }
 }

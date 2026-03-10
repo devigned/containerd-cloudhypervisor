@@ -1,6 +1,5 @@
 use containerd_shim::asynchronous::run;
 use containerd_shim::Config;
-use log::info;
 
 mod config;
 mod hypervisor;
@@ -12,17 +11,11 @@ mod vsock;
 
 use instance::CloudHvShim;
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    info!(
-        "containerd-shim-cloudhv-v1 starting (version {})",
-        env!("CARGO_PKG_VERSION")
-    );
-
-    let backend = hypervisor::detect_hypervisor();
-    info!("hypervisor backend: {}", backend);
-
+    // IMPORTANT: Do NOT log anything before run() returns.
+    // During the "start" action, containerd reads the shim's stdout+stderr
+    // to get the TTRPC socket address. Any output corrupts the address.
     let config = Config {
         no_reaper: false,
         no_sub_reaper: false,

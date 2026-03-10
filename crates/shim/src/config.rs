@@ -5,7 +5,7 @@ use cloudhv_common::types::RuntimeConfig;
 use log::debug;
 
 /// Default configuration file path.
-const DEFAULT_CONFIG_PATH: &str = "/etc/containerd/cloudhv-runtime.json";
+const DEFAULT_CONFIG_PATH: &str = "/opt/cloudhv/config.json";
 
 /// Load runtime configuration from the default path or a specified path.
 pub fn load_config(path: Option<&str>) -> Result<RuntimeConfig> {

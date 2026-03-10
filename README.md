@@ -8,10 +8,12 @@ that runs container workloads inside lightweight microVMs with maximum density a
 ### When to Choose containerd-cloudhypervisor
 
 Choose this shim when you are building a **platform** where you control the stack and need:
-- **Maximum density** — 105ms boot, ~25 MB overhead per VM, sub-second container start from pool
-- **Minimal trusted computing base** — shim (2.4 MB) + agent (1.5 MB), no shell, no package manager in guest
-- **Dual hypervisor support** — same binary runs on KVM (Linux) and MSHV (Azure/Hyper-V) with zero code changes
-- **Tight VMM control** — direct Cloud Hypervisor API integration, configurable hotplug, virtio-mem, TPM
+
+- **Fast cold start** — ~460ms sandbox boot + container start on 8-vCPU host
+- **VM isolation** — each pod runs in its own Cloud Hypervisor microVM with dedicated kernel
+- **Block device rootfs** — container images delivered as hot-plugged virtio-blk disks (no FUSE)
+- **Dual hypervisor support** — same binary runs on KVM (Linux) and MSHV (Azure/Hyper-V)
+- **Multi-container pods** — mount + PID namespace isolation within the VM
 
 This is ideal for serverless/FaaS platforms, container-as-a-service offerings, and security-sensitive
 workloads where VM isolation is required but Kata's full feature set is unnecessary overhead.
@@ -19,6 +21,7 @@ workloads where VM isolation is required but Kata's full feature set is unnecess
 ### When to Choose Kata Containers Instead
 
 Choose [Kata Containers](https://katacontainers.io/) when:
+
 - You need **multi-hypervisor flexibility** (swap between Cloud Hypervisor, QEMU, Firecracker)
 - You want **mature Kubernetes integration** (RuntimeClass, annotations, full CRI support)
 - You need **advanced features**: GPU passthrough, live migration (QEMU), full CSI support
@@ -28,7 +31,7 @@ Choose [Kata Containers](https://katacontainers.io/) when:
 ### Key Differences
 
 | | containerd-cloudhypervisor | Kata Containers |
-|---|---|---|
+| --- | --- | --- |
 | **Boot time** | 105ms (KVM), 178ms (MSHV) | ~500ms–1s |
 | **Shim binary** | 2.4 MB | ~50 MB |
 | **Agent binary** | 1.5 MB (static) | ~20 MB |
@@ -40,57 +43,74 @@ Choose [Kata Containers](https://katacontainers.io/) when:
 
 ## Performance
 
-Measured on Azure D2s_v5 (KVM) and D16as_v6 (MSHV):
+Measured on Azure D8s_v5 (KVM, 8 vCPU):
 
-| Metric | KVM | MSHV |
-|--------|-----|------|
-| Guest boot + agent ready | **105ms** | **178ms** |
-| VM config serialization | 1.4μs | 1.4μs |
-| Image cache hit | 140ns | 140ns |
-| vCPU hotplug resize | ✅ | ✅ |
-| Pool acquire (pre-warmed) | O(1) | O(1) |
-| Integration tests (13) | 5.9s | 6.8s |
+| Phase | Latency |
+| ------- | --------- |
+| VM boot (sandbox) | **257ms** |
+| Container create (disk image + hot-plug) | **58ms** |
+| Container start (crun run) | **145ms** |
+| **Total cold start** | **~460ms** |
+| Sandbox stop + cleanup | **92ms** |
+
+| Resource | Overhead |
+| ---------- | ---------- |
+| Cloud Hypervisor (VMM) | ~50 MB RSS |
+| virtiofsd | ~5 MB RSS |
+| Shim processes | ~10 MB RSS |
+| VM guest memory | 512 MB (configurable) |
 
 ## Architecture
 
-```
+```text
 containerd ──ttrpc──► containerd-shim-cloudhv-v1 ──HTTP/UDS──► cloud-hypervisor
-                                                                     │
-                                                              ┌──────▼──────┐
-                                                              │  Guest VM   │
-                                                              │  ┌────────┐ │
-                                              ttrpc/vsock ◄───┤  │ Agent  │ │
-                                                              │  └───┬────┘ │
-                                                              │  ┌───▼────┐ │
-                                                              │  │ runc   │ │
-                                                              │  └────────┘ │
-                                                              └─────────────┘
+                              │                                      │
+                              │ create disk image                ┌───▼───────┐
+                              │ hot-plug via vm.add-disk         │  Guest VM │
+                              │                                  │ ┌───────┐ │
+                              └─── ttrpc/vsock ──────────────────┤ │ Agent │ │
+                                                                 │ └──┬────┘ │
+                                                                 │ ┌──▼───┐  │
+                                                                 │ │ crun │  │
+                                                                 │ └──────┘  │
+                                                                 └───────────┘
 ```
 
-- **Host shim** (`containerd-shim-cloudhv-v1`): Implements containerd shim v2 protocol, manages
-  Cloud Hypervisor VM lifecycle via REST API, communicates with the guest agent over vsock/ttrpc.
-- **Guest agent** (`cloudhv-agent`): Runs as PID 1 (init) inside the VM, receives container
-  lifecycle commands over ttrpc/vsock, delegates to runc for container execution.
-- **Communication**: vsock + ttrpc — no network stack required for the control plane.
-- **Storage**: virtio-fs with shared memory — avoids guest page cache duplication.
-- **Kernel**: Minimal custom kernel (~23 MB) with PVH boot, virtio, vsock, overlayfs, cgroups v2.
+**Container rootfs delivery via block devices** (like firecracker-containerd):
+
+1. Host shim mounts the container rootfs from containerd's overlayfs snapshot
+2. Creates an ext4 disk image containing the OCI bundle + rootfs
+3. Hot-plugs the disk into the running VM via Cloud Hypervisor's `vm.add-disk` API
+4. Guest agent discovers the new `/dev/vdX` block device and mounts it
+5. `crun` runs the container with mount + PID namespaces on the real filesystem
+
+- **Host shim** (`containerd-shim-cloudhv-v1`): containerd shim v2, manages VM lifecycle,
+  creates disk images, hot-plugs block devices.
+- **Guest agent** (`cloudhv-agent`): PID 1 in the VM, discovers hot-plugged disks, adapts
+  OCI specs, delegates to crun.
+- **Communication**: vsock + ttrpc — no network stack for the control plane.
+- **Container runtime**: crun (1.5 MB static) — lighter than runc (10 MB).
+- **Kernel**: Custom kernel (~27 MB) with PVH boot, virtio, vsock, BPF, ACPI hot-plug.
 
 ## Features
 
 ### Core
+
 - **Dual hypervisor backend**: KVM and MSHV — Cloud Hypervisor auto-selects at runtime
 - **VM pooling**: Pre-warmed VMs for instant container start
 - **CPU/Memory hotplug**: Dynamic resource allocation via `vm.resize` API
 - **virtio-mem**: Sub-block memory granularity for tight packing
-- **File-based I/O proxy**: Container stdout/stderr via virtio-fs shared directory
-- **Multi-container per VM**: Amortized VM overhead with reference-counted cleanup
+- **Block device rootfs**: Hot-plugged virtio-blk disks via CH `vm.add-disk` API
+- **Multi-container per VM**: Mount + PID namespace isolation per container
 
 ### Security
+
 - **TPM 2.0**: swtpm integration for measured boot
-- **Minimal guest**: No shell, no package manager — agent + runc only
+- **Minimal guest**: No shell, no package manager — agent + crun only
 - **VmManager Drop cleanup**: Processes killed and state removed even on panic
 
 ### Operations
+
 - **Live migration**: Zero-downtime VMM upgrades via `send_migration`/`receive_migration`
 - **Snapshot/restore**: Pause → save state → restore with optional config changes
 - **OCI image layer cache**: Reference-counted shared layers, deduplication across VMs
@@ -99,7 +119,7 @@ containerd ──ttrpc──► containerd-shim-cloudhv-v1 ──HTTP/UDS──�
 ## Crates
 
 | Crate | Description |
-|-------|-------------|
+| ------- | ------------- |
 | `crates/shim` | Host shim binary (`containerd-shim-cloudhv-v1`) |
 | `crates/agent` | Guest agent binary (`cloudhv-agent`) |
 | `crates/proto` | Protobuf/ttrpc service definitions (auto-generated) |
@@ -159,7 +179,7 @@ sudo cargo test -p containerd-shim-cloudhv --test integration -- --nocapture --t
 Runtime configuration is loaded from `/etc/containerd/cloudhv-runtime.json`:
 
 | Field | Default | Description |
-|-------|---------|-------------|
+| ------- | --------- | ------------- |
 | `cloud_hypervisor_binary` | `/usr/local/bin/cloud-hypervisor` | Path to CH binary |
 | `virtiofsd_binary` | `/usr/libexec/virtiofsd` | Path to virtiofsd |
 | `kernel_path` | — | Path to guest vmlinux |
@@ -206,20 +226,39 @@ cargo bench -p containerd-shim-cloudhv --bench vm_overhead
 sudo cargo test -p containerd-shim-cloudhv --test integration -- --nocapture test_vm_lifecycle_timing
 ```
 
+### AKS Example
+
+See [`example/aks/`](example/aks/) for a complete example of running VM-isolated containers on Azure Kubernetes Service. The example includes:
+
+- DaemonSet installer that deploys the shim, kernel, rootfs, and cloud-hypervisor onto AKS nodes
+- RuntimeClass configuration for the `cloudhv` runtime
+- Setup/teardown scripts for AKS cluster provisioning
+
+```bash
+# Quick test on an AKS cluster with the cloudhv runtime installed:
+kubectl run test --image=busybox:latest --restart=Never --runtime-class=cloudhv -- echo hello
+kubectl logs test
+kubectl delete pod test
+```
+
 ## Contributing
 
 1. **Fork and clone** the repository
 2. **Set up a Linux VM** with KVM for testing (Azure D-series VMs with nested virt work well)
 3. **Build and test** on both macOS (compile check) and Linux (integration tests):
+
    ```bash
    cargo fmt --all -- --check
    cargo clippy --all-targets --all-features -- -D warnings
    cargo test --workspace
    ```
+
 4. **Integration tests require root** (for `/run/cloudhv/` and Cloud Hypervisor):
+
    ```bash
    sudo cargo test -p containerd-shim-cloudhv --test integration -- --nocapture --test-threads=1
    ```
+
 5. **Submit a PR** — CI runs lint, build (gnu + musl), unit tests, and integration tests with KVM
 
 ### Code Quality Standards

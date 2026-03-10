@@ -3,7 +3,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
@@ -113,8 +113,8 @@ impl VmManager {
             .arg("--log")
             .arg("level=1")
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .context("failed to spawn swtpm")?;
 
@@ -136,73 +136,70 @@ impl VmManager {
     }
 
     /// Start virtiofsd to serve the shared directory.
-    pub async fn start_virtiofsd(&mut self) -> Result<()> {
-        info!(
-            "starting virtiofsd: socket={}, shared_dir={}",
-            self.virtiofsd_socket.display(),
-            self.shared_dir.display()
-        );
-
+    /// Returns immediately after spawning — use `wait_virtiofsd_ready()` to wait.
+    pub fn spawn_virtiofsd(&mut self) -> Result<()> {
         let child = Command::new(&self.config.virtiofsd_binary)
             .arg(format!("--socket-path={}", self.virtiofsd_socket.display()))
             .arg(format!("--shared-dir={}", self.shared_dir.display()))
             .arg("--cache=never")
             .arg("--sandbox=none")
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .context("failed to spawn virtiofsd")?;
-
         self.virtiofsd_process = Some(child);
+        Ok(())
+    }
 
-        // Wait briefly for the socket to appear
-        for _ in 0..20 {
+    /// Wait for virtiofsd socket to appear.
+    pub async fn wait_virtiofsd_ready(&self) -> Result<()> {
+        for _ in 0..200 {
             if self.virtiofsd_socket.exists() {
-                debug!("virtiofsd socket ready");
                 return Ok(());
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-
-        anyhow::bail!(
-            "virtiofsd socket did not appear at {}",
-            self.virtiofsd_socket.display()
-        );
+        anyhow::bail!("virtiofsd socket did not appear");
     }
 
     /// Start the Cloud Hypervisor VMM process.
-    pub async fn start_vmm(&mut self) -> Result<()> {
-        info!(
-            "starting cloud-hypervisor: api_socket={}",
-            self.api_socket.display()
-        );
-
+    /// Returns immediately after spawning — use `wait_vmm_ready()` to wait.
+    pub fn spawn_vmm(&mut self) -> Result<()> {
         let ch_binary = &self.config.cloud_hypervisor_binary;
         let child = Command::new(ch_binary)
             .arg("--api-socket")
             .arg(&self.api_socket)
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .with_context(|| format!("failed to spawn cloud-hypervisor at {ch_binary}"))?;
-
         self.ch_process = Some(child);
+        Ok(())
+    }
 
-        // Wait for the API socket to appear
-        for _ in 0..50 {
+    /// Wait for CH API socket to appear.
+    pub async fn wait_vmm_ready(&self) -> Result<()> {
+        for _ in 0..500 {
             if self.api_socket.exists() {
-                debug!("cloud-hypervisor API socket ready");
                 return Ok(());
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        anyhow::bail!("cloud-hypervisor API socket did not appear");
+    }
 
-        anyhow::bail!(
-            "cloud-hypervisor API socket did not appear at {}",
-            self.api_socket.display()
-        );
+    #[allow(dead_code)]
+    pub async fn start_virtiofsd(&mut self) -> Result<()> {
+        self.spawn_virtiofsd()?;
+        self.wait_virtiofsd_ready().await
+    }
+
+    #[allow(dead_code)]
+    pub async fn start_vmm(&mut self) -> Result<()> {
+        self.spawn_vmm()?;
+        self.wait_vmm_ready().await
     }
 
     /// Create and boot the VM via the Cloud Hypervisor HTTP API.
@@ -240,6 +237,7 @@ impl VmManager {
             disks: vec![VmDisk {
                 path: self.config.rootfs_path.clone(),
                 readonly: false,
+                id: None,
             }],
             fs: vec![VmFs {
                 tag: VIRTIOFS_TAG.to_string(),
@@ -251,7 +249,9 @@ impl VmManager {
                 cid: self.cid,
                 socket: self.vsock_socket.to_string_lossy().to_string(),
             }),
-            serial: Some(VmConsoleConfig::off()),
+            serial: Some(VmConsoleConfig::file(
+                &self.state_dir.join("console.log").to_string_lossy(),
+            )),
             console: Some(VmConsoleConfig::off()),
             tpm: if self.config.tpm_enabled {
                 Some(VmTpm {
@@ -266,16 +266,11 @@ impl VmManager {
         debug!("VM config: {}", config_json);
 
         // PUT /api/v1/vm.create
-        let create_resp = self
-            .api_request("PUT", "/api/v1/vm.create", Some(&config_json))
+        self.api_request("PUT", "/api/v1/vm.create", Some(&config_json))
             .await
             .context("failed to create VM")?;
-        info!("VM create response: {}", create_resp);
 
-        // Small delay between create and boot
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // PUT /api/v1/vm.boot
+        // PUT /api/v1/vm.boot — no delay needed, CH is ready immediately
         self.api_request("PUT", "/api/v1/vm.boot", None)
             .await
             .context("failed to boot VM")?;
@@ -303,7 +298,7 @@ impl VmManager {
                 info!("guest agent is ready (cid={})", self.cid);
                 return Ok(());
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
         anyhow::bail!(
@@ -344,16 +339,17 @@ impl VmManager {
         }
     }
 
-    /// Send an HTTP request to the Cloud Hypervisor API over Unix socket.
-    async fn api_request(&self, method: &str, path: &str, body: Option<&str>) -> Result<String> {
-        let mut stream = UnixStream::connect(&self.api_socket)
+    /// Send an HTTP request to a Cloud Hypervisor API socket.
+    /// Static version for use when the VmManager is behind a Mutex.
+    pub async fn api_request_to_socket(
+        api_socket: &Path,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> Result<String> {
+        let mut stream = UnixStream::connect(api_socket)
             .await
-            .with_context(|| {
-                format!(
-                    "failed to connect to CH API socket: {}",
-                    self.api_socket.display()
-                )
-            })?;
+            .with_context(|| format!("connect to CH API: {}", api_socket.display()))?;
 
         let request = match body {
             Some(b) if !b.is_empty() => format!(
@@ -361,82 +357,62 @@ impl VmManager {
                 b.len()
             ),
             _ => format!(
-                "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Length: 0\r\n\r\n"
+                "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\r\n"
             ),
         };
 
-        debug!("CH API request: {} {}", method, path);
         stream.write_all(request.as_bytes()).await?;
 
-        // Give CH a moment to process before reading
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Read response with a timeout
         let mut response = Vec::new();
-        let mut buf = [0u8; 4096];
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match tokio::time::timeout(
-                std::cmp::min(remaining, Duration::from_secs(5)),
+            let mut buf = [0u8; 4096];
+            let read_result = tokio::time::timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
                 stream.read(&mut buf),
             )
-            .await
-            {
-                Ok(Ok(0)) => break, // EOF
+            .await;
+            match read_result {
+                Ok(Ok(0)) => break,
                 Ok(Ok(n)) => {
                     response.extend_from_slice(&buf[..n]);
-                    // Check if we have a complete response (headers + body)
-                    if let Some(pos) = find_subsequence(&response, b"\r\n\r\n") {
-                        // Check for Content-Length to know if we have full body
-                        let header_str = String::from_utf8_lossy(&response[..pos]);
-                        if let Some(cl) = parse_content_length(&header_str) {
-                            let body_start = pos + 4;
-                            if response.len() >= body_start + cl {
-                                break; // Full response received
+                    if find_subsequence(&response, b"\r\n\r\n").is_some() {
+                        let headers = String::from_utf8_lossy(&response);
+                        if let Some(cl) = parse_content_length(&headers) {
+                            let header_end = find_subsequence(&response, b"\r\n\r\n").unwrap() + 4;
+                            if response.len() >= header_end + cl {
+                                break;
                             }
-                        } else {
-                            // No Content-Length — for 204 No Content, headers are enough
+                        } else if !headers.contains("Content-Length") {
                             break;
                         }
                     }
                 }
-                Ok(Err(e)) => return Err(e.into()),
-                Err(_) => break, // Timeout
+                Ok(Err(e)) => anyhow::bail!("read error: {e}"),
+                Err(_) => anyhow::bail!("API request timed out"),
             }
         }
 
-        let response_str = String::from_utf8_lossy(&response).to_string();
-        debug!(
-            "CH API response ({} bytes): {}",
-            response.len(),
-            &response_str[..std::cmp::min(response_str.len(), 200)]
-        );
-
-        // Parse HTTP status line
-        let status_line = response_str.lines().next().unwrap_or("");
-        let status_code: u16 = status_line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-
-        if (200..300).contains(&status_code) {
-            debug!("API {method} {path} -> {status_code}");
-            let body = response_str
-                .split("\r\n\r\n")
-                .nth(1)
-                .unwrap_or("")
-                .to_string();
-            Ok(body)
-        } else {
-            error!("API {method} {path} -> {status_code}");
-            error!("Response body: {response_str}");
-            anyhow::bail!("CH API error: {status_code} for {method} {path}: {response_str}")
+        let resp_str = String::from_utf8_lossy(&response);
+        if let Some(status_line) = resp_str.lines().next() {
+            if !status_line.contains("200")
+                && !status_line.contains("204")
+                && !status_line.contains("201")
+            {
+                anyhow::bail!("API error: {}", resp_str.trim());
+            }
         }
+
+        if let Some(body_start) = find_subsequence(&response, b"\r\n\r\n") {
+            Ok(String::from_utf8_lossy(&response[body_start + 4..]).to_string())
+        } else {
+            Ok(String::new())
+        }
+    }
+
+    /// Send an HTTP request to the Cloud Hypervisor API over Unix socket.
+    async fn api_request(&self, method: &str, path: &str, body: Option<&str>) -> Result<String> {
+        Self::api_request_to_socket(&self.api_socket, method, path, body).await
     }
 
     /// Resize VM resources (vCPUs and/or memory) via the CH API.
@@ -475,6 +451,43 @@ impl VmManager {
             .context("failed to resize VM")?;
 
         info!("VM {} resized successfully", self.vm_id);
+        Ok(())
+    }
+
+    /// Hot-plug a virtio-blk disk into the running VM.
+    ///
+    /// Used to deliver container rootfs as block devices. The guest kernel
+    /// detects the new disk via ACPI hot-plug and it appears as /dev/vdX.
+    /// Returns the disk ID for later removal.
+    #[allow(dead_code)]
+    pub async fn add_disk(&self, path: &str, disk_id: &str, readonly: bool) -> Result<()> {
+        let disk = VmDisk {
+            path: path.to_string(),
+            readonly,
+            id: Some(disk_id.to_string()),
+        };
+        let body = serde_json::to_string(&disk)?;
+        info!(
+            "hot-plugging disk to VM {}: id={} path={}",
+            self.vm_id, disk_id, path
+        );
+
+        self.api_request("PUT", "/api/v1/vm.add-disk", Some(&body))
+            .await
+            .context("failed to hot-plug disk")?;
+
+        info!("disk {} hot-plugged to VM {}", disk_id, self.vm_id);
+        Ok(())
+    }
+
+    /// Remove a previously hot-plugged disk from the VM.
+    #[allow(dead_code)]
+    pub async fn remove_disk(&self, disk_id: &str) -> Result<()> {
+        let body = format!(r#"{{"id":"{}"}}"#, disk_id);
+        self.api_request("PUT", "/api/v1/vm.remove-device", Some(&body))
+            .await
+            .context("failed to remove disk")?;
+        info!("disk {} removed from VM {}", disk_id, self.vm_id);
         Ok(())
     }
 
@@ -675,6 +688,7 @@ impl VmManager {
         &self.vm_id
     }
 
+    #[allow(dead_code)]
     pub fn cid(&self) -> u64 {
         self.cid
     }
@@ -685,6 +699,16 @@ impl VmManager {
 
     pub fn shared_dir(&self) -> &Path {
         &self.shared_dir
+    }
+
+    pub fn api_socket_path(&self) -> &Path {
+        &self.api_socket
+    }
+
+    /// Get the PIDs of child processes for debugging.
+    #[allow(dead_code)]
+    pub fn virtiofsd_pid(&self) -> Option<u32> {
+        self.virtiofsd_process.as_ref().and_then(|c| c.id())
     }
 
     #[allow(dead_code)]
@@ -698,32 +722,29 @@ impl VmManager {
 /// the async cleanup path is never reached.
 impl Drop for VmManager {
     fn drop(&mut self) {
-        // Kill child processes synchronously using their PIDs
+        // Kill child processes aggressively — SIGKILL to prevent orphans
         for (name, proc) in [
             ("cloud-hypervisor", &mut self.ch_process),
             ("virtiofsd", &mut self.virtiofsd_process),
             ("swtpm", &mut self.swtpm_process),
         ] {
             if let Some(child) = proc.take() {
-                let pid = child.id();
-                if let Some(pid) = pid {
+                if let Some(pid) = child.id() {
                     unsafe {
-                        libc::kill(pid as i32, libc::SIGTERM);
+                        libc::kill(pid as i32, libc::SIGKILL);
                     }
-                    debug!("sent SIGTERM to {} (pid={})", name, pid);
+                    // Wait synchronously to reap the zombie
+                    unsafe {
+                        libc::waitpid(pid as i32, std::ptr::null_mut(), 0);
+                    }
+                    info!("killed {} (pid={})", name, pid);
                 }
             }
         }
 
         // Remove state directory
         if self.state_dir.exists() {
-            if let Err(e) = std::fs::remove_dir_all(&self.state_dir) {
-                debug!(
-                    "failed to remove state dir {}: {}",
-                    self.state_dir.display(),
-                    e
-                );
-            }
+            let _ = std::fs::remove_dir_all(&self.state_dir);
         }
     }
 }

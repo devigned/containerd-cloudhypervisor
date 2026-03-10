@@ -31,6 +31,9 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# OCI runtime spec
+oci-spec = "0.7"
+
 # Logging
 log = { workspace = true }
 env_logger = { workspace = true }

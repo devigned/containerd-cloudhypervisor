@@ -8,7 +8,7 @@ use containerd_shim::asynchronous::{spawn, ExitSignal, Shim};
 use containerd_shim::{Config, Error, Flags, StartOpts, TtrpcResult};
 use containerd_shim_protos::shim_async::Task;
 use containerd_shim_protos::ttrpc::r#async::TtrpcContext;
-use log::{debug, info};
+use log::info;
 
 use crate::config::load_config;
 use crate::pool::VmPool;
@@ -19,6 +19,7 @@ struct VmState {
     vm: VmManager,
     agent: cloudhv_proto::AgentServiceClient,
     container_count: usize,
+    shared_dir: std::path::PathBuf,
 }
 
 /// Per-container state tracked by the shim.
@@ -48,10 +49,11 @@ impl Shim for CloudHvShim {
     type T = CloudHvShim;
 
     async fn new(_runtime_id: &str, _args: &Flags, _config: &mut Config) -> Self {
-        // Load config to initialize pool
-        let rt_config = load_config(None).unwrap_or_else(|_| {
-            // If config doesn't exist, use defaults (pool_size=0 means no pooling)
-            cloudhv_common::types::RuntimeConfig {
+        // Load config but don't warm the pool here — new() is called for
+        // every shim action (start, delete, main). Pool warming should only
+        // happen in the main daemon loop, not during the "start" fork.
+        let rt_config =
+            load_config(None).unwrap_or_else(|_| cloudhv_common::types::RuntimeConfig {
                 cloud_hypervisor_binary: cloudhv_common::DEFAULT_CH_BINARY.to_string(),
                 virtiofsd_binary: cloudhv_common::DEFAULT_VIRTIOFSD_BINARY.to_string(),
                 kernel_path: String::new(),
@@ -67,13 +69,9 @@ impl Shim for CloudHvShim {
                 hotplug_memory_mb: 0,
                 hotplug_method: "acpi".to_string(),
                 tpm_enabled: false,
-            }
-        });
+            });
 
-        let mut pool = VmPool::new(rt_config);
-        if let Err(e) = pool.warm().await {
-            info!("VM pool warm failed (non-fatal): {e}");
-        }
+        let pool = VmPool::new(rt_config);
 
         CloudHvShim {
             exit: Arc::new(ExitSignal::default()),
@@ -84,7 +82,19 @@ impl Shim for CloudHvShim {
     }
 
     async fn start_shim(&mut self, opts: StartOpts) -> Result<String, Error> {
-        let address = spawn(opts, "", Vec::new()).await?;
+        // Use Kubernetes sandbox-id annotation for grouping (like runwasi).
+        // This ensures all containers in a pod share the same shim instance.
+        let dir = std::env::current_dir().map_err(|e| Error::Other(e.to_string()))?;
+        let grouping = match oci_spec::runtime::Spec::load(dir.join("config.json")) {
+            Ok(spec) => spec
+                .annotations()
+                .as_ref()
+                .and_then(|a| a.get("io.kubernetes.cri.sandbox-id"))
+                .cloned()
+                .unwrap_or_else(|| opts.id.clone()),
+            Err(_) => opts.id.clone(),
+        };
+        let address = spawn(opts, &grouping, Vec::new()).await?;
         Ok(address)
     }
 
@@ -100,6 +110,16 @@ impl Shim for CloudHvShim {
         &self,
         _publisher: containerd_shim::asynchronous::publisher::RemotePublisher,
     ) -> Self::T {
+        // Initialize logging in daemon mode only — never before run()
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+            .try_init()
+            .ok();
+        let backend = crate::hypervisor::detect_hypervisor();
+        log::info!(
+            "containerd-shim-cloudhv-v1 daemon started (version {}, hypervisor: {})",
+            env!("CARGO_PKG_VERSION"),
+            backend
+        );
         self.clone()
     }
 }
@@ -125,65 +145,215 @@ impl CloudHvShim {
         })?;
         Ok(vm_state.agent.clone())
     }
-}
 
-#[async_trait]
-impl Task for CloudHvShim {
-    async fn create(
-        &self,
-        _ctx: &TtrpcContext,
-        req: api::CreateTaskRequest,
-    ) -> TtrpcResult<api::CreateTaskResponse> {
-        let container_id = req.id.clone();
-        info!("creating container: {}", container_id);
+    /// Create a sandbox: boot the VM. The VM IS the sandbox — it provides
+    /// network, PID, and mount isolation. No pause container is needed.
+    async fn create_sandbox(&self, sandbox_id: &str) -> TtrpcResult<api::CreateTaskResponse> {
+        info!("creating sandbox (VM): {}", sandbox_id);
 
         let config = load_config(None).map_err(|e| {
             containerd_shim_protos::ttrpc::Error::Others(format!("config error: {e}"))
         })?;
 
-        // Try to acquire a pre-warmed VM from the pool, otherwise create one
         let (vm, agent) = {
             let mut pool = self.pool.lock().await;
             if let Some(warm) = pool.try_acquire() {
                 info!("acquired VM {} from pool", warm.vm.vm_id());
                 (warm.vm, warm.agent)
             } else {
-                // No pool VM available — create on demand
-                let vm_id = container_id.clone();
-                let pool_ref = VmPool::new(config.clone());
-                let warm = pool_ref.create_warm_vm_with_id(vm_id).await.map_err(|e| {
-                    containerd_shim_protos::ttrpc::Error::Others(format!("VM creation error: {e}"))
-                })?;
+                let pool_ref = VmPool::new(config);
+                let warm = pool_ref
+                    .create_warm_vm_with_id(sandbox_id.to_string())
+                    .await
+                    .map_err(|e| {
+                        containerd_shim_protos::ttrpc::Error::Others(format!(
+                            "VM creation error: {e}"
+                        ))
+                    })?;
                 (warm.vm, warm.agent)
             }
         };
+        let shared_dir = vm.shared_dir().to_path_buf();
         let vm_id = vm.vm_id().to_string();
 
-        // Set up I/O files in the virtio-fs shared directory
-        let io_dir = vm.shared_dir().join("io").join(&container_id);
+        self.vms.lock().unwrap().insert(
+            vm_id.clone(),
+            VmState {
+                vm,
+                agent,
+                container_count: 0,
+                shared_dir,
+            },
+        );
+
+        // Track the sandbox as a "container" so start/kill/delete work on it
+        self.containers.lock().unwrap().insert(
+            sandbox_id.to_string(),
+            ContainerState {
+                vm_id,
+                pid: Some(1), // agent is PID 1 inside the VM
+                exit_code: None,
+                _exited_at: None,
+                _stdout_path: None,
+                _stderr_path: None,
+            },
+        );
+
+        info!("sandbox VM {} ready", sandbox_id);
+        let mut resp = api::CreateTaskResponse::new();
+        resp.pid = std::process::id();
+        Ok(resp)
+    }
+
+    /// Create an application container inside an existing sandbox VM.
+    async fn create_container(
+        &self,
+        container_id: &str,
+        req: &api::CreateTaskRequest,
+    ) -> TtrpcResult<api::CreateTaskResponse> {
+        info!("creating app container: {}", container_id);
+
+        // Find the sandbox VM for this container via the sandbox-id annotation
+        let sandbox_id = {
+            let spec_path = std::path::Path::new(&req.bundle).join("config.json");
+            let data = std::fs::read_to_string(&spec_path).map_err(|e| {
+                containerd_shim_protos::ttrpc::Error::Others(format!(
+                    "failed to read config.json: {e}"
+                ))
+            })?;
+            let spec: serde_json::Value = serde_json::from_str(&data).map_err(|e| {
+                containerd_shim_protos::ttrpc::Error::Others(format!(
+                    "failed to parse config.json: {e}"
+                ))
+            })?;
+            spec.pointer("/annotations/io.kubernetes.cri.sandbox-id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(container_id)
+                .to_string()
+        };
+
+        // Get the sandbox VM's agent and shared dir
+        let (agent, shared_dir) = {
+            let vms = self.vms.lock().unwrap();
+            let vm_state = vms.get(&sandbox_id).ok_or_else(|| {
+                containerd_shim_protos::ttrpc::Error::Others(format!(
+                    "sandbox VM not found: {sandbox_id}"
+                ))
+            })?;
+            (vm_state.agent.clone(), vm_state.shared_dir.clone())
+        };
+
+        // Set up I/O files in the shared directory
+        let io_dir = shared_dir.join("io").join(container_id);
         std::fs::create_dir_all(&io_dir).map_err(|e| {
             containerd_shim_protos::ttrpc::Error::Others(format!("failed to create I/O dir: {e}"))
         })?;
         let stdout_host_path = io_dir.join("stdout");
         let stderr_host_path = io_dir.join("stderr");
-        let stdout_guest_path = format!(
+        let stdout_guest = format!(
             "{}/io/{}/stdout",
             cloudhv_common::VIRTIOFS_GUEST_MOUNT,
             container_id
         );
-        let stderr_guest_path = format!(
+        let stderr_guest = format!(
             "{}/io/{}/stderr",
             cloudhv_common::VIRTIOFS_GUEST_MOUNT,
             container_id
         );
 
+        // Mount the container rootfs from containerd's snapshot.
+        let rootfs_path = std::path::Path::new(&req.bundle).join("rootfs");
+        std::fs::create_dir_all(&rootfs_path).ok();
+        for m in req.rootfs.iter() {
+            containerd_shim::mount::mount_rootfs(
+                if m.type_.is_empty() {
+                    None
+                } else {
+                    Some(m.type_.as_str())
+                },
+                if m.source.is_empty() {
+                    None
+                } else {
+                    Some(m.source.as_str())
+                },
+                &m.options.to_vec(),
+                &rootfs_path,
+            )
+            .map_err(|e| {
+                containerd_shim_protos::ttrpc::Error::Others(format!("failed to mount rootfs: {e}"))
+            })?;
+        }
+
+        // Create an ext4 disk image from the rootfs and hot-plug it into the VM.
+        let disk_id = format!("ctr-{}", &container_id[..12.min(container_id.len())]);
+        let disk_path = shared_dir
+            .parent()
+            .unwrap_or(&shared_dir)
+            .join(format!("{}.img", disk_id));
+
+        info!(
+            "creating disk image: {} from rootfs {}",
+            disk_path.display(),
+            rootfs_path.display()
+        );
+
+        let bundle_path_str = req.bundle.clone();
+        let disk_path_clone = disk_path.clone();
+        let rootfs_path_clone = rootfs_path.clone();
+        tokio::task::spawn_blocking(move || {
+            create_rootfs_disk_image(&bundle_path_str, &rootfs_path_clone, &disk_path_clone)
+        })
+        .await
+        .map_err(|e| containerd_shim_protos::ttrpc::Error::Others(format!("disk image task: {e}")))?
+        .map_err(|e| containerd_shim_protos::ttrpc::Error::Others(format!("disk image: {e:#}")))?;
+
+        info!("disk image created: {}", disk_path.display());
+
+        // Hot-plug the disk into the VM
+        let disk_path_str = disk_path.to_string_lossy().to_string();
+        let api_socket = {
+            let vms = self.vms.lock().unwrap();
+            let vm_state = vms.get(&sandbox_id).ok_or_else(|| {
+                containerd_shim_protos::ttrpc::Error::Others(format!(
+                    "sandbox VM not found for disk plug: {sandbox_id}"
+                ))
+            })?;
+            vm_state.vm.api_socket_path().to_path_buf()
+        }; // lock released here
+
+        info!(
+            "hot-plugging disk {} to VM via {}",
+            disk_id,
+            api_socket.display()
+        );
+        let disk_json = serde_json::json!({
+            "path": disk_path_str,
+            "readonly": false,
+            "id": disk_id,
+        });
+        let add_disk_resp = crate::vm::VmManager::api_request_to_socket(
+            &api_socket,
+            "PUT",
+            "/api/v1/vm.add-disk",
+            Some(&disk_json.to_string()),
+        )
+        .await
+        .map_err(|e| {
+            containerd_shim_protos::ttrpc::Error::Others(format!("hot-plug disk: {e:#}"))
+        })?;
+        info!("disk hot-plugged: {}", add_disk_resp);
+
+        // Tell the agent to discover the new block device, mount it, and
+        // prepare the OCI bundle for crun.
+        let bundle_guest = format!("/run/containers/{}", container_id);
+
         // Send CreateContainer RPC to the guest agent
         let mut create_req = cloudhv_proto::CreateContainerRequest::new();
-        create_req.container_id = container_id.clone();
-        create_req.bundle_path = req.bundle.clone();
-        create_req.stdout = stdout_guest_path;
-        create_req.stderr = stderr_guest_path;
-        let ctx = ttrpc::context::with_timeout(30);
+        create_req.container_id = container_id.to_string();
+        create_req.bundle_path = bundle_guest;
+        create_req.stdout = stdout_guest;
+        create_req.stderr = stderr_guest;
+        let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
         let create_resp = agent
             .create_container(ctx, &create_req)
             .await
@@ -193,21 +363,18 @@ impl Task for CloudHvShim {
                 ))
             })?;
 
-        // Store VM state
-        self.vms.lock().unwrap().insert(
-            vm_id.clone(),
-            VmState {
-                vm,
-                agent,
-                container_count: 1,
-            },
-        );
+        // Increment container count on the sandbox VM
+        {
+            let mut vms = self.vms.lock().unwrap();
+            if let Some(vm_state) = vms.get_mut(&sandbox_id) {
+                vm_state.container_count += 1;
+            }
+        }
 
-        // Store container state
         self.containers.lock().unwrap().insert(
-            container_id.clone(),
+            container_id.to_string(),
             ContainerState {
-                vm_id,
+                vm_id: sandbox_id,
                 pid: Some(create_resp.pid),
                 exit_code: None,
                 _exited_at: None,
@@ -220,6 +387,39 @@ impl Task for CloudHvShim {
         resp.pid = create_resp.pid;
         Ok(resp)
     }
+}
+
+#[async_trait]
+impl Task for CloudHvShim {
+    async fn create(
+        &self,
+        _ctx: &TtrpcContext,
+        req: api::CreateTaskRequest,
+    ) -> TtrpcResult<api::CreateTaskResponse> {
+        let container_id = req.id.clone();
+        info!("creating container: {}", container_id);
+
+        // Detect whether this is a sandbox (pause) container or an
+        // application container by reading the OCI spec annotations.
+        let spec_path = std::path::Path::new(&req.bundle).join("config.json");
+        let is_sandbox = if let Ok(data) = std::fs::read_to_string(&spec_path) {
+            if let Ok(spec) = serde_json::from_str::<serde_json::Value>(&data) {
+                spec.pointer("/annotations/io.kubernetes.cri.container-type")
+                    .and_then(|v| v.as_str())
+                    == Some("sandbox")
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if is_sandbox {
+            self.create_sandbox(&container_id).await
+        } else {
+            self.create_container(&container_id, &req).await
+        }
+    }
 
     async fn start(
         &self,
@@ -229,34 +429,77 @@ impl Task for CloudHvShim {
         let container_id = &req.id;
         info!("starting container: {}", container_id);
 
-        let agent = self.get_agent_for_container(container_id)?;
-
-        let mut start_req = cloudhv_proto::StartContainerRequest::new();
-        start_req.container_id = container_id.to_string();
-        let ctx = ttrpc::context::with_timeout(30);
-        let start_resp = agent.start_container(ctx, &start_req).await.map_err(|e| {
-            containerd_shim_protos::ttrpc::Error::Others(format!("StartContainer RPC error: {e}"))
-        })?;
+        // Check if this is the sandbox — if so, the VM is already running
+        let is_sandbox = {
+            let vms = self.vms.lock().unwrap();
+            vms.contains_key(container_id)
+        };
 
         let mut resp = api::StartResponse::new();
-        resp.pid = start_resp.pid;
+        if is_sandbox {
+            resp.pid = std::process::id();
+        } else {
+            let agent = self.get_agent_for_container(container_id)?;
+            let mut start_req = cloudhv_proto::StartContainerRequest::new();
+            start_req.container_id = container_id.to_string();
+            let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
+            let start_resp = agent.start_container(ctx, &start_req).await.map_err(|e| {
+                containerd_shim_protos::ttrpc::Error::Others(format!(
+                    "StartContainer RPC error: {e}"
+                ))
+            })?;
+            resp.pid = start_resp.pid;
+        }
         Ok(resp)
     }
 
     async fn kill(&self, _ctx: &TtrpcContext, req: api::KillRequest) -> TtrpcResult<api::Empty> {
         let container_id = &req.id;
-        info!("killing container: {} signal={}", container_id, req.signal);
+        info!("container signal: {} signal={}", container_id, req.signal);
 
-        let agent = self.get_agent_for_container(container_id)?;
+        // For sandbox: mark all containers in this VM as stopped, then
+        // signal shim exit so sandbox wait() returns
+        let is_sandbox = {
+            let vms = self.vms.lock().unwrap();
+            vms.contains_key(container_id)
+        };
+        if is_sandbox {
+            // Mark all containers associated with this sandbox as stopped
+            let mut containers = self.containers.lock().unwrap();
+            for state in containers.values_mut() {
+                if state.vm_id == *container_id && state.exit_code.is_none() {
+                    state.exit_code = Some(137);
+                }
+            }
+            // Mark the sandbox container itself
+            if let Some(state) = containers.get_mut(container_id) {
+                if state.exit_code.is_none() {
+                    state.exit_code = Some(0);
+                }
+            }
+            self.exit.signal();
+            return Ok(api::Empty::new());
+        }
 
-        let mut kreq = cloudhv_proto::KillContainerRequest::new();
-        kreq.container_id = container_id.to_string();
-        kreq.signal = req.signal;
-        kreq.all = req.all;
-        let ctx = ttrpc::context::with_timeout(10);
-        agent.kill_container(ctx, &kreq).await.map_err(|e| {
-            containerd_shim_protos::ttrpc::Error::Others(format!("KillContainer RPC error: {e}"))
-        })?;
+        // For app containers: try agent RPC, then mark stopped
+        if let Ok(agent) = self.get_agent_for_container(container_id) {
+            let mut kreq = cloudhv_proto::KillContainerRequest::new();
+            kreq.container_id = container_id.to_string();
+            kreq.signal = req.signal;
+            kreq.all = req.all;
+            let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(5));
+            let _ = agent.kill_container(ctx, &kreq).await;
+        }
+
+        // Mark container as stopped
+        {
+            let mut containers = self.containers.lock().unwrap();
+            if let Some(state) = containers.get_mut(container_id) {
+                if state.exit_code.is_none() {
+                    state.exit_code = Some(137);
+                }
+            }
+        }
 
         Ok(api::Empty::new())
     }
@@ -274,7 +517,7 @@ impl Task for CloudHvShim {
         let (pid, exit_status) = if let Some(agent) = agent {
             let mut del_req = cloudhv_proto::DeleteContainerRequest::new();
             del_req.container_id = container_id.to_string();
-            let ctx = ttrpc::context::with_timeout(10);
+            let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(10));
             match agent.delete_container(ctx, &del_req).await {
                 Ok(r) => (r.pid, r.exit_status),
                 Err(e) => {
@@ -292,6 +535,22 @@ impl Task for CloudHvShim {
             containers.remove(container_id).map(|s| s.vm_id)
         };
         if let Some(vm_id) = vm_id {
+            // Clean up the disk image for this container
+            let state_dir = {
+                let vms = self.vms.lock().unwrap();
+                vms.get(&vm_id)
+                    .map(|s| s.shared_dir.parent().unwrap_or(&s.shared_dir).to_path_buf())
+            };
+            if let Some(state_dir) = state_dir {
+                let disk_id = format!("ctr-{}", &container_id[..12.min(container_id.len())]);
+                let disk_img = state_dir.join(format!("{disk_id}.img"));
+                match std::fs::remove_file(&disk_img) {
+                    Ok(()) => info!("removed disk image: {}", disk_img.display()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => info!("failed to remove disk image: {e}"),
+                }
+            }
+
             let should_cleanup = {
                 let mut vms = self.vms.lock().unwrap();
                 if let Some(vm_state) = vms.get_mut(&vm_id) {
@@ -326,17 +585,46 @@ impl Task for CloudHvShim {
         let container_id = &req.id;
         info!("waiting for container: {}", container_id);
 
-        let agent = self.get_agent_for_container(container_id)?;
+        // For sandbox, wait until shim exit is signaled
+        let is_sandbox = {
+            let vms = self.vms.lock().unwrap();
+            vms.contains_key(container_id)
+        };
+        if is_sandbox {
+            self.exit.wait().await;
+            let mut resp = api::WaitResponse::new();
+            resp.exit_status = 0;
+            return Ok(resp);
+        }
 
-        let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
-        wait_req.container_id = container_id.to_string();
-        let ctx = ttrpc::context::with_timeout(300);
-        let wait_resp = agent.wait_container(ctx, &wait_req).await.map_err(|e| {
-            containerd_shim_protos::ttrpc::Error::Others(format!("WaitContainer RPC error: {e}"))
-        })?;
+        // Check local state — if container already has exit code, return it
+        {
+            let containers = self.containers.lock().unwrap();
+            if let Some(state) = containers.get(container_id) {
+                if let Some(exit_code) = state.exit_code {
+                    info!("container {} already exited: {}", container_id, exit_code);
+                    let mut resp = api::WaitResponse::new();
+                    resp.exit_status = exit_code;
+                    return Ok(resp);
+                }
+            }
+        }
 
+        // Container still running — ask the agent
+        if let Ok(agent) = self.get_agent_for_container(container_id) {
+            let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
+            wait_req.container_id = container_id.to_string();
+            let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(300));
+            if let Ok(wait_resp) = agent.wait_container(ctx, &wait_req).await {
+                let mut resp = api::WaitResponse::new();
+                resp.exit_status = wait_resp.exit_status;
+                return Ok(resp);
+            }
+        }
+
+        // Fallback
         let mut resp = api::WaitResponse::new();
-        resp.exit_status = wait_resp.exit_status;
+        resp.exit_status = 0;
         Ok(resp)
     }
 
@@ -346,7 +634,6 @@ impl Task for CloudHvShim {
         req: api::StateRequest,
     ) -> TtrpcResult<api::StateResponse> {
         let container_id = &req.id;
-        debug!("state query for container: {}", container_id);
 
         let containers = self.containers.lock().unwrap();
         let mut resp = api::StateResponse::new();
@@ -360,8 +647,15 @@ impl Task for CloudHvShim {
             } else {
                 resp.status = api::Status::RUNNING.into();
             }
+        } else {
+            // Container not found — treat as stopped
+            resp.status = api::Status::STOPPED.into();
         }
 
+        info!(
+            "state query: id={} status={:?} exit={}",
+            container_id, resp.status, resp.exit_status
+        );
         Ok(resp)
     }
 
@@ -384,4 +678,107 @@ impl Task for CloudHvShim {
         self.exit.signal();
         Ok(api::Empty::new())
     }
+}
+
+/// Create an ext4 disk image containing the OCI bundle (config.json + rootfs).
+///
+/// The image is sized to fit the rootfs content plus headroom. The guest agent
+/// mounts this block device and runs crun from it — no FUSE involved.
+fn create_rootfs_disk_image(
+    bundle_path: &str,
+    rootfs_path: &std::path::Path,
+    disk_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::process::Command;
+
+    // Calculate rootfs size
+    let rootfs_size = dir_size(rootfs_path)?;
+    // Add 50% headroom + 16MB for ext4 metadata, minimum 64MB
+    let image_size_mb = std::cmp::max(64, (rootfs_size * 3 / 2 / 1024 / 1024 + 16) as u64);
+
+    log::info!(
+        "creating disk image: {}MB for rootfs ({}MB content)",
+        image_size_mb,
+        rootfs_size / 1024 / 1024
+    );
+
+    // Create sparse file
+    let f = std::fs::File::create(disk_path)
+        .with_context(|| format!("create disk image: {}", disk_path.display()))?;
+    f.set_len(image_size_mb * 1024 * 1024)?;
+    drop(f);
+
+    // Format as ext4
+    let status = Command::new("mkfs.ext4")
+        .args(["-q", "-F"])
+        .arg(disk_path)
+        .status()
+        .context("mkfs.ext4")?;
+    if !status.success() {
+        anyhow::bail!("mkfs.ext4 failed: {status}");
+    }
+
+    // Mount, copy content, unmount
+    let mount_dir = disk_path.with_extension("mnt");
+    std::fs::create_dir_all(&mount_dir)?;
+
+    let status = Command::new("mount")
+        .args(["-o", "loop"])
+        .arg(disk_path)
+        .arg(&mount_dir)
+        .status()
+        .context("mount disk image")?;
+    if !status.success() {
+        anyhow::bail!("mount disk image failed: {status}");
+    }
+
+    // Copy rootfs content into the image
+    let rootfs_dest = mount_dir.join("rootfs");
+    std::fs::create_dir_all(&rootfs_dest)?;
+    let status = Command::new("cp")
+        .args(["-a", "--"])
+        .arg(format!("{}/.", rootfs_path.display()))
+        .arg(&rootfs_dest)
+        .status()
+        .context("cp rootfs to disk image")?;
+
+    // Copy config.json
+    let config_src = std::path::Path::new(bundle_path).join("config.json");
+    if config_src.exists() {
+        std::fs::copy(&config_src, mount_dir.join("config.json"))?;
+    }
+
+    // Unmount
+    let umount_status = Command::new("umount").arg(&mount_dir).status();
+    std::fs::remove_dir(&mount_dir).ok();
+
+    if !status.success() {
+        anyhow::bail!("cp rootfs failed: {status}");
+    }
+    if let Ok(s) = umount_status {
+        if !s.success() {
+            anyhow::bail!("umount failed: {s}");
+        }
+    }
+
+    log::info!("disk image created: {}", disk_path.display());
+    Ok(())
+}
+
+/// Calculate total size of a directory tree in bytes.
+fn dir_size(path: &std::path::Path) -> anyhow::Result<u64> {
+    let mut total = 0u64;
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let meta = entry.metadata()?;
+            if meta.is_dir() {
+                total += dir_size(&entry.path())?;
+            } else {
+                total += meta.len();
+            }
+        }
+    }
+    Ok(total)
 }

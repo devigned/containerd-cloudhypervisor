@@ -50,10 +50,18 @@ if [ -f "../${CONFIG_FILE}" ]; then
     scripts/config --enable VIRTIO_VSOCKETS
     # PCI_MSI is required for Cloud Hypervisor's virtio-pci interrupt delivery
     scripts/config --enable PCI_MSI
+    # BPF support required by crun for cgroup v2 device control
+    scripts/config --enable BPF
+    scripts/config --enable BPF_SYSCALL
+    scripts/config --enable CGROUP_BPF
+    scripts/config --enable BPF_JIT
+    # ACPI PCI hot-plug for block device delivery to containers
+    scripts/config --enable HOTPLUG_PCI
+    scripts/config --enable HOTPLUG_PCI_ACPI
     make olddefconfig
 
     # Verify critical configs are enabled
-    for opt in PCI_MSI VSOCKETS VIRTIO_VSOCKETS PVH; do
+    for opt in PCI_MSI VSOCKETS VIRTIO_VSOCKETS PVH BPF_SYSCALL CGROUP_BPF HOTPLUG_PCI; do
         if ! grep -q "CONFIG_${opt}=y" .config; then
             echo "ERROR: CONFIG_${opt} is not enabled!"
             exit 1
@@ -78,6 +86,10 @@ fi
 
 echo "Building kernel with ${NPROC} jobs..."
 make -j "${NPROC}" vmlinux
+
+# Strip debug info for smaller kernel (~27MB → ~5MB)
+echo "Stripping kernel debug info..."
+strip --strip-debug vmlinux 2>/dev/null || true
 
 # Copy the kernel binary to a predictable location
 cp vmlinux ../vmlinux
