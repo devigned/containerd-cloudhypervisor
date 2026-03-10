@@ -190,6 +190,14 @@ jobs:
           chmod +x /tmp/agent/cloudhv-agent
           cd guest/rootfs
           sudo bash build-rootfs.sh /tmp/agent/cloudhv-agent
+          # Verify rootfs contains crun
+          MOUNT_DIR=$(mktemp -d)
+          sudo mount -o loop,ro rootfs.ext4 "$MOUNT_DIR"
+          echo "Rootfs contents:"
+          ls -la "$MOUNT_DIR"/bin/
+          file "$MOUNT_DIR"/bin/crun || echo "WARNING: crun not found in rootfs!"
+          sudo umount "$MOUNT_DIR"
+          rmdir "$MOUNT_DIR"
 
       - name: Run integration tests
         if: env.KVM_AVAILABLE == 'true'

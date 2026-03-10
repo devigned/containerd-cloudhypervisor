@@ -50,23 +50,23 @@ chmod 755 "${ROOTFS_DIR}/init"
 cp "${AGENT_BINARY}" "${ROOTFS_DIR}/bin/cloudhv-agent"
 chmod 755 "${ROOTFS_DIR}/bin/cloudhv-agent"
 
-# Install crun (lightweight OCI runtime, ~1.5MB static binary)
+# Install crun (lightweight OCI runtime, must be statically linked for the VM guest)
 echo "Installing crun..."
-if command -v crun &>/dev/null; then
-    cp "$(command -v crun)" "${ROOTFS_DIR}/bin/crun"
-    chmod 755 "${ROOTFS_DIR}/bin/crun"
-else
-    echo "WARNING: crun not found in PATH. Downloading static binary..."
-    CRUN_VERSION="1.20"
-    ARCH=$(uname -m)
-    case "${ARCH}" in
-        x86_64) CRUN_ARCH="amd64" ;;
-        aarch64) CRUN_ARCH="arm64" ;;
-        *) echo "Unsupported arch: ${ARCH}"; exit 1 ;;
-    esac
-    wget -q "https://github.com/containers/crun/releases/download/${CRUN_VERSION}/crun-${CRUN_VERSION}-linux-${CRUN_ARCH}-disable-systemd" \
-        -O "${ROOTFS_DIR}/bin/crun"
-    chmod 755 "${ROOTFS_DIR}/bin/crun"
+CRUN_VERSION="1.20"
+ARCH=$(uname -m)
+case "${ARCH}" in
+    x86_64) CRUN_ARCH="amd64" ;;
+    aarch64) CRUN_ARCH="arm64" ;;
+    *) echo "Unsupported arch: ${ARCH}"; exit 1 ;;
+esac
+wget -q "https://github.com/containers/crun/releases/download/${CRUN_VERSION}/crun-${CRUN_VERSION}-linux-${CRUN_ARCH}-disable-systemd" \
+    -O "${ROOTFS_DIR}/bin/crun"
+chmod 755 "${ROOTFS_DIR}/bin/crun"
+
+# Verify crun is static (dynamically-linked crun from the host won't work in the VM)
+if file "${ROOTFS_DIR}/bin/crun" | grep -q "dynamically linked"; then
+    echo "ERROR: crun binary is dynamically linked — must be static for guest rootfs"
+    exit 1
 fi
 
 # Minimal /etc
