@@ -67,8 +67,8 @@ impl Shim for CloudHvShim {
                 kernel_args: "console=hvc0 root=/dev/vda rw quiet init=/init net.ifnames=0"
                     .to_string(),
                 debug: false,
-                pool_size: 0,
-                max_containers_per_vm: 1,
+                pool_size: cloudhv_common::DEFAULT_POOL_SIZE,
+                max_containers_per_vm: cloudhv_common::DEFAULT_MAX_CONTAINERS_PER_VM,
                 hotplug_memory_mb: 0,
                 hotplug_method: "acpi".to_string(),
                 tpm_enabled: false,

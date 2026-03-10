@@ -37,7 +37,7 @@ cat > "$HOST/opt/cloudhv/config.json" << 'CONFIG'
   "default_vcpus": 1,
   "default_memory_mb": 512,
   "pool_size": 2,
-  "max_containers_per_vm": 1,
+  "max_containers_per_vm": 5,
   "hotplug_memory_mb": 128,
   "hotplug_method": "virtio-mem",
   "tpm_enabled": false

@@ -264,7 +264,7 @@ cat | sudo tee /opt/cloudhv/config.json << EOF
   "kernel_args": "console=hvc0 root=/dev/vda rw quiet init=/init net.ifnames=0",
   "default_vcpus": 1,
   "default_memory_mb": 128,
-  "pool_size": 0,
+  "pool_size": 2,
   "tpm_enabled": false
 }
 EOF
@@ -291,8 +291,8 @@ Runtime configuration is loaded from `/opt/cloudhv/config.json`:
 | `kernel_args` | `console=hvc0 root=/dev/vda rw quiet init=/init net.ifnames=0` | Guest kernel cmdline |
 | `default_vcpus` | `1` | Boot vCPUs per VM |
 | `default_memory_mb` | `128` | Boot memory in MiB |
-| `pool_size` | `0` | Pre-warmed VM pool size (0 = disabled) |
-| `max_containers_per_vm` | `1` | Max containers sharing a VM |
+| `pool_size` | `2` | Pre-warmed VM pool size (0 = disabled) |
+| `max_containers_per_vm` | `5` | Max containers sharing a VM |
 | `hotplug_memory_mb` | `0` | Hotpluggable memory (0 = disabled) |
 | `hotplug_method` | `acpi` | `acpi` or `virtio-mem` |
 | `tpm_enabled` | `false` | Enable TPM 2.0 via swtpm |

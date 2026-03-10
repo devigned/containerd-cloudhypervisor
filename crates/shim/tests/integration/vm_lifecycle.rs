@@ -2050,3 +2050,404 @@ fn test_embedded_virtiofsd() {
         eprintln!("╚══════════════════════════════════════════════════════════╝\n");
     });
 }
+
+/// Helper: create an ext4 disk image containing an http-echo binary + OCI config.
+/// Returns the disk image path.
+fn create_echo_disk_image(
+    state_dir: &std::path::Path,
+    http_echo_path: &std::path::Path,
+    name: &str,
+    text: &str,
+    port: u16,
+) -> std::path::PathBuf {
+    let disk_path = state_dir.join(format!("{name}.img"));
+    let bundle_tmp = state_dir.join(format!("{name}-bundle"));
+    let rootfs_tmp = bundle_tmp.join("rootfs");
+    std::fs::create_dir_all(&rootfs_tmp).expect("mkdir rootfs");
+    std::fs::copy(http_echo_path, rootfs_tmp.join("http-echo")).expect("cp http-echo");
+    std::process::Command::new("chmod")
+        .args(["755", &rootfs_tmp.join("http-echo").to_string_lossy()])
+        .status()
+        .expect("chmod");
+
+    let oci_config = serde_json::json!({
+        "ociVersion": "1.0.2",
+        "process": {
+            "terminal": false,
+            "user": { "uid": 0, "gid": 0 },
+            "args": ["/http-echo", &format!("-text={text}"), &format!("-listen=:{port}")],
+            "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+            "cwd": "/"
+        },
+        "root": { "path": "rootfs", "readonly": false },
+        "linux": { "namespaces": [{"type": "pid"}, {"type": "mount"}] }
+    });
+    std::fs::write(
+        bundle_tmp.join("config.json"),
+        serde_json::to_string_pretty(&oci_config).unwrap(),
+    )
+    .expect("write config.json");
+
+    // Create ext4 disk image
+    let f = std::fs::File::create(&disk_path).expect("create disk");
+    f.set_len(64 * 1024 * 1024).expect("set_len");
+    drop(f);
+    assert!(run_cmd_status(
+        "mkfs.ext4",
+        &["-q", "-F", &disk_path.to_string_lossy()]
+    ));
+    let mount_dir = disk_path.with_extension("mnt");
+    std::fs::create_dir_all(&mount_dir).expect("mkdir mount");
+    assert!(run_cmd_status(
+        "mount",
+        &[
+            "-o",
+            "loop",
+            &disk_path.to_string_lossy(),
+            &mount_dir.to_string_lossy()
+        ]
+    ));
+    let img_rootfs = mount_dir.join("rootfs");
+    std::fs::create_dir_all(&img_rootfs).expect("mkdir img rootfs");
+    assert!(run_cmd_status(
+        "cp",
+        &[
+            "-a",
+            "--",
+            &format!("{}/.", rootfs_tmp.display()),
+            &img_rootfs.to_string_lossy()
+        ]
+    ));
+    std::fs::copy(
+        bundle_tmp.join("config.json"),
+        mount_dir.join("config.json"),
+    )
+    .expect("cp config.json");
+    assert!(run_cmd_status("umount", &[&mount_dir.to_string_lossy()]));
+    std::fs::remove_dir(&mount_dir).ok();
+    std::fs::remove_dir_all(&bundle_tmp).ok();
+
+    disk_path
+}
+
+/// Test that two containers can run simultaneously inside the same VM.
+///
+/// This proves multi-container-per-VM isolation:
+///   1. Boot a single VM with networking
+///   2. Hot-plug two disk images (each with http-echo on a different port)
+///   3. Start both containers via the agent
+///   4. Curl both endpoints from the host and verify independent responses
+///   5. Both containers share the VM's network namespace (same IP, different ports)
+///
+/// Requires: root, KVM, CH, virtiofsd, kernel, rootfs, http-echo binary
+#[test]
+fn test_two_containers_in_one_vm() {
+    let fixtures = TestFixtures::resolve().expect("failed to resolve test fixtures");
+    skip_if_missing!(fixtures);
+
+    let http_echo_path = std::env::var("CLOUDHV_TEST_HTTP_ECHO")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/usr/local/bin/http-echo"));
+    if !http_echo_path.exists() {
+        eprintln!("SKIPPING: http-echo not found (set CLOUDHV_TEST_HTTP_ECHO)");
+        return;
+    }
+    for tool in ["nsenter", "ip", "tc", "curl", "mkfs.ext4"] {
+        if !run_cmd_status("which", &[tool]) {
+            eprintln!("SKIPPING: {tool} not found");
+            return;
+        }
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let vm_id = format!("multi-ctr-{}", std::process::id());
+        let mut config = fixtures.runtime_config();
+        config.max_containers_per_vm = 5;
+
+        // Networking setup (same pattern as test_echo_container_with_networking)
+        let netns_name = format!("chmulti-{}", std::process::id());
+        let netns_path = format!("/var/run/netns/{netns_name}");
+        let veth_host = "veth-multi-h";
+        let veth_ns = "veth-multi-ns";
+        let test_ip = "10.200.202.2";
+        let host_ip = "10.200.202.1";
+        let netmask = "255.255.255.0";
+
+        struct Guard {
+            name: String,
+            veth: String,
+        }
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("ip")
+                    .args(["link", "delete", &self.veth])
+                    .status();
+                let _ = std::process::Command::new("ip")
+                    .args(["netns", "delete", &self.name])
+                    .status();
+            }
+        }
+        let _guard = Guard {
+            name: netns_name.clone(),
+            veth: veth_host.to_string(),
+        };
+
+        eprintln!("\n╔══════════════════════════════════════════════════════════╗");
+        eprintln!("║  Two Containers in One VM — Integration Test            ║");
+        eprintln!("╠══════════════════════════════════════════════════════════╣");
+
+        // ── Phase 1: Boot VM with networking ──────────────────────────
+        eprintln!("  Phase 1 │ Booting VM with networking");
+
+        // Set up netns + veth + TAP + TC redirect
+        run_cmd("ip", &["netns", "add", &netns_name]);
+        run_cmd(
+            "ip",
+            &[
+                "link", "add", veth_host, "type", "veth", "peer", "name", veth_ns,
+            ],
+        );
+        run_cmd("ip", &["link", "set", veth_ns, "netns", &netns_name]);
+        run_cmd(
+            "ip",
+            &["addr", "add", &format!("{host_ip}/24"), "dev", veth_host],
+        );
+        run_cmd("ip", &["link", "set", veth_host, "up"]);
+        run_nsenter(
+            &netns_path,
+            &[
+                "ip",
+                "addr",
+                "add",
+                &format!("{test_ip}/24"),
+                "dev",
+                veth_ns,
+            ],
+        );
+        run_nsenter(&netns_path, &["ip", "link", "set", veth_ns, "up"]);
+        run_nsenter(&netns_path, &["ip", "link", "set", "lo", "up"]);
+        run_nsenter(
+            &netns_path,
+            &["ip", "route", "add", "default", "via", host_ip],
+        );
+
+        let tap_name = format!("tap_{}", &vm_id[..8.min(vm_id.len())]);
+        run_nsenter(
+            &netns_path,
+            &["ip", "tuntap", "add", &tap_name, "mode", "tap"],
+        );
+        run_nsenter(&netns_path, &["ip", "link", "set", &tap_name, "up"]);
+
+        let mac_out = std::process::Command::new("nsenter")
+            .args([
+                &format!("--net={netns_path}"),
+                "--",
+                "ip",
+                "-j",
+                "addr",
+                "show",
+                "dev",
+                veth_ns,
+            ])
+            .output()
+            .expect("get MAC");
+        let addrs: serde_json::Value =
+            serde_json::from_slice(&mac_out.stdout).unwrap_or(serde_json::json!([]));
+        let tap_mac = addrs
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|i| i.get("address"))
+            .and_then(|a| a.as_str())
+            .unwrap_or("aa:bb:cc:dd:ee:ff")
+            .to_string();
+
+        run_nsenter(
+            &netns_path,
+            &["tc", "qdisc", "add", "dev", veth_ns, "ingress"],
+        );
+        run_nsenter(
+            &netns_path,
+            &[
+                "tc", "filter", "add", "dev", veth_ns, "parent", "ffff:", "protocol", "all", "u32",
+                "match", "u32", "0", "0", "action", "mirred", "egress", "redirect", "dev",
+                &tap_name,
+            ],
+        );
+        run_nsenter(
+            &netns_path,
+            &["tc", "qdisc", "add", "dev", &tap_name, "ingress"],
+        );
+        run_nsenter(
+            &netns_path,
+            &[
+                "tc", "filter", "add", "dev", &tap_name, "parent", "ffff:", "protocol", "all",
+                "u32", "match", "u32", "0", "0", "action", "mirred", "egress", "redirect", "dev",
+                veth_ns,
+            ],
+        );
+        run_nsenter(&netns_path, &["ip", "addr", "flush", "dev", veth_ns]);
+
+        // Boot VM with networking
+        config.kernel_args = format!(
+            "{} ip={test_ip}::{host_ip}:{netmask}::eth0:off",
+            config.kernel_args
+        );
+
+        let mut vm = containerd_shim_cloudhv::vm::VmManager::new(vm_id.clone(), config)
+            .expect("VmManager::new");
+        vm.prepare().await.expect("prepare");
+        vm.spawn_virtiofsd().expect("spawn_virtiofsd");
+        vm.spawn_vmm_in_netns(Some(&netns_path))
+            .expect("spawn_vmm_in_netns");
+        let (vfsd_r, vmm_r) = tokio::join!(vm.wait_virtiofsd_ready(), vm.wait_vmm_ready());
+        vfsd_r.expect("virtiofsd ready");
+        vmm_r.expect("vmm ready");
+        vm.create_and_boot_vm(Some(&tap_name), Some(&tap_mac))
+            .await
+            .expect("create_and_boot_vm");
+        tokio::time::timeout(Duration::from_secs(30), vm.wait_for_agent())
+            .await
+            .expect("agent timeout")
+            .expect("agent health");
+        eprintln!("           │ VM booted at {test_ip}");
+
+        // Connect ttrpc
+        let vsock_client = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
+        let (agent, _health) =
+            tokio::time::timeout(Duration::from_secs(5), vsock_client.connect_ttrpc())
+                .await
+                .expect("ttrpc timeout")
+                .expect("ttrpc connect");
+
+        // ── Phase 2: Hot-plug and start container A (port 5678) ───────
+        eprintln!("  Phase 2 │ Starting container A (port 5678)");
+        let ctr_a_id = format!("ctr-a-{}", std::process::id());
+        let disk_a = create_echo_disk_image(
+            vm.state_dir(),
+            &http_echo_path,
+            "ctr-a",
+            "response-from-container-A",
+            5678,
+        );
+        vm.add_disk(&disk_a.to_string_lossy(), &ctr_a_id, false)
+            .await
+            .expect("add_disk A");
+
+        let io_a = vm.shared_dir().join("io").join(&ctr_a_id);
+        std::fs::create_dir_all(&io_a).expect("mkdir io A");
+        let mut req_a = cloudhv_proto::CreateContainerRequest::new();
+        req_a.container_id = ctr_a_id.clone();
+        req_a.bundle_path = format!("{}/{}", cloudhv_common::VIRTIOFS_GUEST_MOUNT, ctr_a_id);
+        req_a.stdout = format!(
+            "{}/io/{}/stdout",
+            cloudhv_common::VIRTIOFS_GUEST_MOUNT,
+            ctr_a_id
+        );
+        req_a.stderr = format!(
+            "{}/io/{}/stderr",
+            cloudhv_common::VIRTIOFS_GUEST_MOUNT,
+            ctr_a_id
+        );
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(30));
+        agent.create_container(ctx, &req_a).await.expect("create A");
+        let mut start_a = cloudhv_proto::StartContainerRequest::new();
+        start_a.container_id = ctr_a_id.clone();
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(30));
+        agent.start_container(ctx, &start_a).await.expect("start A");
+        eprintln!("           │ container A started");
+
+        // ── Phase 3: Hot-plug and start container B (port 5679) ───────
+        eprintln!("  Phase 3 │ Starting container B (port 5679)");
+        let ctr_b_id = format!("ctr-b-{}", std::process::id());
+        let disk_b = create_echo_disk_image(
+            vm.state_dir(),
+            &http_echo_path,
+            "ctr-b",
+            "response-from-container-B",
+            5679,
+        );
+        vm.add_disk(&disk_b.to_string_lossy(), &ctr_b_id, false)
+            .await
+            .expect("add_disk B");
+
+        let io_b = vm.shared_dir().join("io").join(&ctr_b_id);
+        std::fs::create_dir_all(&io_b).expect("mkdir io B");
+        let mut req_b = cloudhv_proto::CreateContainerRequest::new();
+        req_b.container_id = ctr_b_id.clone();
+        req_b.bundle_path = format!("{}/{}", cloudhv_common::VIRTIOFS_GUEST_MOUNT, ctr_b_id);
+        req_b.stdout = format!(
+            "{}/io/{}/stdout",
+            cloudhv_common::VIRTIOFS_GUEST_MOUNT,
+            ctr_b_id
+        );
+        req_b.stderr = format!(
+            "{}/io/{}/stderr",
+            cloudhv_common::VIRTIOFS_GUEST_MOUNT,
+            ctr_b_id
+        );
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(30));
+        agent.create_container(ctx, &req_b).await.expect("create B");
+        let mut start_b = cloudhv_proto::StartContainerRequest::new();
+        start_b.container_id = ctr_b_id.clone();
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(30));
+        agent.start_container(ctx, &start_b).await.expect("start B");
+        eprintln!("           │ container B started");
+
+        // Give both containers time to bind their ports
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // ── Phase 4: Curl both containers ─────────────────────────────
+        eprintln!("  Phase 4 │ Verifying both containers respond");
+
+        let resp_a = std::process::Command::new("curl")
+            .args([
+                "-s",
+                "--connect-timeout",
+                "5",
+                &format!("http://{test_ip}:5678/"),
+            ])
+            .output()
+            .expect("curl A");
+        let body_a = String::from_utf8_lossy(&resp_a.stdout).trim().to_string();
+        eprintln!("           │ container A: \"{body_a}\"");
+        assert!(resp_a.status.success(), "curl A failed");
+        assert!(
+            body_a.contains("response-from-container-A"),
+            "expected container A response, got: {body_a}"
+        );
+
+        let resp_b = std::process::Command::new("curl")
+            .args([
+                "-s",
+                "--connect-timeout",
+                "5",
+                &format!("http://{test_ip}:5679/"),
+            ])
+            .output()
+            .expect("curl B");
+        let body_b = String::from_utf8_lossy(&resp_b.stdout).trim().to_string();
+        eprintln!("           │ container B: \"{body_b}\"");
+        assert!(resp_b.status.success(), "curl B failed");
+        assert!(
+            body_b.contains("response-from-container-B"),
+            "expected container B response, got: {body_b}"
+        );
+
+        eprintln!("           │ ✅ Both containers respond independently!");
+
+        // ── Phase 5: Cleanup ──────────────────────────────────────────
+        eprintln!("  Phase 5 │ Cleaning up");
+        drop(agent);
+        drop(_health);
+        vm.cleanup().await.expect("cleanup");
+        let _ = std::fs::remove_file(&disk_a);
+        let _ = std::fs::remove_file(&disk_b);
+
+        eprintln!("╚══════════════════════════════════════════════════════════╝\n");
+    });
+}

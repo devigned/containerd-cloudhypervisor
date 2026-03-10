@@ -32,10 +32,10 @@ pub const DEFAULT_CH_BINARY: &str = "/usr/local/bin/cloud-hypervisor";
 pub const DEFAULT_VIRTIOFSD_BINARY: &str = "/usr/libexec/virtiofsd";
 
 /// Default VM pool size (number of pre-warmed VMs).
-pub const DEFAULT_POOL_SIZE: usize = 0;
+pub const DEFAULT_POOL_SIZE: usize = 2;
 
 /// Default maximum containers per VM.
-pub const DEFAULT_MAX_CONTAINERS_PER_VM: usize = 1;
+pub const DEFAULT_MAX_CONTAINERS_PER_VM: usize = 5;
 
 /// Default hotplug memory size in MiB (0 = no hotplug).
 pub const DEFAULT_HOTPLUG_MEMORY_MB: u64 = 0;
