@@ -1,6 +1,7 @@
 use containerd_shim::asynchronous::run;
 use containerd_shim::Config;
 
+mod annotations;
 mod config;
 mod hypervisor;
 mod image_cache;
