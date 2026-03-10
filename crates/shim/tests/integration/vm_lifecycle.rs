@@ -339,6 +339,7 @@ fn test_vm_config_with_hotplug() {
             hotplug_method: Some("VirtioMem".to_string()),
         },
         disks: vec![],
+        net: vec![],
         fs: vec![],
         vsock: None,
         serial: None,
@@ -858,4 +859,477 @@ fn pct(part: Duration, total: Duration) -> f64 {
     } else {
         part.as_secs_f64() / total.as_secs_f64() * 100.0
     }
+}
+
+/// End-to-end test: boot a VM with networking, start an HTTP echo container,
+/// and verify that an HTTP request from the host reaches the container and
+/// gets a valid response.
+///
+/// This proves the entire networking stack works:
+///   veth ↔ TC redirect ↔ TAP ↔ virtio-net ↔ guest eth0 (kernel IP_PNP)
+///
+/// Requires:
+/// - Root (for netns, TAP, TC, mount)
+/// - KVM or MSHV
+/// - cloud-hypervisor, virtiofsd, kernel, rootfs
+/// - A static HTTP echo binary: set `CLOUDHV_TEST_HTTP_ECHO` env var
+///   (e.g. hashicorp/http-echo or any binary that listens on a port)
+///
+/// Download http-echo for testing:
+///   curl -Lo /usr/local/bin/http-echo \
+///     https://github.com/hashicorp/http-echo/releases/download/v0.2.3/http-echo_0.2.3_linux_amd64
+///   chmod +x /usr/local/bin/http-echo
+#[test]
+fn test_echo_container_with_networking() {
+    let fixtures = TestFixtures::resolve().expect("failed to resolve test fixtures");
+    skip_if_missing!(fixtures);
+
+    // Resolve the http-echo binary
+    let http_echo_path = std::env::var("CLOUDHV_TEST_HTTP_ECHO")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/usr/local/bin/http-echo"));
+    if !http_echo_path.exists() {
+        eprintln!(
+            "SKIPPING TEST: http-echo binary not found at {}",
+            http_echo_path.display()
+        );
+        eprintln!("Set CLOUDHV_TEST_HTTP_ECHO or install http-echo to /usr/local/bin/http-echo");
+        return;
+    }
+
+    // Check that networking tools are available
+    for tool in ["nsenter", "ip", "tc", "curl", "mkfs.ext4"] {
+        if std::process::Command::new("which")
+            .arg(tool)
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("SKIPPING TEST: {tool} not found in PATH");
+            return;
+        }
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let vm_id = format!("echo-test-{}", std::process::id());
+        let netns_name = format!("chtest-{}", std::process::id());
+        let netns_path = format!("/var/run/netns/{netns_name}");
+        let veth_host = "veth-chtest-h";
+        let veth_ns = "veth-chtest-ns";
+        let test_ip = "10.200.200.2";
+        let host_ip = "10.200.200.1";
+        let netmask = "255.255.255.0";
+        let echo_port = 5678;
+        let echo_text = "hello-from-cloudhv-integration-test";
+
+        // Cleanup guard — ensures netns and temp files are cleaned up on
+        // exit, even on panic.
+        struct NetnsGuard {
+            name: String,
+            veth_host: String,
+            disk_path: Option<std::path::PathBuf>,
+        }
+        impl Drop for NetnsGuard {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("ip")
+                    .args(["link", "delete", &self.veth_host])
+                    .status();
+                let _ = std::process::Command::new("ip")
+                    .args(["netns", "delete", &self.name])
+                    .status();
+                if let Some(ref p) = self.disk_path {
+                    let _ = std::fs::remove_file(p);
+                    let _ = std::fs::remove_dir(p.with_extension("mnt"));
+                }
+            }
+        }
+        let _guard = NetnsGuard {
+            name: netns_name.clone(),
+            veth_host: veth_host.to_string(),
+            disk_path: None,
+        };
+
+        eprintln!("\n╔══════════════════════════════════════════════════════════╗");
+        eprintln!("║  Echo Container with Networking — E2E Integration Test  ║");
+        eprintln!("╠══════════════════════════════════════════════════════════╣");
+
+        // ── Phase 1: Create test network namespace ────────────────────
+        eprintln!("  Phase 1 │ Setting up test network namespace");
+        run_cmd("ip", &["netns", "add", &netns_name]);
+
+        // Create veth pair: host end stays in default netns, peer goes into test netns
+        run_cmd(
+            "ip",
+            &[
+                "link", "add", veth_host, "type", "veth", "peer", "name", veth_ns,
+            ],
+        );
+        run_cmd("ip", &["link", "set", veth_ns, "netns", &netns_name]);
+
+        // Assign IP to host end and bring it up
+        run_cmd(
+            "ip",
+            &["addr", "add", &format!("{host_ip}/24"), "dev", veth_host],
+        );
+        run_cmd("ip", &["link", "set", veth_host, "up"]);
+
+        // Assign pod IP to netns end and bring it up
+        run_nsenter(
+            &netns_path,
+            &[
+                "ip",
+                "addr",
+                "add",
+                &format!("{test_ip}/24"),
+                "dev",
+                veth_ns,
+            ],
+        );
+        run_nsenter(&netns_path, &["ip", "link", "set", veth_ns, "up"]);
+        run_nsenter(&netns_path, &["ip", "link", "set", "lo", "up"]);
+
+        // Add default route inside netns pointing at host
+        run_nsenter(
+            &netns_path,
+            &["ip", "route", "add", "default", "via", host_ip],
+        );
+
+        // Create TAP device inside netns
+        let tap_name = format!("tap_{}", &vm_id[..8.min(vm_id.len())]);
+        run_nsenter(
+            &netns_path,
+            &["ip", "tuntap", "add", &tap_name, "mode", "tap"],
+        );
+        run_nsenter(&netns_path, &["ip", "link", "set", &tap_name, "up"]);
+
+        // Get MAC address of veth-ns (the VM will use this MAC)
+        let mac_output = std::process::Command::new("nsenter")
+            .args([
+                &format!("--net={netns_path}"),
+                "--",
+                "ip",
+                "-j",
+                "addr",
+                "show",
+                "dev",
+                veth_ns,
+            ])
+            .output()
+            .expect("get MAC");
+        let addrs: serde_json::Value =
+            serde_json::from_slice(&mac_output.stdout).unwrap_or(serde_json::json!([]));
+        let tap_mac = addrs
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|iface| iface.get("address"))
+            .and_then(|a| a.as_str())
+            .unwrap_or("aa:bb:cc:dd:ee:ff")
+            .to_string();
+
+        // TC redirect: veth-ns ↔ TAP (bidirectional L2 forwarding)
+        run_nsenter(
+            &netns_path,
+            &["tc", "qdisc", "add", "dev", veth_ns, "ingress"],
+        );
+        run_nsenter(
+            &netns_path,
+            &[
+                "tc", "filter", "add", "dev", veth_ns, "parent", "ffff:", "protocol", "all", "u32",
+                "match", "u32", "0", "0", "action", "mirred", "egress", "redirect", "dev",
+                &tap_name,
+            ],
+        );
+        run_nsenter(
+            &netns_path,
+            &["tc", "qdisc", "add", "dev", &tap_name, "ingress"],
+        );
+        run_nsenter(
+            &netns_path,
+            &[
+                "tc", "filter", "add", "dev", &tap_name, "parent", "ffff:", "protocol", "all",
+                "u32", "match", "u32", "0", "0", "action", "mirred", "egress", "redirect", "dev",
+                veth_ns,
+            ],
+        );
+
+        // Flush IP from veth-ns so packets traverse TC into VM
+        run_nsenter(&netns_path, &["ip", "addr", "flush", "dev", veth_ns]);
+
+        eprintln!("           │ netns={netns_name} tap={tap_name} mac={tap_mac}");
+        eprintln!("           │ VM IP={test_ip} host IP={host_ip}");
+
+        // ── Phase 2: Boot VM with networking ──────────────────────────
+        eprintln!("  Phase 2 │ Booting VM with networking");
+        let mut config = fixtures.runtime_config();
+        // Add kernel IP config: ip=<addr>::<gw>:<mask>::eth0:off
+        config.kernel_args = format!(
+            "{} ip={test_ip}::{host_ip}:{netmask}::eth0:off",
+            config.kernel_args
+        );
+
+        let mut vm = containerd_shim_cloudhv::vm::VmManager::new(vm_id.clone(), config)
+            .expect("VmManager::new");
+        vm.prepare().await.expect("prepare");
+
+        vm.spawn_virtiofsd().expect("spawn_virtiofsd");
+        vm.spawn_vmm_in_netns(Some(&netns_path))
+            .expect("spawn_vmm_in_netns");
+        let (vfsd_r, vmm_r) = tokio::join!(vm.wait_virtiofsd_ready(), vm.wait_vmm_ready());
+        vfsd_r.expect("virtiofsd ready");
+        vmm_r.expect("vmm ready");
+
+        vm.create_and_boot_vm(Some(&tap_name), Some(&tap_mac))
+            .await
+            .expect("create_and_boot_vm");
+
+        tokio::time::timeout(Duration::from_secs(30), vm.wait_for_agent())
+            .await
+            .expect("agent timeout")
+            .expect("agent health");
+        eprintln!("           │ VM booted, agent healthy");
+
+        // ── Phase 3: Create disk image with http-echo ─────────────────
+        eprintln!("  Phase 3 │ Creating container disk image");
+        let disk_path = vm.state_dir().join("echo-container.img");
+
+        // Build an OCI bundle with http-echo
+        let bundle_tmp = vm.state_dir().join("echo-bundle");
+        let rootfs_tmp = bundle_tmp.join("rootfs");
+        std::fs::create_dir_all(&rootfs_tmp).expect("mkdir rootfs");
+        std::fs::copy(&http_echo_path, rootfs_tmp.join("http-echo")).expect("cp http-echo");
+
+        // Make it executable
+        std::process::Command::new("chmod")
+            .args(["755", &rootfs_tmp.join("http-echo").to_string_lossy()])
+            .status()
+            .expect("chmod");
+
+        // Write OCI config.json
+        let oci_config = serde_json::json!({
+            "ociVersion": "1.0.2",
+            "process": {
+                "terminal": false,
+                "user": { "uid": 0, "gid": 0 },
+                "args": [
+                    "/http-echo",
+                    &format!("-text={echo_text}"),
+                    &format!("-listen=:{echo_port}")
+                ],
+                "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+                "cwd": "/"
+            },
+            "root": { "path": "rootfs", "readonly": false },
+            "linux": { "namespaces": [{"type": "pid"}, {"type": "mount"}] }
+        });
+        std::fs::write(
+            bundle_tmp.join("config.json"),
+            serde_json::to_string_pretty(&oci_config).unwrap(),
+        )
+        .expect("write config.json");
+
+        // Create ext4 disk image (64MB, sparse)
+        let f = std::fs::File::create(&disk_path).expect("create disk");
+        f.set_len(64 * 1024 * 1024).expect("set_len");
+        drop(f);
+
+        assert!(
+            run_cmd_status("mkfs.ext4", &["-q", "-F", &disk_path.to_string_lossy()]),
+            "mkfs.ext4 failed"
+        );
+
+        let mount_dir = disk_path.with_extension("mnt");
+        std::fs::create_dir_all(&mount_dir).expect("mkdir mount");
+        assert!(
+            run_cmd_status(
+                "mount",
+                &[
+                    "-o",
+                    "loop",
+                    &disk_path.to_string_lossy(),
+                    &mount_dir.to_string_lossy()
+                ]
+            ),
+            "mount failed"
+        );
+
+        // Copy rootfs and config.json into the disk image
+        let img_rootfs = mount_dir.join("rootfs");
+        std::fs::create_dir_all(&img_rootfs).expect("mkdir img rootfs");
+        assert!(
+            run_cmd_status(
+                "cp",
+                &[
+                    "-a",
+                    "--",
+                    &format!("{}/.", rootfs_tmp.display()),
+                    &img_rootfs.to_string_lossy(),
+                ]
+            ),
+            "cp rootfs failed"
+        );
+        std::fs::copy(
+            bundle_tmp.join("config.json"),
+            mount_dir.join("config.json"),
+        )
+        .expect("cp config.json");
+
+        assert!(
+            run_cmd_status("umount", &[&mount_dir.to_string_lossy()]),
+            "umount failed"
+        );
+        std::fs::remove_dir(&mount_dir).ok();
+
+        eprintln!("           │ disk image: {}", disk_path.display());
+
+        // ── Phase 4: Hot-plug disk and start container ────────────────
+        eprintln!("  Phase 4 │ Hot-plugging disk and starting container");
+        let container_id = format!("echo-ctr-{}", std::process::id());
+
+        vm.add_disk(&disk_path.to_string_lossy(), &container_id, false)
+            .await
+            .expect("add_disk");
+
+        // Set up I/O directory for container stdout/stderr
+        let io_dir = vm.shared_dir().join("io").join(&container_id);
+        std::fs::create_dir_all(&io_dir).expect("mkdir io");
+        let stdout_guest = format!(
+            "{}/io/{}/stdout",
+            cloudhv_common::VIRTIOFS_GUEST_MOUNT,
+            container_id
+        );
+        let stderr_guest = format!(
+            "{}/io/{}/stderr",
+            cloudhv_common::VIRTIOFS_GUEST_MOUNT,
+            container_id
+        );
+
+        // Connect to agent via ttrpc
+        let vsock_client = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
+        let (agent, _health) =
+            tokio::time::timeout(Duration::from_secs(5), vsock_client.connect_ttrpc())
+                .await
+                .expect("ttrpc connect timeout")
+                .expect("ttrpc connect");
+
+        // CreateContainer RPC
+        let mut create_req = cloudhv_proto::CreateContainerRequest::new();
+        create_req.container_id = container_id.clone();
+        create_req.bundle_path =
+            format!("{}/{}", cloudhv_common::VIRTIOFS_GUEST_MOUNT, container_id);
+        create_req.stdout = stdout_guest;
+        create_req.stderr = stderr_guest;
+
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(30));
+        let create_resp = agent
+            .create_container(ctx, &create_req)
+            .await
+            .expect("CreateContainer RPC failed");
+        eprintln!("           │ container created (pid={})", create_resp.pid);
+
+        // StartContainer RPC
+        let mut start_req = cloudhv_proto::StartContainerRequest::new();
+        start_req.container_id = container_id.clone();
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(30));
+        agent
+            .start_container(ctx, &start_req)
+            .await
+            .expect("StartContainer RPC failed");
+        eprintln!("           │ container started");
+
+        // Give http-echo a moment to bind the port
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // ── Phase 5: Curl the echo container from the host ────────────
+        eprintln!("  Phase 5 │ Sending HTTP request to VM");
+        let url = format!("http://{test_ip}:{echo_port}/");
+        eprintln!("           │ curl {url}");
+
+        let curl_output = std::process::Command::new("curl")
+            .args(["-s", "--connect-timeout", "5", &url])
+            .output()
+            .expect("curl command failed");
+
+        let response = String::from_utf8_lossy(&curl_output.stdout)
+            .trim()
+            .to_string();
+
+        eprintln!("           │ response: \"{response}\"");
+        eprintln!(
+            "           │ curl exit: {}",
+            curl_output.status.code().unwrap_or(-1)
+        );
+
+        assert!(
+            curl_output.status.success(),
+            "curl failed: {}",
+            String::from_utf8_lossy(&curl_output.stderr)
+        );
+        assert!(
+            response.contains(echo_text),
+            "expected response to contain \"{echo_text}\", got: \"{response}\""
+        );
+
+        eprintln!("           │ ✅ Echo response verified!");
+
+        // ── Phase 6: Cleanup ──────────────────────────────────────────
+        eprintln!("  Phase 6 │ Cleaning up");
+
+        // Delete container via agent
+        let mut del_req = cloudhv_proto::DeleteContainerRequest::new();
+        del_req.container_id = container_id.clone();
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(10));
+        let _ = agent.delete_container(ctx, &del_req).await;
+
+        // Drop agent/ttrpc connection before cleanup
+        drop(agent);
+        drop(_health);
+
+        vm.cleanup().await.expect("VM cleanup failed");
+        assert!(!vm.state_dir().exists(), "state dir should be removed");
+
+        // Disk image cleanup
+        let _ = std::fs::remove_file(&disk_path);
+        let _ = std::fs::remove_dir_all(&bundle_tmp);
+
+        eprintln!("╚══════════════════════════════════════════════════════════╝\n");
+    });
+}
+
+/// Run a command, panic on failure.
+fn run_cmd(cmd: &str, args: &[&str]) {
+    let status = std::process::Command::new(cmd)
+        .args(args)
+        .status()
+        .unwrap_or_else(|e| panic!("{cmd} {}: {e}", args.join(" ")));
+    assert!(
+        status.success(),
+        "{cmd} {} failed: {status}",
+        args.join(" ")
+    );
+}
+
+/// Run a command inside a network namespace, panic on failure.
+fn run_nsenter(netns_path: &str, args: &[&str]) {
+    let net_arg = format!("--net={netns_path}");
+    let mut cmd_args = vec!["nsenter", &net_arg, "--"];
+    cmd_args.extend(args);
+    let status = std::process::Command::new(cmd_args[0])
+        .args(&cmd_args[1..])
+        .status()
+        .unwrap_or_else(|e| panic!("nsenter {:?}: {e}", args));
+    assert!(status.success(), "nsenter {:?} failed: {status}", args);
+}
+
+/// Run a command, return success status (no panic).
+fn run_cmd_status(cmd: &str, args: &[&str]) -> bool {
+    std::process::Command::new(cmd)
+        .args(args)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
