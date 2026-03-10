@@ -215,20 +215,3 @@ impl VmConsoleConfig {
 pub struct VmTpm {
     pub socket: String,
 }
-
-/// Live migration configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MigrationConfig {
-    /// Transport URI: "unix:/path/to/socket" or "tcp:host:port"
-    pub uri: String,
-    /// Whether this is a local (same-host) migration
-    #[serde(default)]
-    pub local: bool,
-}
-
-/// Snapshot configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnapshotConfig {
-    /// Directory to store/load snapshot files
-    pub destination_url: String,
-}

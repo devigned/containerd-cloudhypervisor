@@ -652,50 +652,10 @@ impl VmManager {
         Ok(())
     }
 
-    /// Remove a previously hot-plugged disk from the VM.
-    #[allow(dead_code)]
-    pub async fn remove_disk(&self, disk_id: &str) -> Result<()> {
-        let body = format!(r#"{{"id":"{}"}}"#, disk_id);
-        self.api_request("PUT", "/api/v1/vm.remove-device", Some(&body))
-            .await
-            .context("failed to remove disk")?;
-        info!("disk {} removed from VM {}", disk_id, self.vm_id);
-        Ok(())
-    }
-
-    /// Hot-add a virtio-net device backed by a TAP device.
-    ///
-    /// Used to add networking to a snapshot-restored VM (golden snapshots
-    /// exclude network devices). The TAP device must already exist in the
-    /// appropriate network namespace.
-    #[allow(dead_code)]
-    pub async fn add_net(&self, tap_name: &str, mac: Option<&str>) -> Result<()> {
-        let mut net_config = serde_json::json!({
-            "tap": tap_name,
-        });
-        if let Some(m) = mac {
-            net_config["mac"] = serde_json::Value::String(m.to_string());
-        }
-        let body = serde_json::to_string(&net_config)?;
-        info!(
-            "hot-adding net to VM {}: tap={} mac={:?}",
-            self.vm_id, tap_name, mac
-        );
-
-        self.api_request("PUT", "/api/v1/vm.add-net", Some(&body))
-            .await
-            .context("failed to hot-add net device")?;
-
-        info!(
-            "net device hot-added to VM {} (tap={})",
-            self.vm_id, tap_name
-        );
-        Ok(())
-    }
-
-    /// Hot-add a net device to a VM via its API socket (static version).
+    /// Hot-add a virtio-net device to a VM via its API socket.
     ///
     /// Used for snapshot-restored VMs that don't have a VmManager.
+    /// The TAP device must already exist in the appropriate network namespace.
     #[allow(dead_code)]
     pub async fn add_net_to_socket(
         api_socket: &Path,
@@ -778,54 +738,6 @@ impl VmManager {
             .await
             .context("failed to resume VM")?;
         info!("VM {} resumed", self.vm_id);
-        Ok(())
-    }
-
-    /// Send this VM to another Cloud Hypervisor instance via live migration.
-    ///
-    /// The destination CH must be running and have called receive_migration.
-    /// Transport: "unix:/path/to/socket" for same-host, "tcp:host:port" for remote.
-    #[allow(dead_code)]
-    pub async fn send_migration(&self, transport_uri: &str, local: bool) -> Result<()> {
-        info!("sending VM {} migration to {}", self.vm_id, transport_uri);
-
-        let mut body_map = serde_json::Map::new();
-        body_map.insert(
-            "destination_url".to_string(),
-            serde_json::Value::String(transport_uri.to_string()),
-        );
-        if local {
-            body_map.insert("local".to_string(), serde_json::Value::Bool(true));
-        }
-        let body = serde_json::to_string(&serde_json::Value::Object(body_map))?;
-
-        self.api_request("PUT", "/api/v1/vm.send-migration", Some(&body))
-            .await
-            .context("failed to send migration")?;
-
-        info!("VM {} migration sent to {}", self.vm_id, transport_uri);
-        Ok(())
-    }
-
-    /// Prepare to receive a VM via live migration.
-    #[allow(dead_code)]
-    pub async fn receive_migration(api_socket: &Path, transport_uri: &str) -> Result<()> {
-        info!("preparing to receive migration on {}", transport_uri);
-
-        let body = serde_json::to_string(&serde_json::json!({
-            "receiver_url": transport_uri
-        }))?;
-
-        Self::api_request_to_socket(
-            api_socket,
-            "PUT",
-            "/api/v1/vm.receive-migration",
-            Some(&body),
-        )
-        .await
-        .context("failed to receive migration")?;
-
-        info!("VM migration received on {}", transport_uri);
         Ok(())
     }
 

@@ -242,10 +242,4 @@ impl VmPool {
     pub fn is_enabled(&self) -> bool {
         self.target_size > 0
     }
-
-    /// Access the snapshot manager (e.g., for lazy golden snapshot creation).
-    #[allow(dead_code)]
-    pub fn snapshot_manager(&mut self) -> &mut SnapshotManager {
-        &mut self.snapshot_mgr
-    }
 }
