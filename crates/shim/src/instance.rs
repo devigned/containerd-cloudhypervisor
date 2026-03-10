@@ -162,10 +162,9 @@ impl CloudHvShim {
     ) -> TtrpcResult<api::CreateTaskResponse> {
         info!("creating sandbox (VM): {}", sandbox_id);
 
-        // Extract network namespace and IP from the OCI spec
+        // Extract network namespace and annotations from the OCI spec
         let spec_path = std::path::Path::new(bundle_path).join("config.json");
-        let (netns_path, _pod_ip, _gateway) = if let Ok(data) = std::fs::read_to_string(&spec_path)
-        {
+        let (netns_path, pod_annotations) = if let Ok(data) = std::fs::read_to_string(&spec_path) {
             if let Ok(spec) = serde_json::from_str::<serde_json::Value>(&data) {
                 let netns = spec
                     .pointer("/linux/namespaces")
@@ -176,13 +175,17 @@ impl CloudHvShim {
                     })
                     .and_then(|n| n.get("path").and_then(|p| p.as_str()))
                     .map(String::from);
+                let annotations = crate::annotations::annotations_from_spec(&spec);
                 info!("sandbox netns: {:?}", netns);
-                (netns, None::<String>, None::<String>)
+                if !annotations.is_empty() {
+                    info!("sandbox annotations: {:?}", annotations);
+                }
+                (netns, annotations)
             } else {
-                (None, None, None)
+                (None, std::collections::HashMap::new())
             }
         } else {
-            (None, None, None)
+            (None, std::collections::HashMap::new())
         };
 
         // Set up TAP device in the pod's network namespace
@@ -212,6 +215,9 @@ impl CloudHvShim {
         let config = load_config(None).map_err(|e| {
             containerd_shim_protos::ttrpc::Error::Others(format!("config error: {e}"))
         })?;
+
+        // Apply pod annotations to override VM resource settings
+        let config = crate::annotations::apply_annotations(config, &pod_annotations);
 
         let (vm, agent) = {
             let mut pool = self.pool.lock().await;
