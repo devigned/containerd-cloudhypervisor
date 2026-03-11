@@ -73,36 +73,77 @@ kubectl -n kube-system logs -l app.kubernetes.io/name=cloudhv-installer --tail=5
 kubectl get runtimeclass cloudhv
 ```
 
-## 3. Run a Container in a MicroVM
+## 3. Deploy an Echo Service
+
+Deploy an HTTP echo server as a Deployment with a Service, making it easy to
+scale up and down. Each replica runs inside its own Cloud Hypervisor microVM.
 
 ```bash
 kubectl apply -f - <<EOF
-apiVersion: v1
-kind: Pod
+apiVersion: apps/v1
+kind: Deployment
 metadata:
-  name: echo-test
+  name: echo-cloudhv
+  labels:
+    app: echo-cloudhv
 spec:
-  runtimeClassName: cloudhv
-  containers:
-    - name: echo
-      image: hashicorp/http-echo:latest
-      args: ["-text=Hello from Cloud Hypervisor on AKS!", "-listen=:5678"]
-      ports:
-        - containerPort: 5678
-  restartPolicy: Never
+  replicas: 1
+  selector:
+    matchLabels:
+      app: echo-cloudhv
+  template:
+    metadata:
+      labels:
+        app: echo-cloudhv
+    spec:
+      runtimeClassName: cloudhv
+      containers:
+        - name: echo
+          image: hashicorp/http-echo:latest
+          args: ["-text=Hello from Cloud Hypervisor on AKS!", "-listen=:5678"]
+          ports:
+            - containerPort: 5678
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-cloudhv
+spec:
+  selector:
+    app: echo-cloudhv
+  ports:
+    - port: 80
+      targetPort: 5678
+  type: ClusterIP
 EOF
 
-# Wait for it to start
-kubectl get pod echo-test -w
+# Wait for the deployment to be ready
+kubectl rollout status deployment echo-cloudhv
 
-# Verify it responds
-POD_IP=$(kubectl get pod echo-test -o jsonpath='{.status.podIP}')
+# Test via the service
 kubectl run curl-test --image=curlimages/curl:latest --rm -it --restart=Never \
-  -- curl -s "http://$POD_IP:5678/"
+  -- curl -s http://echo-cloudhv/
 # Output: Hello from Cloud Hypervisor on AKS!
+```
 
-# Check logs
-kubectl logs echo-test
+### Scale Up
+
+Each new replica boots a fresh microVM in ~300ms:
+
+```bash
+# Scale to 5 replicas (5 VMs across 3 nodes)
+kubectl scale deployment echo-cloudhv --replicas=5
+kubectl get pods -l app=echo-cloudhv -o wide -w
+```
+
+### Scale Down
+
+```bash
+kubectl scale deployment echo-cloudhv --replicas=1
 ```
 
 ## 4. Customize VM Resources (Optional)
@@ -130,8 +171,9 @@ the full list of supported annotations.
 ## 5. Clean Up
 
 ```bash
-# Delete test pods
-kubectl delete pod echo-test --ignore-not-found
+# Delete the echo service
+kubectl delete deployment echo-cloudhv
+kubectl delete service echo-cloudhv
 
 # Uninstall the shim
 helm uninstall cloudhv-installer --namespace kube-system
