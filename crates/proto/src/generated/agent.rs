@@ -267,6 +267,10 @@ pub struct VolumeMount {
     pub options: ::std::vec::Vec<::std::string::String>,
     // @@protoc_insertion_point(field:cloudhv.agent.VolumeMount.readonly)
     pub readonly: bool,
+    // @@protoc_insertion_point(field:cloudhv.agent.VolumeMount.volume_type)
+    pub volume_type: ::protobuf::EnumOrUnknown<VolumeType>,
+    // @@protoc_insertion_point(field:cloudhv.agent.VolumeMount.fs_type)
+    pub fs_type: ::std::string::String,
     // special fields
     // @@protoc_insertion_point(special_field:cloudhv.agent.VolumeMount.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -284,7 +288,7 @@ impl VolumeMount {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(4);
+        let mut fields = ::std::vec::Vec::with_capacity(6);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "destination",
@@ -305,6 +309,16 @@ impl VolumeMount {
             "readonly",
             |m: &VolumeMount| { &m.readonly },
             |m: &mut VolumeMount| { &mut m.readonly },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "volume_type",
+            |m: &VolumeMount| { &m.volume_type },
+            |m: &mut VolumeMount| { &mut m.volume_type },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "fs_type",
+            |m: &VolumeMount| { &m.fs_type },
+            |m: &mut VolumeMount| { &mut m.fs_type },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<VolumeMount>(
             "VolumeMount",
@@ -336,6 +350,12 @@ impl ::protobuf::Message for VolumeMount {
                 32 => {
                     self.readonly = is.read_bool()?;
                 },
+                40 => {
+                    self.volume_type = is.read_enum_or_unknown()?;
+                },
+                50 => {
+                    self.fs_type = is.read_string()?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -360,6 +380,12 @@ impl ::protobuf::Message for VolumeMount {
         if self.readonly != false {
             my_size += 1 + 1;
         }
+        if self.volume_type != ::protobuf::EnumOrUnknown::new(VolumeType::FILESYSTEM) {
+            my_size += ::protobuf::rt::int32_size(5, self.volume_type.value());
+        }
+        if !self.fs_type.is_empty() {
+            my_size += ::protobuf::rt::string_size(6, &self.fs_type);
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -377,6 +403,12 @@ impl ::protobuf::Message for VolumeMount {
         };
         if self.readonly != false {
             os.write_bool(4, self.readonly)?;
+        }
+        if self.volume_type != ::protobuf::EnumOrUnknown::new(VolumeType::FILESYSTEM) {
+            os.write_enum(5, ::protobuf::EnumOrUnknown::value(&self.volume_type))?;
+        }
+        if !self.fs_type.is_empty() {
+            os.write_string(6, &self.fs_type)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -399,6 +431,8 @@ impl ::protobuf::Message for VolumeMount {
         self.source.clear();
         self.options.clear();
         self.readonly = false;
+        self.volume_type = ::protobuf::EnumOrUnknown::new(VolumeType::FILESYSTEM);
+        self.fs_type.clear();
         self.special_fields.clear();
     }
 
@@ -408,6 +442,8 @@ impl ::protobuf::Message for VolumeMount {
             source: ::std::string::String::new(),
             options: ::std::vec::Vec::new(),
             readonly: false,
+            volume_type: ::protobuf::EnumOrUnknown::from_i32(0),
+            fs_type: ::std::string::String::new(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -2827,6 +2863,68 @@ impl ::protobuf::reflect::ProtobufValue for GetMemInfoResponse {
 }
 
 #[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
+// @@protoc_insertion_point(enum:cloudhv.agent.VolumeType)
+pub enum VolumeType {
+    // @@protoc_insertion_point(enum_value:cloudhv.agent.VolumeType.FILESYSTEM)
+    FILESYSTEM = 0,
+    // @@protoc_insertion_point(enum_value:cloudhv.agent.VolumeType.BLOCK)
+    BLOCK = 1,
+}
+
+impl ::protobuf::Enum for VolumeType {
+    const NAME: &'static str = "VolumeType";
+
+    fn value(&self) -> i32 {
+        *self as i32
+    }
+
+    fn from_i32(value: i32) -> ::std::option::Option<VolumeType> {
+        match value {
+            0 => ::std::option::Option::Some(VolumeType::FILESYSTEM),
+            1 => ::std::option::Option::Some(VolumeType::BLOCK),
+            _ => ::std::option::Option::None
+        }
+    }
+
+    fn from_str(str: &str) -> ::std::option::Option<VolumeType> {
+        match str {
+            "FILESYSTEM" => ::std::option::Option::Some(VolumeType::FILESYSTEM),
+            "BLOCK" => ::std::option::Option::Some(VolumeType::BLOCK),
+            _ => ::std::option::Option::None
+        }
+    }
+
+    const VALUES: &'static [VolumeType] = &[
+        VolumeType::FILESYSTEM,
+        VolumeType::BLOCK,
+    ];
+}
+
+impl ::protobuf::EnumFull for VolumeType {
+    fn enum_descriptor() -> ::protobuf::reflect::EnumDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::EnumDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().enum_by_package_relative_name("VolumeType").unwrap()).clone()
+    }
+
+    fn descriptor(&self) -> ::protobuf::reflect::EnumValueDescriptor {
+        let index = *self as usize;
+        Self::enum_descriptor().value_by_index(index)
+    }
+}
+
+impl ::std::default::Default for VolumeType {
+    fn default() -> Self {
+        VolumeType::FILESYSTEM
+    }
+}
+
+impl VolumeType {
+    fn generated_enum_descriptor_data() -> ::protobuf::reflect::GeneratedEnumDescriptorData {
+        ::protobuf::reflect::GeneratedEnumDescriptorData::new::<VolumeType>("VolumeType")
+    }
+}
+
+#[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
 // @@protoc_insertion_point(enum:cloudhv.agent.ContainerState)
 pub enum ContainerState {
     // @@protoc_insertion_point(enum_value:cloudhv.agent.ContainerState.UNKNOWN)
@@ -2910,27 +3008,29 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x03\x20\x01(\tR\x05stdin\x12\x16\n\x06stdout\x18\x04\x20\x01(\tR\x06std\
     out\x12\x16\n\x06stderr\x18\x05\x20\x01(\tR\x06stderr\x12\x1a\n\x08termi\
     nal\x18\x06\x20\x01(\x08R\x08terminal\x124\n\x07volumes\x18\x07\x20\x03(\
-    \x0b2\x1a.cloudhv.agent.VolumeMountR\x07volumes\"}\n\x0bVolumeMount\x12\
-    \x20\n\x0bdestination\x18\x01\x20\x01(\tR\x0bdestination\x12\x16\n\x06so\
-    urce\x18\x02\x20\x01(\tR\x06source\x12\x18\n\x07options\x18\x03\x20\x03(\
-    \tR\x07options\x12\x1a\n\x08readonly\x18\x04\x20\x01(\x08R\x08readonly\"\
-    +\n\x17CreateContainerResponse\x12\x10\n\x03pid\x18\x01\x20\x01(\rR\x03p\
-    id\":\n\x15StartContainerRequest\x12!\n\x0ccontainer_id\x18\x01\x20\x01(\
-    \tR\x0bcontainerId\"*\n\x16StartContainerResponse\x12\x10\n\x03pid\x18\
-    \x01\x20\x01(\rR\x03pid\"c\n\x14KillContainerRequest\x12!\n\x0ccontainer\
-    _id\x18\x01\x20\x01(\tR\x0bcontainerId\x12\x16\n\x06signal\x18\x02\x20\
-    \x01(\rR\x06signal\x12\x10\n\x03all\x18\x03\x20\x01(\x08R\x03all\"\x17\n\
-    \x15KillContainerResponse\";\n\x16DeleteContainerRequest\x12!\n\x0cconta\
-    iner_id\x18\x01\x20\x01(\tR\x0bcontainerId\"L\n\x17DeleteContainerRespon\
-    se\x12\x1f\n\x0bexit_status\x18\x01\x20\x01(\rR\nexitStatus\x12\x10\n\
-    \x03pid\x18\x02\x20\x01(\rR\x03pid\"9\n\x14WaitContainerRequest\x12!\n\
-    \x0ccontainer_id\x18\x01\x20\x01(\tR\x0bcontainerId\"U\n\x15WaitContaine\
-    rResponse\x12\x1f\n\x0bexit_status\x18\x01\x20\x01(\rR\nexitStatus\x12\
-    \x1b\n\texited_at\x18\x02\x20\x01(\tR\x08exitedAt\"\xcf\x01\n\x12ExecPro\
-    cessRequest\x12!\n\x0ccontainer_id\x18\x01\x20\x01(\tR\x0bcontainerId\
-    \x12\x17\n\x07exec_id\x18\x02\x20\x01(\tR\x06execId\x12\x1b\n\tspec_json\
-    \x18\x03\x20\x01(\tR\x08specJson\x12\x14\n\x05stdin\x18\x04\x20\x01(\tR\
-    \x05stdin\x12\x16\n\x06stdout\x18\x05\x20\x01(\tR\x06stdout\x12\x16\n\
+    \x0b2\x1a.cloudhv.agent.VolumeMountR\x07volumes\"\xd2\x01\n\x0bVolumeMou\
+    nt\x12\x20\n\x0bdestination\x18\x01\x20\x01(\tR\x0bdestination\x12\x16\n\
+    \x06source\x18\x02\x20\x01(\tR\x06source\x12\x18\n\x07options\x18\x03\
+    \x20\x03(\tR\x07options\x12\x1a\n\x08readonly\x18\x04\x20\x01(\x08R\x08r\
+    eadonly\x12:\n\x0bvolume_type\x18\x05\x20\x01(\x0e2\x19.cloudhv.agent.Vo\
+    lumeTypeR\nvolumeType\x12\x17\n\x07fs_type\x18\x06\x20\x01(\tR\x06fsType\
+    \"+\n\x17CreateContainerResponse\x12\x10\n\x03pid\x18\x01\x20\x01(\rR\
+    \x03pid\":\n\x15StartContainerRequest\x12!\n\x0ccontainer_id\x18\x01\x20\
+    \x01(\tR\x0bcontainerId\"*\n\x16StartContainerResponse\x12\x10\n\x03pid\
+    \x18\x01\x20\x01(\rR\x03pid\"c\n\x14KillContainerRequest\x12!\n\x0cconta\
+    iner_id\x18\x01\x20\x01(\tR\x0bcontainerId\x12\x16\n\x06signal\x18\x02\
+    \x20\x01(\rR\x06signal\x12\x10\n\x03all\x18\x03\x20\x01(\x08R\x03all\"\
+    \x17\n\x15KillContainerResponse\";\n\x16DeleteContainerRequest\x12!\n\
+    \x0ccontainer_id\x18\x01\x20\x01(\tR\x0bcontainerId\"L\n\x17DeleteContai\
+    nerResponse\x12\x1f\n\x0bexit_status\x18\x01\x20\x01(\rR\nexitStatus\x12\
+    \x10\n\x03pid\x18\x02\x20\x01(\rR\x03pid\"9\n\x14WaitContainerRequest\
+    \x12!\n\x0ccontainer_id\x18\x01\x20\x01(\tR\x0bcontainerId\"U\n\x15WaitC\
+    ontainerResponse\x12\x1f\n\x0bexit_status\x18\x01\x20\x01(\rR\nexitStatu\
+    s\x12\x1b\n\texited_at\x18\x02\x20\x01(\tR\x08exitedAt\"\xcf\x01\n\x12Ex\
+    ecProcessRequest\x12!\n\x0ccontainer_id\x18\x01\x20\x01(\tR\x0bcontainer\
+    Id\x12\x17\n\x07exec_id\x18\x02\x20\x01(\tR\x06execId\x12\x1b\n\tspec_js\
+    on\x18\x03\x20\x01(\tR\x08specJson\x12\x14\n\x05stdin\x18\x04\x20\x01(\t\
+    R\x05stdin\x12\x16\n\x06stdout\x18\x05\x20\x01(\tR\x06stdout\x12\x16\n\
     \x06stderr\x18\x06\x20\x01(\tR\x06stderr\x12\x1a\n\x08terminal\x18\x07\
     \x20\x01(\x08R\x08terminal\"'\n\x13ExecProcessResponse\x12\x10\n\x03pid\
     \x18\x01\x20\x01(\rR\x03pid\":\n\x15StateContainerRequest\x12!\n\x0ccont\
@@ -2947,8 +3047,9 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     em_available_kb\x18\x03\x20\x01(\x04R\x0ememAvailableKb\x12\x1d\n\nbuffe\
     rs_kb\x18\x04\x20\x01(\x04R\tbuffersKb\x12\x1b\n\tcached_kb\x18\x05\x20\
     \x01(\x04R\x08cachedKb\x12\"\n\rswap_total_kb\x18\x06\x20\x01(\x04R\x0bs\
-    wapTotalKb\x12\x20\n\x0cswap_free_kb\x18\x07\x20\x01(\x04R\nswapFreeKb*P\
-    \n\x0eContainerState\x12\x0b\n\x07UNKNOWN\x10\0\x12\x0b\n\x07CREATED\x10\
+    wapTotalKb\x12\x20\n\x0cswap_free_kb\x18\x07\x20\x01(\x04R\nswapFreeKb*'\
+    \n\nVolumeType\x12\x0e\n\nFILESYSTEM\x10\0\x12\t\n\x05BLOCK\x10\x01*P\n\
+    \x0eContainerState\x12\x0b\n\x07UNKNOWN\x10\0\x12\x0b\n\x07CREATED\x10\
     \x01\x12\x0b\n\x07RUNNING\x10\x02\x12\x0b\n\x07STOPPED\x10\x03\x12\n\n\
     \x06PAUSED\x10\x042\xf1\x05\n\x0cAgentService\x12`\n\x0fCreateContainer\
     \x12%.cloudhv.agent.CreateContainerRequest\x1a&.cloudhv.agent.CreateCont\
@@ -3002,7 +3103,8 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
             messages.push(CheckResponse::generated_message_descriptor_data());
             messages.push(GetMemInfoRequest::generated_message_descriptor_data());
             messages.push(GetMemInfoResponse::generated_message_descriptor_data());
-            let mut enums = ::std::vec::Vec::with_capacity(1);
+            let mut enums = ::std::vec::Vec::with_capacity(2);
+            enums.push(VolumeType::generated_enum_descriptor_data());
             enums.push(ContainerState::generated_enum_descriptor_data());
             ::protobuf::reflect::GeneratedFileDescriptor::new_generated(
                 file_descriptor_proto(),

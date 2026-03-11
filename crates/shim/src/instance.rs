@@ -510,12 +510,51 @@ impl CloudHvShim {
         // prepare the OCI bundle for crun.
         let bundle_guest = format!("/run/containers/{}", container_id);
 
-        // Extract volume mounts from the OCI spec and copy their contents
-        // into the shared directory so the agent can mount them.
-        let volumes = {
+        // Extract volume mounts from the OCI spec and stage them.
+        // Block volumes are hot-plugged; filesystem volumes are bind-mounted
+        // into the shared directory.
+        let mut volumes = {
             let spec_path = std::path::Path::new(&req.bundle).join("config.json");
             extract_and_stage_volumes(&spec_path, container_id, &shared_dir)
         };
+
+        // Hot-plug block volumes into the VM
+        for vol in &mut volumes {
+            if vol.volume_type == cloudhv_proto::VolumeType::BLOCK.into() {
+                let vol_disk_id = format!(
+                    "vol-{}",
+                    &vol.destination.trim_start_matches('/').replace('/', "-")
+                );
+                let readonly = vol.readonly;
+                info!(
+                    "hot-plugging block volume: {} -> {} (fs={})",
+                    vol.source, vol.destination, vol.fs_type
+                );
+                crate::vm::VmManager::api_request_to_socket(
+                    &api_socket,
+                    "PUT",
+                    "/api/v1/vm.add-disk",
+                    Some(
+                        &serde_json::json!({
+                            "path": vol.source,
+                            "readonly": readonly,
+                            "id": vol_disk_id,
+                        })
+                        .to_string(),
+                    ),
+                )
+                .await
+                .map_err(|e| {
+                    containerd_shim_protos::ttrpc::Error::Others(format!(
+                        "hot-plug block volume {}: {e:#}",
+                        vol.destination
+                    ))
+                })?;
+                // Rewrite source to disk ID so the agent can discover it
+                vol.source = vol_disk_id;
+            }
+        }
+
         if !volumes.is_empty() {
             info!(
                 "staged {} volume(s) for container {}",
@@ -1263,15 +1302,13 @@ fn prefix_to_netmask(prefix: u32) -> String {
     )
 }
 
-/// Extract bind mounts from the OCI spec, copy their source data into the
-/// shared directory, and return VolumeMount proto messages for the agent.
+/// Extract volume mounts from the OCI spec and stage them for the guest.
 ///
-/// CSI volumes, ConfigMaps, Secrets, and emptyDirs appear as bind mounts
-/// in the OCI spec. This function:
-/// 1. Reads the spec's mounts array
-/// 2. Filters for bind mounts with real host paths (skipping /dev, /proc, etc.)
-/// 3. Copies the source data to shared_dir/volumes/<container_id>/<dest>
-/// 4. Returns VolumeMount messages with guest-side paths
+/// Dual-path transport:
+/// - **Block devices** (raw block PVCs): hot-plugged via vm.add-disk for
+///   direct virtio-blk access (no FUSE overhead)
+/// - **Filesystem volumes** (ConfigMaps, Secrets, emptyDirs, fs PVCs):
+///   bind-mounted into the virtio-fs shared dir for live host access
 fn extract_and_stage_volumes(
     spec_path: &std::path::Path,
     container_id: &str,
@@ -1291,7 +1328,6 @@ fn extract_and_stage_volumes(
         None => return vec![],
     };
 
-    // System mounts to skip (not volumes)
     let skip_destinations = [
         "/proc",
         "/dev",
@@ -1317,77 +1353,122 @@ fn extract_and_stage_volumes(
             None => continue,
         };
 
-        // Skip system mounts
         if skip_destinations.contains(&dest) {
             continue;
         }
 
-        // Only handle bind mounts with existing source paths
-        let mount_type = mount.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let src_path = std::path::Path::new(source);
+        if !src_path.exists() {
+            continue;
+        }
+
         let options = mount
             .get("options")
             .and_then(|o| o.as_array())
             .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
             .unwrap_or_default();
-        let is_bind = mount_type == "bind" || options.iter().any(|o| *o == "bind" || *o == "rbind");
-
-        if !is_bind || !std::path::Path::new(source).exists() {
-            continue;
-        }
-
-        // Copy volume data into the shared directory
-        let safe_dest = dest.trim_start_matches('/').replace('/', "_");
-        let vol_dir = shared_dir
-            .join("volumes")
-            .join(container_id)
-            .join(&safe_dest);
-
-        if let Err(e) = copy_dir_recursive(std::path::Path::new(source), &vol_dir) {
-            log::warn!(
-                "failed to stage volume {} -> {}: {e}",
-                source,
-                vol_dir.display()
-            );
-            continue;
-        }
-
         let readonly = options.contains(&"ro");
-        let guest_source = format!(
-            "{}/volumes/{}/{}",
-            cloudhv_common::VIRTIOFS_GUEST_MOUNT,
-            container_id,
-            safe_dest
-        );
 
-        let mut vm = cloudhv_proto::VolumeMount::new();
-        vm.destination = dest.to_string();
-        vm.source = guest_source;
-        vm.readonly = readonly;
-        vm.options = options.iter().map(|s| s.to_string()).collect();
-        volumes.push(vm);
+        // Detect block devices vs filesystem paths
+        if is_block_device(src_path) {
+            // Block device — will be hot-plugged via vm.add-disk.
+            // The agent discovers it as a new /dev/vdX and mounts it.
+            let mut vol_msg = cloudhv_proto::VolumeMount::new();
+            vol_msg.destination = dest.to_string();
+            vol_msg.source = source.to_string();
+            vol_msg.readonly = readonly;
+            vol_msg.volume_type = cloudhv_proto::VolumeType::BLOCK.into();
+            vol_msg.fs_type = detect_fs_type(source).unwrap_or_else(|| "ext4".to_string());
+            vol_msg.options = options.iter().map(|s| s.to_string()).collect();
+            log::info!(
+                "block volume: {} -> {} (fs={})",
+                source,
+                dest,
+                vol_msg.fs_type
+            );
+            volumes.push(vol_msg);
+        } else {
+            // Filesystem path — bind-mount into the shared directory so
+            // the guest sees a live view via virtio-fs.
+            let mount_type = mount.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let is_bind =
+                mount_type == "bind" || options.iter().any(|o| *o == "bind" || *o == "rbind");
+            if !is_bind {
+                continue;
+            }
 
-        log::info!("staged volume: {} -> {} (ro={})", source, dest, readonly);
+            let safe_dest = dest.trim_start_matches('/').replace('/', "_");
+            let vol_dir = shared_dir
+                .join("volumes")
+                .join(container_id)
+                .join(&safe_dest);
+
+            if let Err(e) = bind_mount_volume(src_path, &vol_dir) {
+                log::warn!(
+                    "failed to bind-mount volume {} -> {}: {e}",
+                    source,
+                    vol_dir.display()
+                );
+                continue;
+            }
+
+            let guest_source = format!(
+                "{}/volumes/{}/{}",
+                cloudhv_common::VIRTIOFS_GUEST_MOUNT,
+                container_id,
+                safe_dest
+            );
+
+            let mut vol_msg = cloudhv_proto::VolumeMount::new();
+            vol_msg.destination = dest.to_string();
+            vol_msg.source = guest_source;
+            vol_msg.readonly = readonly;
+            vol_msg.volume_type = cloudhv_proto::VolumeType::FILESYSTEM.into();
+            vol_msg.options = options.iter().map(|s| s.to_string()).collect();
+            volumes.push(vol_msg);
+            log::info!("fs volume: {} -> {} (ro={})", source, dest, readonly);
+        }
     }
 
     volumes
 }
 
-/// Recursively copy a directory tree.
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    if src.is_file() {
-        std::fs::copy(src, dst.join(src.file_name().unwrap_or_default()))?;
-        return Ok(());
+/// Check if a path is a block device.
+fn is_block_device(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    match std::fs::metadata(path) {
+        Ok(meta) => meta.file_type().is_block_device(),
+        Err(_) => false,
     }
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else {
-            std::fs::copy(&src_path, &dst_path)?;
+}
+
+/// Detect the filesystem type of a block device via blkid.
+fn detect_fs_type(device: &str) -> Option<String> {
+    let output = std::process::Command::new("blkid")
+        .args(["-s", "TYPE", "-o", "value", device])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let fs = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !fs.is_empty() {
+            return Some(fs);
         }
+    }
+    None
+}
+
+/// Bind-mount a host path into the shared directory.
+fn bind_mount_volume(source: &std::path::Path, target: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(target)?;
+    let status = std::process::Command::new("mount")
+        .args([
+            "--bind",
+            &source.to_string_lossy(),
+            &target.to_string_lossy(),
+        ])
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("mount --bind failed: {status}");
     }
     Ok(())
 }

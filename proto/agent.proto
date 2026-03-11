@@ -58,12 +58,23 @@ message CreateContainerRequest {
 message VolumeMount {
     // Mount destination inside the container (e.g., "/data")
     string destination = 1;
-    // Source path on the virtio-fs shared mount (host copies data here)
+    // Source path on the virtio-fs shared mount (for filesystem volumes)
     string source = 2;
     // Mount options (e.g., "ro", "rbind")
     repeated string options = 3;
     // Whether the mount is read-only
     bool readonly = 4;
+    // Volume transport type
+    VolumeType volume_type = 5;
+    // Filesystem type for block volumes (e.g., "ext4", "xfs")
+    string fs_type = 6;
+}
+
+enum VolumeType {
+    // Filesystem volume shared via virtio-fs (ConfigMap, Secret, emptyDir, fs PVC)
+    FILESYSTEM = 0;
+    // Block volume hot-plugged as virtio-blk disk (raw block PVC)
+    BLOCK = 1;
 }
 
 message CreateContainerResponse {

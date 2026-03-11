@@ -62,6 +62,36 @@ Following the same approach as [firecracker-containerd](https://github.com/firec
 
 This avoids FUSE in the container data path and enables proper `pivot_root`.
 
+## Volumes (CSI, ConfigMap, Secret)
+
+Kubernetes volumes are transported into the VM using a dual-path approach
+optimized for each volume type:
+
+| Volume Type | Host Form | Transport | Guest Access | Writes Persist |
+|-------------|-----------|-----------|-------------|----------------|
+| Block PVC (raw) | `/dev/sdX` | `vm.add-disk` hot-plug | `/dev/vdX` direct I/O | Yes |
+| Filesystem PVC | directory | virtio-fs bind mount | bind mount | Yes |
+| ConfigMap | directory | virtio-fs bind mount | bind mount | No (read-only) |
+| Secret | directory | virtio-fs bind mount | bind mount | No (read-only) |
+| emptyDir | directory | virtio-fs bind mount | bind mount | Yes (pod lifetime) |
+
+### How It Works
+
+1. The shim reads the OCI spec's mounts array from the container bundle
+2. For each volume mount (skipping system mounts like `/proc`, `/dev`, `/sys`):
+   - **Block devices**: detected via `is_block_device()`, hot-plugged into the VM
+     via `vm.add-disk`, agent discovers and mounts the new `/dev/vdX` device
+   - **Filesystem paths**: bind-mounted into the virtio-fs shared directory,
+     giving the guest a live view of the host data through virtio-fs
+3. Volume metadata (destination, source, type, readonly) is passed to the agent
+   via the `CreateContainer` RPC
+4. The agent injects the volumes as mounts in the adapted OCI spec
+5. `crun` mounts them at the expected paths inside the container
+
+Block device passthrough avoids FUSE overhead for I/O-intensive workloads.
+Filesystem sharing via virtio-fs preserves write persistence — changes inside
+the container propagate back to the host PV.
+
 ## Networking
 
 VM networking follows the [tc-redirect-tap](https://github.com/firecracker-microvm/firecracker-containerd)

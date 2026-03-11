@@ -37,10 +37,17 @@ impl AgentService for AgentServiceHandler {
             Some(req.stderr.as_str())
         };
         let mut mgr = self.container_manager.lock().await;
-        let volumes: Vec<(String, String, bool)> = req
+        let volumes: Vec<crate::container::VolumeInfo> = req
             .volumes
             .iter()
-            .map(|v| (v.destination.clone(), v.source.clone(), v.readonly))
+            .map(|v| crate::container::VolumeInfo {
+                destination: v.destination.clone(),
+                source: v.source.clone(),
+                readonly: v.readonly,
+                is_block: v.volume_type
+                    == cloudhv_proto::generated::agent::VolumeType::BLOCK.into(),
+                fs_type: v.fs_type.clone(),
+            })
             .collect();
         let pid = mgr
             .create(

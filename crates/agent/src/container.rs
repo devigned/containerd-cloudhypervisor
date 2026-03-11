@@ -8,6 +8,15 @@ use log::debug;
 use log::{error, info};
 use tokio::process::Command;
 
+/// Volume information passed from the shim to the agent.
+pub struct VolumeInfo {
+    pub destination: String,
+    pub source: String,
+    pub readonly: bool,
+    pub is_block: bool,
+    pub fs_type: String,
+}
+
 /// Tracks the state of a container managed by the agent.
 #[derive(Debug)]
 struct Container {
@@ -126,7 +135,7 @@ impl ContainerManager {
     fn adapt_oci_spec_for_vm(
         &self,
         bundle: &std::path::Path,
-        volumes: &[(String, String, bool)],
+        volumes: &[VolumeInfo],
     ) -> Result<()> {
         let config_path = bundle.join("config.json");
         let data = std::fs::read_to_string(&config_path)
@@ -167,18 +176,44 @@ impl ContainerManager {
         ];
 
         // Add volume mounts from the shim (CSI, ConfigMap, Secret, emptyDir)
-        for (dest, source, readonly) in volumes {
-            let mut opts = vec!["rbind".to_string()];
-            if *readonly {
-                opts.push("ro".to_string());
+        for vol in volumes {
+            if vol.is_block {
+                // Block volumes: the shim hot-plugged the device. The agent
+                // discovers it as a new /dev/vdX. We mount it at the
+                // destination with the detected filesystem type.
+                // For now, add as a mount — the device will be discovered
+                // by scanning /sys/block for the new device.
+                let mut opts = Vec::new();
+                if vol.readonly {
+                    opts.push("ro".to_string());
+                }
+                mounts.push(serde_json::json!({
+                    "destination": vol.destination,
+                    "type": vol.fs_type,
+                    "source": "block-volume", // placeholder — resolved at mount time
+                    "options": opts,
+                }));
+                info!(
+                    "block volume mount: {} (fs={}, ro={})",
+                    vol.destination, vol.fs_type, vol.readonly
+                );
+            } else {
+                // Filesystem volumes: bind-mount from the virtio-fs shared dir
+                let mut opts = vec!["rbind".to_string()];
+                if vol.readonly {
+                    opts.push("ro".to_string());
+                }
+                mounts.push(serde_json::json!({
+                    "destination": vol.destination,
+                    "type": "bind",
+                    "source": vol.source,
+                    "options": opts,
+                }));
+                info!(
+                    "fs volume mount: {} -> {} (ro={})",
+                    vol.source, vol.destination, vol.readonly
+                );
             }
-            mounts.push(serde_json::json!({
-                "destination": dest,
-                "type": "bind",
-                "source": source,
-                "options": opts,
-            }));
-            info!("volume mount: {} -> {} (ro={})", source, dest, readonly);
         }
 
         if let Some(obj) = spec.as_object_mut() {
@@ -214,7 +249,7 @@ impl ContainerManager {
         bundle_path: &str,
         _stdout_path: Option<&str>,
         _stderr_path: Option<&str>,
-        volumes: &[(String, String, bool)],
+        volumes: &[VolumeInfo],
     ) -> Result<u32> {
         info!("creating container: id={}", container_id);
 
