@@ -141,6 +141,17 @@ jobs:
           name: ${{ matrix.rootfs_artifact }}
           path: guest/rootfs/rootfs.ext4
 
+      - name: Package virtiofsd
+        run: |
+          sudo apt-get update && sudo apt-get install -y virtiofsd
+          cp /usr/libexec/virtiofsd /tmp/virtiofsd
+
+      - name: Upload virtiofsd
+        uses: actions/upload-artifact@v4
+        with:
+          name: virtiofsd-${{ matrix.arch }}
+          path: /tmp/virtiofsd
+
   build-installer-image:
     name: Build & Push Installer Image (multi-arch)
     runs-on: ubuntu-latest
@@ -160,12 +171,11 @@ jobs:
             /tmp/image-root-amd64/opt/cloudhv/
           cp /tmp/artifacts/vmlinux-x86_64/vmlinux /tmp/image-root-amd64/opt/cloudhv/
           cp /tmp/artifacts/rootfs-x86_64/rootfs.ext4 /tmp/image-root-amd64/opt/cloudhv/
+          cp /tmp/artifacts/virtiofsd-x86_64/virtiofsd /tmp/image-root-amd64/opt/cloudhv/
           cp installer/install.sh /tmp/image-root-amd64/opt/cloudhv/
           chmod +x /tmp/image-root-amd64/opt/cloudhv/containerd-shim-cloudhv-v1
+          chmod +x /tmp/image-root-amd64/opt/cloudhv/virtiofsd
           chmod +x /tmp/image-root-amd64/opt/cloudhv/install.sh
-          # Download virtiofsd for amd64
-          sudo apt-get update && sudo apt-get install -y virtiofsd
-          cp /usr/libexec/virtiofsd /tmp/image-root-amd64/opt/cloudhv/
           ls -lh /tmp/image-root-amd64/opt/cloudhv/
 
       - name: Prepare image contents (arm64)
@@ -175,8 +185,10 @@ jobs:
             /tmp/image-root-arm64/opt/cloudhv/
           cp /tmp/artifacts/vmlinux-aarch64/vmlinux /tmp/image-root-arm64/opt/cloudhv/
           cp /tmp/artifacts/rootfs-aarch64/rootfs.ext4 /tmp/image-root-arm64/opt/cloudhv/
+          cp /tmp/artifacts/virtiofsd-aarch64/virtiofsd /tmp/image-root-arm64/opt/cloudhv/
           cp installer/install.sh /tmp/image-root-arm64/opt/cloudhv/
           chmod +x /tmp/image-root-arm64/opt/cloudhv/containerd-shim-cloudhv-v1
+          chmod +x /tmp/image-root-arm64/opt/cloudhv/virtiofsd
           chmod +x /tmp/image-root-arm64/opt/cloudhv/install.sh
           ls -lh /tmp/image-root-arm64/opt/cloudhv/
 
