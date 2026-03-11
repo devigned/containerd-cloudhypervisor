@@ -510,12 +510,27 @@ impl CloudHvShim {
         // prepare the OCI bundle for crun.
         let bundle_guest = format!("/run/containers/{}", container_id);
 
+        // Extract volume mounts from the OCI spec and copy their contents
+        // into the shared directory so the agent can mount them.
+        let volumes = {
+            let spec_path = std::path::Path::new(&req.bundle).join("config.json");
+            extract_and_stage_volumes(&spec_path, container_id, &shared_dir)
+        };
+        if !volumes.is_empty() {
+            info!(
+                "staged {} volume(s) for container {}",
+                volumes.len(),
+                container_id
+            );
+        }
+
         // Send CreateContainer RPC to the guest agent
         let mut create_req = cloudhv_proto::CreateContainerRequest::new();
         create_req.container_id = container_id.to_string();
         create_req.bundle_path = bundle_guest;
         create_req.stdout = stdout_guest;
         create_req.stderr = stderr_guest;
+        create_req.volumes = volumes;
         let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
         let create_resp = agent
             .create_container(ctx, &create_req)
@@ -1246,4 +1261,133 @@ fn prefix_to_netmask(prefix: u32) -> String {
         (mask >> 8) & 0xff,
         mask & 0xff,
     )
+}
+
+/// Extract bind mounts from the OCI spec, copy their source data into the
+/// shared directory, and return VolumeMount proto messages for the agent.
+///
+/// CSI volumes, ConfigMaps, Secrets, and emptyDirs appear as bind mounts
+/// in the OCI spec. This function:
+/// 1. Reads the spec's mounts array
+/// 2. Filters for bind mounts with real host paths (skipping /dev, /proc, etc.)
+/// 3. Copies the source data to shared_dir/volumes/<container_id>/<dest>
+/// 4. Returns VolumeMount messages with guest-side paths
+fn extract_and_stage_volumes(
+    spec_path: &std::path::Path,
+    container_id: &str,
+    shared_dir: &std::path::Path,
+) -> Vec<cloudhv_proto::VolumeMount> {
+    let data = match std::fs::read_to_string(spec_path) {
+        Ok(d) => d,
+        Err(_) => return vec![],
+    };
+    let spec: serde_json::Value = match serde_json::from_str(&data) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+
+    let mounts = match spec.get("mounts").and_then(|m| m.as_array()) {
+        Some(m) => m,
+        None => return vec![],
+    };
+
+    // System mounts to skip (not volumes)
+    let skip_destinations = [
+        "/proc",
+        "/dev",
+        "/dev/pts",
+        "/dev/shm",
+        "/dev/mqueue",
+        "/sys",
+        "/sys/fs/cgroup",
+        "/etc/hostname",
+        "/etc/hosts",
+        "/etc/resolv.conf",
+    ];
+
+    let mut volumes = Vec::new();
+
+    for mount in mounts {
+        let dest = match mount.get("destination").and_then(|d| d.as_str()) {
+            Some(d) => d,
+            None => continue,
+        };
+        let source = match mount.get("source").and_then(|s| s.as_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        // Skip system mounts
+        if skip_destinations.contains(&dest) {
+            continue;
+        }
+
+        // Only handle bind mounts with existing source paths
+        let mount_type = mount.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let options = mount
+            .get("options")
+            .and_then(|o| o.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let is_bind = mount_type == "bind" || options.iter().any(|o| *o == "bind" || *o == "rbind");
+
+        if !is_bind || !std::path::Path::new(source).exists() {
+            continue;
+        }
+
+        // Copy volume data into the shared directory
+        let safe_dest = dest.trim_start_matches('/').replace('/', "_");
+        let vol_dir = shared_dir
+            .join("volumes")
+            .join(container_id)
+            .join(&safe_dest);
+
+        if let Err(e) = copy_dir_recursive(std::path::Path::new(source), &vol_dir) {
+            log::warn!(
+                "failed to stage volume {} -> {}: {e}",
+                source,
+                vol_dir.display()
+            );
+            continue;
+        }
+
+        let readonly = options.contains(&"ro");
+        let guest_source = format!(
+            "{}/volumes/{}/{}",
+            cloudhv_common::VIRTIOFS_GUEST_MOUNT,
+            container_id,
+            safe_dest
+        );
+
+        let mut vm = cloudhv_proto::VolumeMount::new();
+        vm.destination = dest.to_string();
+        vm.source = guest_source;
+        vm.readonly = readonly;
+        vm.options = options.iter().map(|s| s.to_string()).collect();
+        volumes.push(vm);
+
+        log::info!("staged volume: {} -> {} (ro={})", source, dest, readonly);
+    }
+
+    volumes
+}
+
+/// Recursively copy a directory tree.
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    if src.is_file() {
+        std::fs::copy(src, dst.join(src.file_name().unwrap_or_default()))?;
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
 }

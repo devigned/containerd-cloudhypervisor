@@ -123,7 +123,11 @@ impl ContainerManager {
     /// resources (CNI network namespaces, cgroup paths, etc.) that don't
     /// exist inside the VM. We strip or modify these so crun can create
     /// the container using the VM's own namespaces.
-    fn adapt_oci_spec_for_vm(&self, bundle: &std::path::Path) -> Result<()> {
+    fn adapt_oci_spec_for_vm(
+        &self,
+        bundle: &std::path::Path,
+        volumes: &[(String, String, bool)],
+    ) -> Result<()> {
         let config_path = bundle.join("config.json");
         let data = std::fs::read_to_string(&config_path)
             .with_context(|| format!("failed to read {}", config_path.display()))?;
@@ -151,21 +155,35 @@ impl ContainerManager {
             }
         }
 
-        // Strip host-specific fields and replace mounts with essentials
+        // Replace host mounts with essential system mounts + injected volumes
+        let mut mounts = vec![
+            serde_json::json!({"destination": "/proc", "type": "proc", "source": "proc"}),
+            serde_json::json!({"destination": "/dev", "type": "tmpfs", "source": "tmpfs",
+                "options": ["nosuid", "strictatime", "mode=755", "size=65536k"]}),
+            serde_json::json!({"destination": "/dev/pts", "type": "devpts", "source": "devpts",
+                "options": ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620"]}),
+            serde_json::json!({"destination": "/sys", "type": "sysfs", "source": "sysfs",
+                "options": ["nosuid", "noexec", "nodev", "ro"]}),
+        ];
+
+        // Add volume mounts from the shim (CSI, ConfigMap, Secret, emptyDir)
+        for (dest, source, readonly) in volumes {
+            let mut opts = vec!["rbind".to_string()];
+            if *readonly {
+                opts.push("ro".to_string());
+            }
+            mounts.push(serde_json::json!({
+                "destination": dest,
+                "type": "bind",
+                "source": source,
+                "options": opts,
+            }));
+            info!("volume mount: {} -> {} (ro={})", source, dest, readonly);
+        }
+
         if let Some(obj) = spec.as_object_mut() {
             obj.remove("hostname");
-            obj.insert(
-                "mounts".to_string(),
-                serde_json::json!([
-                    {"destination": "/proc", "type": "proc", "source": "proc"},
-                    {"destination": "/dev", "type": "tmpfs", "source": "tmpfs",
-                     "options": ["nosuid", "strictatime", "mode=755", "size=65536k"]},
-                    {"destination": "/dev/pts", "type": "devpts", "source": "devpts",
-                     "options": ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620"]},
-                    {"destination": "/sys", "type": "sysfs", "source": "sysfs",
-                     "options": ["nosuid", "noexec", "nodev", "ro"]}
-                ]),
-            );
+            obj.insert("mounts".to_string(), serde_json::Value::Array(mounts));
         }
         if let Some(process) = spec.pointer_mut("/process") {
             if let Some(obj) = process.as_object_mut() {
@@ -196,6 +214,7 @@ impl ContainerManager {
         bundle_path: &str,
         _stdout_path: Option<&str>,
         _stderr_path: Option<&str>,
+        volumes: &[(String, String, bool)],
     ) -> Result<u32> {
         info!("creating container: id={}", container_id);
 
@@ -224,7 +243,7 @@ impl ContainerManager {
         let local_bundle = mount_point.clone();
 
         // Adapt the OCI spec for the VM environment
-        self.adapt_oci_spec_for_vm(&local_bundle)?;
+        self.adapt_oci_spec_for_vm(&local_bundle, volumes)?;
 
         let pid = std::process::id();
         self.containers.insert(

@@ -50,6 +50,20 @@ message CreateContainerRequest {
     string stderr = 5;
     // Terminal mode
     bool terminal = 6;
+    // Volume mounts to add to the container (from CSI, ConfigMap, Secret, etc.)
+    repeated VolumeMount volumes = 7;
+}
+
+// A volume mount to inject into the container's OCI spec.
+message VolumeMount {
+    // Mount destination inside the container (e.g., "/data")
+    string destination = 1;
+    // Source path on the virtio-fs shared mount (host copies data here)
+    string source = 2;
+    // Mount options (e.g., "ro", "rbind")
+    repeated string options = 3;
+    // Whether the mount is read-only
+    bool readonly = 4;
 }
 
 message CreateContainerResponse {

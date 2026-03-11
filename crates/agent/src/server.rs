@@ -37,8 +37,19 @@ impl AgentService for AgentServiceHandler {
             Some(req.stderr.as_str())
         };
         let mut mgr = self.container_manager.lock().await;
+        let volumes: Vec<(String, String, bool)> = req
+            .volumes
+            .iter()
+            .map(|v| (v.destination.clone(), v.source.clone(), v.readonly))
+            .collect();
         let pid = mgr
-            .create(&req.container_id, &req.bundle_path, stdout, stderr)
+            .create(
+                &req.container_id,
+                &req.bundle_path,
+                stdout,
+                stderr,
+                &volumes,
+            )
             .await
             .map_err(|e| ttrpc::Error::Others(format!("create_container failed: {e:#}")))?;
         let mut resp = CreateContainerResponse::new();

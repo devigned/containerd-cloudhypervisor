@@ -40,6 +40,8 @@ pub struct CreateContainerRequest {
     pub stderr: ::std::string::String,
     // @@protoc_insertion_point(field:cloudhv.agent.CreateContainerRequest.terminal)
     pub terminal: bool,
+    // @@protoc_insertion_point(field:cloudhv.agent.CreateContainerRequest.volumes)
+    pub volumes: ::std::vec::Vec<VolumeMount>,
     // special fields
     // @@protoc_insertion_point(special_field:cloudhv.agent.CreateContainerRequest.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -57,7 +59,7 @@ impl CreateContainerRequest {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(6);
+        let mut fields = ::std::vec::Vec::with_capacity(7);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "container_id",
@@ -88,6 +90,11 @@ impl CreateContainerRequest {
             "terminal",
             |m: &CreateContainerRequest| { &m.terminal },
             |m: &mut CreateContainerRequest| { &mut m.terminal },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_vec_simpler_accessor::<_, _>(
+            "volumes",
+            |m: &CreateContainerRequest| { &m.volumes },
+            |m: &mut CreateContainerRequest| { &mut m.volumes },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<CreateContainerRequest>(
             "CreateContainerRequest",
@@ -125,6 +132,9 @@ impl ::protobuf::Message for CreateContainerRequest {
                 48 => {
                     self.terminal = is.read_bool()?;
                 },
+                58 => {
+                    self.volumes.push(is.read_message()?);
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -155,6 +165,10 @@ impl ::protobuf::Message for CreateContainerRequest {
         if self.terminal != false {
             my_size += 1 + 1;
         }
+        for value in &self.volumes {
+            let len = value.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+        };
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -179,6 +193,9 @@ impl ::protobuf::Message for CreateContainerRequest {
         if self.terminal != false {
             os.write_bool(6, self.terminal)?;
         }
+        for v in &self.volumes {
+            ::protobuf::rt::write_message_field_with_cached_size(7, v, os)?;
+        };
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -202,6 +219,7 @@ impl ::protobuf::Message for CreateContainerRequest {
         self.stdout.clear();
         self.stderr.clear();
         self.terminal = false;
+        self.volumes.clear();
         self.special_fields.clear();
     }
 
@@ -213,6 +231,7 @@ impl ::protobuf::Message for CreateContainerRequest {
             stdout: ::std::string::String::new(),
             stderr: ::std::string::String::new(),
             terminal: false,
+            volumes: ::std::vec::Vec::new(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -233,6 +252,182 @@ impl ::std::fmt::Display for CreateContainerRequest {
 }
 
 impl ::protobuf::reflect::ProtobufValue for CreateContainerRequest {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+// @@protoc_insertion_point(message:cloudhv.agent.VolumeMount)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct VolumeMount {
+    // message fields
+    // @@protoc_insertion_point(field:cloudhv.agent.VolumeMount.destination)
+    pub destination: ::std::string::String,
+    // @@protoc_insertion_point(field:cloudhv.agent.VolumeMount.source)
+    pub source: ::std::string::String,
+    // @@protoc_insertion_point(field:cloudhv.agent.VolumeMount.options)
+    pub options: ::std::vec::Vec<::std::string::String>,
+    // @@protoc_insertion_point(field:cloudhv.agent.VolumeMount.readonly)
+    pub readonly: bool,
+    // special fields
+    // @@protoc_insertion_point(special_field:cloudhv.agent.VolumeMount.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a VolumeMount {
+    fn default() -> &'a VolumeMount {
+        <VolumeMount as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl VolumeMount {
+    pub fn new() -> VolumeMount {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(4);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "destination",
+            |m: &VolumeMount| { &m.destination },
+            |m: &mut VolumeMount| { &mut m.destination },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "source",
+            |m: &VolumeMount| { &m.source },
+            |m: &mut VolumeMount| { &mut m.source },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_vec_simpler_accessor::<_, _>(
+            "options",
+            |m: &VolumeMount| { &m.options },
+            |m: &mut VolumeMount| { &mut m.options },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "readonly",
+            |m: &VolumeMount| { &m.readonly },
+            |m: &mut VolumeMount| { &mut m.readonly },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<VolumeMount>(
+            "VolumeMount",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for VolumeMount {
+    const NAME: &'static str = "VolumeMount";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                10 => {
+                    self.destination = is.read_string()?;
+                },
+                18 => {
+                    self.source = is.read_string()?;
+                },
+                26 => {
+                    self.options.push(is.read_string()?);
+                },
+                32 => {
+                    self.readonly = is.read_bool()?;
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if !self.destination.is_empty() {
+            my_size += ::protobuf::rt::string_size(1, &self.destination);
+        }
+        if !self.source.is_empty() {
+            my_size += ::protobuf::rt::string_size(2, &self.source);
+        }
+        for value in &self.options {
+            my_size += ::protobuf::rt::string_size(3, &value);
+        };
+        if self.readonly != false {
+            my_size += 1 + 1;
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if !self.destination.is_empty() {
+            os.write_string(1, &self.destination)?;
+        }
+        if !self.source.is_empty() {
+            os.write_string(2, &self.source)?;
+        }
+        for v in &self.options {
+            os.write_string(3, &v)?;
+        };
+        if self.readonly != false {
+            os.write_bool(4, self.readonly)?;
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> VolumeMount {
+        VolumeMount::new()
+    }
+
+    fn clear(&mut self) {
+        self.destination.clear();
+        self.source.clear();
+        self.options.clear();
+        self.readonly = false;
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static VolumeMount {
+        static instance: VolumeMount = VolumeMount {
+            destination: ::std::string::String::new(),
+            source: ::std::string::String::new(),
+            options: ::std::vec::Vec::new(),
+            readonly: false,
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for VolumeMount {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("VolumeMount").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for VolumeMount {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for VolumeMount {
     type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
 }
 
@@ -2709,63 +2904,67 @@ impl ContainerState {
 }
 
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\x0bagent.proto\x12\rcloudhv.agent\"\xbe\x01\n\x16CreateContainerReque\
+    \n\x0bagent.proto\x12\rcloudhv.agent\"\xf4\x01\n\x16CreateContainerReque\
     st\x12!\n\x0ccontainer_id\x18\x01\x20\x01(\tR\x0bcontainerId\x12\x1f\n\
     \x0bbundle_path\x18\x02\x20\x01(\tR\nbundlePath\x12\x14\n\x05stdin\x18\
     \x03\x20\x01(\tR\x05stdin\x12\x16\n\x06stdout\x18\x04\x20\x01(\tR\x06std\
     out\x12\x16\n\x06stderr\x18\x05\x20\x01(\tR\x06stderr\x12\x1a\n\x08termi\
-    nal\x18\x06\x20\x01(\x08R\x08terminal\"+\n\x17CreateContainerResponse\
-    \x12\x10\n\x03pid\x18\x01\x20\x01(\rR\x03pid\":\n\x15StartContainerReque\
-    st\x12!\n\x0ccontainer_id\x18\x01\x20\x01(\tR\x0bcontainerId\"*\n\x16Sta\
-    rtContainerResponse\x12\x10\n\x03pid\x18\x01\x20\x01(\rR\x03pid\"c\n\x14\
-    KillContainerRequest\x12!\n\x0ccontainer_id\x18\x01\x20\x01(\tR\x0bconta\
-    inerId\x12\x16\n\x06signal\x18\x02\x20\x01(\rR\x06signal\x12\x10\n\x03al\
-    l\x18\x03\x20\x01(\x08R\x03all\"\x17\n\x15KillContainerResponse\";\n\x16\
-    DeleteContainerRequest\x12!\n\x0ccontainer_id\x18\x01\x20\x01(\tR\x0bcon\
-    tainerId\"L\n\x17DeleteContainerResponse\x12\x1f\n\x0bexit_status\x18\
-    \x01\x20\x01(\rR\nexitStatus\x12\x10\n\x03pid\x18\x02\x20\x01(\rR\x03pid\
-    \"9\n\x14WaitContainerRequest\x12!\n\x0ccontainer_id\x18\x01\x20\x01(\tR\
-    \x0bcontainerId\"U\n\x15WaitContainerResponse\x12\x1f\n\x0bexit_status\
-    \x18\x01\x20\x01(\rR\nexitStatus\x12\x1b\n\texited_at\x18\x02\x20\x01(\t\
-    R\x08exitedAt\"\xcf\x01\n\x12ExecProcessRequest\x12!\n\x0ccontainer_id\
-    \x18\x01\x20\x01(\tR\x0bcontainerId\x12\x17\n\x07exec_id\x18\x02\x20\x01\
-    (\tR\x06execId\x12\x1b\n\tspec_json\x18\x03\x20\x01(\tR\x08specJson\x12\
-    \x14\n\x05stdin\x18\x04\x20\x01(\tR\x05stdin\x12\x16\n\x06stdout\x18\x05\
-    \x20\x01(\tR\x06stdout\x12\x16\n\x06stderr\x18\x06\x20\x01(\tR\x06stderr\
-    \x12\x1a\n\x08terminal\x18\x07\x20\x01(\x08R\x08terminal\"'\n\x13ExecPro\
-    cessResponse\x12\x10\n\x03pid\x18\x01\x20\x01(\rR\x03pid\":\n\x15StateCo\
-    ntainerRequest\x12!\n\x0ccontainer_id\x18\x01\x20\x01(\tR\x0bcontainerId\
-    \"\xc2\x01\n\x16StateContainerResponse\x12!\n\x0ccontainer_id\x18\x01\
-    \x20\x01(\tR\x0bcontainerId\x12\x10\n\x03pid\x18\x02\x20\x01(\rR\x03pid\
-    \x125\n\x06status\x18\x03\x20\x01(\x0e2\x1d.cloudhv.agent.ContainerState\
-    R\x06status\x12\x1f\n\x0bexit_status\x18\x04\x20\x01(\rR\nexitStatus\x12\
-    \x1b\n\texited_at\x18\x05\x20\x01(\tR\x08exitedAt\"\x0e\n\x0cCheckReques\
-    t\"?\n\rCheckResponse\x12\x14\n\x05ready\x18\x01\x20\x01(\x08R\x05ready\
-    \x12\x18\n\x07version\x18\x02\x20\x01(\tR\x07version\"\x13\n\x11GetMemIn\
-    foRequest\"\x82\x02\n\x12GetMemInfoResponse\x12\x20\n\x0cmem_total_kb\
-    \x18\x01\x20\x01(\x04R\nmemTotalKb\x12\x1e\n\x0bmem_free_kb\x18\x02\x20\
-    \x01(\x04R\tmemFreeKb\x12(\n\x10mem_available_kb\x18\x03\x20\x01(\x04R\
-    \x0ememAvailableKb\x12\x1d\n\nbuffers_kb\x18\x04\x20\x01(\x04R\tbuffersK\
-    b\x12\x1b\n\tcached_kb\x18\x05\x20\x01(\x04R\x08cachedKb\x12\"\n\rswap_t\
-    otal_kb\x18\x06\x20\x01(\x04R\x0bswapTotalKb\x12\x20\n\x0cswap_free_kb\
-    \x18\x07\x20\x01(\x04R\nswapFreeKb*P\n\x0eContainerState\x12\x0b\n\x07UN\
-    KNOWN\x10\0\x12\x0b\n\x07CREATED\x10\x01\x12\x0b\n\x07RUNNING\x10\x02\
-    \x12\x0b\n\x07STOPPED\x10\x03\x12\n\n\x06PAUSED\x10\x042\xf1\x05\n\x0cAg\
-    entService\x12`\n\x0fCreateContainer\x12%.cloudhv.agent.CreateContainerR\
-    equest\x1a&.cloudhv.agent.CreateContainerResponse\x12]\n\x0eStartContain\
-    er\x12$.cloudhv.agent.StartContainerRequest\x1a%.cloudhv.agent.StartCont\
-    ainerResponse\x12Z\n\rKillContainer\x12#.cloudhv.agent.KillContainerRequ\
-    est\x1a$.cloudhv.agent.KillContainerResponse\x12`\n\x0fDeleteContainer\
-    \x12%.cloudhv.agent.DeleteContainerRequest\x1a&.cloudhv.agent.DeleteCont\
-    ainerResponse\x12Z\n\rWaitContainer\x12#.cloudhv.agent.WaitContainerRequ\
-    est\x1a$.cloudhv.agent.WaitContainerResponse\x12T\n\x0bExecProcess\x12!.\
-    cloudhv.agent.ExecProcessRequest\x1a\".cloudhv.agent.ExecProcessResponse\
-    \x12]\n\x0eStateContainer\x12$.cloudhv.agent.StateContainerRequest\x1a%.\
-    cloudhv.agent.StateContainerResponse\x12Q\n\nGetMemInfo\x12\x20.cloudhv.\
-    agent.GetMemInfoRequest\x1a!.cloudhv.agent.GetMemInfoResponse2S\n\rHealt\
-    hService\x12B\n\x05Check\x12\x1b.cloudhv.agent.CheckRequest\x1a\x1c.clou\
-    dhv.agent.CheckResponseB6Z4github.com/devigned/containerd-cloudhyperviso\
-    r/protob\x06proto3\
+    nal\x18\x06\x20\x01(\x08R\x08terminal\x124\n\x07volumes\x18\x07\x20\x03(\
+    \x0b2\x1a.cloudhv.agent.VolumeMountR\x07volumes\"}\n\x0bVolumeMount\x12\
+    \x20\n\x0bdestination\x18\x01\x20\x01(\tR\x0bdestination\x12\x16\n\x06so\
+    urce\x18\x02\x20\x01(\tR\x06source\x12\x18\n\x07options\x18\x03\x20\x03(\
+    \tR\x07options\x12\x1a\n\x08readonly\x18\x04\x20\x01(\x08R\x08readonly\"\
+    +\n\x17CreateContainerResponse\x12\x10\n\x03pid\x18\x01\x20\x01(\rR\x03p\
+    id\":\n\x15StartContainerRequest\x12!\n\x0ccontainer_id\x18\x01\x20\x01(\
+    \tR\x0bcontainerId\"*\n\x16StartContainerResponse\x12\x10\n\x03pid\x18\
+    \x01\x20\x01(\rR\x03pid\"c\n\x14KillContainerRequest\x12!\n\x0ccontainer\
+    _id\x18\x01\x20\x01(\tR\x0bcontainerId\x12\x16\n\x06signal\x18\x02\x20\
+    \x01(\rR\x06signal\x12\x10\n\x03all\x18\x03\x20\x01(\x08R\x03all\"\x17\n\
+    \x15KillContainerResponse\";\n\x16DeleteContainerRequest\x12!\n\x0cconta\
+    iner_id\x18\x01\x20\x01(\tR\x0bcontainerId\"L\n\x17DeleteContainerRespon\
+    se\x12\x1f\n\x0bexit_status\x18\x01\x20\x01(\rR\nexitStatus\x12\x10\n\
+    \x03pid\x18\x02\x20\x01(\rR\x03pid\"9\n\x14WaitContainerRequest\x12!\n\
+    \x0ccontainer_id\x18\x01\x20\x01(\tR\x0bcontainerId\"U\n\x15WaitContaine\
+    rResponse\x12\x1f\n\x0bexit_status\x18\x01\x20\x01(\rR\nexitStatus\x12\
+    \x1b\n\texited_at\x18\x02\x20\x01(\tR\x08exitedAt\"\xcf\x01\n\x12ExecPro\
+    cessRequest\x12!\n\x0ccontainer_id\x18\x01\x20\x01(\tR\x0bcontainerId\
+    \x12\x17\n\x07exec_id\x18\x02\x20\x01(\tR\x06execId\x12\x1b\n\tspec_json\
+    \x18\x03\x20\x01(\tR\x08specJson\x12\x14\n\x05stdin\x18\x04\x20\x01(\tR\
+    \x05stdin\x12\x16\n\x06stdout\x18\x05\x20\x01(\tR\x06stdout\x12\x16\n\
+    \x06stderr\x18\x06\x20\x01(\tR\x06stderr\x12\x1a\n\x08terminal\x18\x07\
+    \x20\x01(\x08R\x08terminal\"'\n\x13ExecProcessResponse\x12\x10\n\x03pid\
+    \x18\x01\x20\x01(\rR\x03pid\":\n\x15StateContainerRequest\x12!\n\x0ccont\
+    ainer_id\x18\x01\x20\x01(\tR\x0bcontainerId\"\xc2\x01\n\x16StateContaine\
+    rResponse\x12!\n\x0ccontainer_id\x18\x01\x20\x01(\tR\x0bcontainerId\x12\
+    \x10\n\x03pid\x18\x02\x20\x01(\rR\x03pid\x125\n\x06status\x18\x03\x20\
+    \x01(\x0e2\x1d.cloudhv.agent.ContainerStateR\x06status\x12\x1f\n\x0bexit\
+    _status\x18\x04\x20\x01(\rR\nexitStatus\x12\x1b\n\texited_at\x18\x05\x20\
+    \x01(\tR\x08exitedAt\"\x0e\n\x0cCheckRequest\"?\n\rCheckResponse\x12\x14\
+    \n\x05ready\x18\x01\x20\x01(\x08R\x05ready\x12\x18\n\x07version\x18\x02\
+    \x20\x01(\tR\x07version\"\x13\n\x11GetMemInfoRequest\"\x82\x02\n\x12GetM\
+    emInfoResponse\x12\x20\n\x0cmem_total_kb\x18\x01\x20\x01(\x04R\nmemTotal\
+    Kb\x12\x1e\n\x0bmem_free_kb\x18\x02\x20\x01(\x04R\tmemFreeKb\x12(\n\x10m\
+    em_available_kb\x18\x03\x20\x01(\x04R\x0ememAvailableKb\x12\x1d\n\nbuffe\
+    rs_kb\x18\x04\x20\x01(\x04R\tbuffersKb\x12\x1b\n\tcached_kb\x18\x05\x20\
+    \x01(\x04R\x08cachedKb\x12\"\n\rswap_total_kb\x18\x06\x20\x01(\x04R\x0bs\
+    wapTotalKb\x12\x20\n\x0cswap_free_kb\x18\x07\x20\x01(\x04R\nswapFreeKb*P\
+    \n\x0eContainerState\x12\x0b\n\x07UNKNOWN\x10\0\x12\x0b\n\x07CREATED\x10\
+    \x01\x12\x0b\n\x07RUNNING\x10\x02\x12\x0b\n\x07STOPPED\x10\x03\x12\n\n\
+    \x06PAUSED\x10\x042\xf1\x05\n\x0cAgentService\x12`\n\x0fCreateContainer\
+    \x12%.cloudhv.agent.CreateContainerRequest\x1a&.cloudhv.agent.CreateCont\
+    ainerResponse\x12]\n\x0eStartContainer\x12$.cloudhv.agent.StartContainer\
+    Request\x1a%.cloudhv.agent.StartContainerResponse\x12Z\n\rKillContainer\
+    \x12#.cloudhv.agent.KillContainerRequest\x1a$.cloudhv.agent.KillContaine\
+    rResponse\x12`\n\x0fDeleteContainer\x12%.cloudhv.agent.DeleteContainerRe\
+    quest\x1a&.cloudhv.agent.DeleteContainerResponse\x12Z\n\rWaitContainer\
+    \x12#.cloudhv.agent.WaitContainerRequest\x1a$.cloudhv.agent.WaitContaine\
+    rResponse\x12T\n\x0bExecProcess\x12!.cloudhv.agent.ExecProcessRequest\
+    \x1a\".cloudhv.agent.ExecProcessResponse\x12]\n\x0eStateContainer\x12$.c\
+    loudhv.agent.StateContainerRequest\x1a%.cloudhv.agent.StateContainerResp\
+    onse\x12Q\n\nGetMemInfo\x12\x20.cloudhv.agent.GetMemInfoRequest\x1a!.clo\
+    udhv.agent.GetMemInfoResponse2S\n\rHealthService\x12B\n\x05Check\x12\x1b\
+    .cloudhv.agent.CheckRequest\x1a\x1c.cloudhv.agent.CheckResponseB6Z4githu\
+    b.com/devigned/containerd-cloudhypervisor/protob\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file
@@ -2783,8 +2982,9 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
     file_descriptor.get(|| {
         let generated_file_descriptor = generated_file_descriptor_lazy.get(|| {
             let mut deps = ::std::vec::Vec::with_capacity(0);
-            let mut messages = ::std::vec::Vec::with_capacity(18);
+            let mut messages = ::std::vec::Vec::with_capacity(19);
             messages.push(CreateContainerRequest::generated_message_descriptor_data());
+            messages.push(VolumeMount::generated_message_descriptor_data());
             messages.push(CreateContainerResponse::generated_message_descriptor_data());
             messages.push(StartContainerRequest::generated_message_descriptor_data());
             messages.push(StartContainerResponse::generated_message_descriptor_data());
