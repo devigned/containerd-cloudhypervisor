@@ -659,13 +659,20 @@ impl Task for CloudHvShim {
         // is the only way to unblock wait() since Notify is in-process.
         self.exit.signal();
 
+        // Best-effort agent RPC — fire and forget since exit_code is
+        // already set and wait() already unblocked.
         if let Ok(agent) = self.get_agent_for_container(container_id) {
-            let mut kreq = cloudhv_proto::KillContainerRequest::new();
-            kreq.container_id = container_id.to_string();
-            kreq.signal = req.signal;
-            kreq.all = req.all;
-            let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(5));
-            let _ = agent.kill_container(ctx, &kreq).await;
+            let cid = container_id.to_string();
+            let signal = req.signal;
+            let all = req.all;
+            tokio::spawn(async move {
+                let mut kreq = cloudhv_proto::KillContainerRequest::new();
+                kreq.container_id = cid;
+                kreq.signal = signal;
+                kreq.all = all;
+                let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(5));
+                let _ = agent.kill_container(ctx, &kreq).await;
+            });
         }
 
         Ok(api::Empty::new())
