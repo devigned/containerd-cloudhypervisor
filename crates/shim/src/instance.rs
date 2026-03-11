@@ -46,6 +46,10 @@ struct ContainerState {
     /// Containerd's FIFO paths (shim must write container output here)
     stdout_fifo: Option<String>,
     stderr_fifo: Option<String>,
+    /// Bind-mounted volume paths in the shared dir (need unmount on delete)
+    volume_mounts: Vec<std::path::PathBuf>,
+    /// Hot-plugged block volume disk IDs (need vm.remove-device on delete)
+    block_volume_ids: Vec<String>,
 }
 
 /// The Cloud Hypervisor containerd shim implementation.
@@ -335,6 +339,8 @@ impl CloudHvShim {
                 stderr_shared_path: None,
                 stdout_fifo: None,
                 stderr_fifo: None,
+                volume_mounts: vec![],
+                block_volume_ids: vec![],
             },
         );
 
@@ -518,7 +524,10 @@ impl CloudHvShim {
             extract_and_stage_volumes(&spec_path, container_id, &shared_dir)
         };
 
-        // Hot-plug block volumes into the VM
+        // Hot-plug block volumes into the VM and collect cleanup info
+        let mut volume_mount_paths: Vec<std::path::PathBuf> = Vec::new();
+        let mut block_volume_disk_ids: Vec<String> = Vec::new();
+
         for vol in &mut volumes {
             if vol.volume_type == cloudhv_proto::VolumeType::BLOCK.into() {
                 let vol_disk_id = format!(
@@ -550,8 +559,17 @@ impl CloudHvShim {
                         vol.destination
                     ))
                 })?;
-                // Rewrite source to disk ID so the agent can discover it
+                block_volume_disk_ids.push(vol_disk_id.clone());
                 vol.source = vol_disk_id;
+            } else {
+                // Track filesystem volume bind mount paths for cleanup
+                let safe_dest = vol.destination.trim_start_matches('/').replace('/', "_");
+                volume_mount_paths.push(
+                    shared_dir
+                        .join("volumes")
+                        .join(container_id)
+                        .join(&safe_dest),
+                );
             }
         }
 
@@ -607,6 +625,8 @@ impl CloudHvShim {
                 } else {
                     Some(req.stderr.clone())
                 },
+                volume_mounts: volume_mount_paths,
+                block_volume_ids: block_volume_disk_ids,
             },
         );
 
@@ -788,11 +808,57 @@ impl Task for CloudHvShim {
             (0, 0)
         };
 
-        // Remove container and clean up its VM if no other containers use it
-        let vm_id = {
+        // Remove container and clean up its resources
+        let removed_state = {
             let mut containers = self.containers.lock().unwrap();
-            containers.remove(container_id).map(|s| s.vm_id)
+            containers.remove(container_id)
         };
+        let vm_id = removed_state.as_ref().map(|s| s.vm_id.clone());
+
+        if let (Some(state), Some(ref vm_id)) = (&removed_state, &vm_id) {
+            // Unmount bind-mounted filesystem volumes
+            for mount_path in &state.volume_mounts {
+                let _ = std::process::Command::new("umount")
+                    .arg(mount_path.to_string_lossy().to_string())
+                    .status();
+                let _ = std::fs::remove_dir_all(mount_path);
+            }
+
+            // Remove hot-plugged block volumes
+            let api_socket = {
+                let vms = self.vms.lock().unwrap();
+                vms.get(vm_id).map(|s| {
+                    s.shared_dir
+                        .parent()
+                        .unwrap_or(&s.shared_dir)
+                        .join("api.sock")
+                })
+            };
+            if let Some(api_socket) = api_socket {
+                for disk_id in &state.block_volume_ids {
+                    let body = format!(r#"{{"id":"{disk_id}"}}"#);
+                    let _ = crate::vm::VmManager::api_request_to_socket(
+                        &api_socket,
+                        "PUT",
+                        "/api/v1/vm.remove-device",
+                        Some(&body),
+                    )
+                    .await;
+                    info!("removed block volume: {}", disk_id);
+                }
+            }
+
+            // Clean up the container's volume directory
+            let shared_dir = {
+                let vms = self.vms.lock().unwrap();
+                vms.get(vm_id).map(|s| s.shared_dir.clone())
+            };
+            if let Some(shared_dir) = shared_dir {
+                let vol_dir = shared_dir.join("volumes").join(container_id);
+                let _ = std::fs::remove_dir_all(&vol_dir);
+            }
+        }
+
         if let Some(vm_id) = vm_id {
             // Clean up the disk image for this container
             let state_dir = {
@@ -1339,6 +1405,7 @@ fn extract_and_stage_volumes(
         "/etc/hostname",
         "/etc/hosts",
         "/etc/resolv.conf",
+        "/dev/termination-log",
     ];
 
     let mut volumes = Vec::new();
@@ -1353,7 +1420,7 @@ fn extract_and_stage_volumes(
             None => continue,
         };
 
-        if skip_destinations.contains(&dest) {
+        if skip_destinations.contains(&dest) || dest.starts_with("/var/run/secrets") {
             continue;
         }
 

@@ -5,7 +5,7 @@ use std::process::Stdio;
 use anyhow::{Context, Result};
 #[cfg(target_os = "linux")]
 use log::debug;
-use log::{error, info};
+use log::{error, info, warn};
 use tokio::process::Command;
 
 /// Volume information passed from the shim to the agent.
@@ -126,6 +126,21 @@ impl ContainerManager {
         anyhow::bail!("failed to mount disk after retries")
     }
 
+    /// Discover a newly hot-plugged block device by scanning /sys/block.
+    /// Returns the device path (e.g., "/dev/vdc") if a new device is found.
+    fn discover_block_device(&mut self, _disk_id: &str) -> Option<String> {
+        let current = Self::scan_block_devices();
+        let new_devices: Vec<_> = current.difference(&self.known_disks).cloned().collect();
+        if let Some(dev) = new_devices.first() {
+            self.known_disks.insert(dev.clone());
+            let path = format!("/dev/{dev}");
+            info!("discovered block volume device: {}", path);
+            Some(path)
+        } else {
+            None
+        }
+    }
+
     /// Adapt the OCI spec for the VM environment.
     ///
     /// The host-generated config.json contains references to host-side
@@ -133,7 +148,7 @@ impl ContainerManager {
     /// exist inside the VM. We strip or modify these so crun can create
     /// the container using the VM's own namespaces.
     fn adapt_oci_spec_for_vm(
-        &self,
+        &mut self,
         bundle: &std::path::Path,
         volumes: &[VolumeInfo],
     ) -> Result<()> {
@@ -178,11 +193,18 @@ impl ContainerManager {
         // Add volume mounts from the shim (CSI, ConfigMap, Secret, emptyDir)
         for vol in volumes {
             if vol.is_block {
-                // Block volumes: the shim hot-plugged the device. The agent
-                // discovers it as a new /dev/vdX. We mount it at the
-                // destination with the detected filesystem type.
-                // For now, add as a mount — the device will be discovered
-                // by scanning /sys/block for the new device.
+                // Block volumes: discover the hot-plugged device by scanning
+                // /sys/block for new vdX devices not already known.
+                let dev_path = match self.discover_block_device(&vol.source) {
+                    Some(p) => p,
+                    None => {
+                        warn!(
+                            "block volume {} not found, skipping mount to {}",
+                            vol.source, vol.destination
+                        );
+                        continue;
+                    }
+                };
                 let mut opts = Vec::new();
                 if vol.readonly {
                     opts.push("ro".to_string());
@@ -190,12 +212,12 @@ impl ContainerManager {
                 mounts.push(serde_json::json!({
                     "destination": vol.destination,
                     "type": vol.fs_type,
-                    "source": "block-volume", // placeholder — resolved at mount time
+                    "source": dev_path,
                     "options": opts,
                 }));
                 info!(
-                    "block volume mount: {} (fs={}, ro={})",
-                    vol.destination, vol.fs_type, vol.readonly
+                    "block volume mount: {} -> {} (dev={}, fs={})",
+                    vol.source, vol.destination, dev_path, vol.fs_type
                 );
             } else {
                 // Filesystem volumes: bind-mount from the virtio-fs shared dir
