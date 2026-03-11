@@ -107,6 +107,7 @@ fn bench_vm_config_serialization(c: &mut Criterion) {
         }),
         serial: Some(VmConsoleConfig::off()),
         console: Some(VmConsoleConfig::off()),
+        balloon: None,
         tpm: None,
     };
 

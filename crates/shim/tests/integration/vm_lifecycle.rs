@@ -185,6 +185,7 @@ fn test_vm_config_json_generation() {
         }),
         serial: Some(VmConsoleConfig::off()),
         console: Some(VmConsoleConfig::off()),
+        balloon: None,
         tpm: None,
     };
 
@@ -355,6 +356,7 @@ fn test_vm_config_with_hotplug() {
         vsock: None,
         serial: None,
         console: None,
+        balloon: None,
         tpm: None,
     };
 
@@ -2383,6 +2385,189 @@ fn test_two_containers_in_one_vm() {
         let _ = std::fs::remove_file(&disk_a);
         let _ = std::fs::remove_file(&disk_b);
 
+        eprintln!("╚══════════════════════════════════════════════════════════╝\n");
+    });
+}
+
+/// Test that a VM can be resized to grow memory when hotplug is configured.
+///
+/// This verifies the memory growth path:
+///   1. Boot VM with 128MB + 256MB hotplug headroom (virtio-mem)
+///   2. Query initial memory via agent GetMemInfo
+///   3. Resize VM to 256MB via vm.resize
+///   4. Query memory again and verify it increased
+#[test]
+fn test_vm_memory_growth() {
+    let fixtures = TestFixtures::resolve().expect("failed to resolve test fixtures");
+    skip_if_missing!(fixtures);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let mut config = fixtures.runtime_config();
+        config.default_memory_mb = 128;
+        config.hotplug_memory_mb = 256;
+        config.hotplug_method = "virtio-mem".to_string();
+        let vm_id = format!("mem-grow-{}", std::process::id());
+
+        eprintln!("\n╔══════════════════════════════════════════════════════════╗");
+        eprintln!("║  VM Memory Growth — Integration Test                    ║");
+        eprintln!("╠══════════════════════════════════════════════════════════╣");
+
+        let mut vm = containerd_shim_cloudhv::vm::VmManager::new(vm_id, config).expect("VmManager");
+        vm.prepare().await.expect("prepare");
+        vm.start_virtiofsd().await.expect("virtiofsd");
+        vm.start_vmm().await.expect("vmm");
+        vm.create_and_boot_vm(None, None).await.expect("boot");
+        tokio::time::timeout(Duration::from_secs(30), vm.wait_for_agent())
+            .await
+            .expect("agent timeout")
+            .expect("agent");
+
+        // Query initial memory
+        let vsock = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
+        let (agent, _health) = vsock.connect_ttrpc().await.expect("ttrpc");
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(5));
+        let initial = agent
+            .get_mem_info(ctx, &cloudhv_proto::GetMemInfoRequest::new())
+            .await
+            .expect("initial meminfo");
+        let initial_total_mb = initial.mem_total_kb / 1024;
+        eprintln!("  Initial │ MemTotal: {}MiB", initial_total_mb);
+        assert!(
+            (100..=160).contains(&initial_total_mb),
+            "expected ~128MiB, got {}MiB",
+            initial_total_mb
+        );
+
+        // Resize to 256MB
+        eprintln!("  Resize  │ 128MiB -> 256MiB");
+        vm.resize(None, Some(256 * 1024 * 1024))
+            .await
+            .expect("resize to 256MiB must succeed");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Query again
+        let vsock2 = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
+        let (agent2, _h2) = vsock2.connect_ttrpc().await.expect("ttrpc2");
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(5));
+        let grown = agent2
+            .get_mem_info(ctx, &cloudhv_proto::GetMemInfoRequest::new())
+            .await
+            .expect("grown meminfo");
+        let grown_total_mb = grown.mem_total_kb / 1024;
+        eprintln!("  After   │ MemTotal: {}MiB", grown_total_mb);
+        assert!(
+            grown_total_mb > initial_total_mb,
+            "VM memory did not grow after resize: got {}MiB (was {}MiB). \
+             Kernel may lack CONFIG_VIRTIO_MEM or CONFIG_MEMORY_HOTPLUG.",
+            grown_total_mb,
+            initial_total_mb
+        );
+        eprintln!("           │ ✅ Memory grew successfully");
+
+        drop(agent);
+        drop(_health);
+        drop(agent2);
+        drop(_h2);
+        vm.cleanup().await.expect("cleanup");
+        eprintln!("╚══════════════════════════════════════════════════════════╝\n");
+    });
+}
+
+/// Test that a VM's memory can be shrunk back after growth (virtio-mem).
+///
+/// This verifies the reclaim path:
+///   1. Boot VM with 128MB + 256MB hotplug (virtio-mem)
+///   2. Grow to 256MB
+///   3. Shrink back to 128MB
+///   4. Verify MemTotal decreased
+#[test]
+fn test_vm_memory_reclaim() {
+    let fixtures = TestFixtures::resolve().expect("failed to resolve test fixtures");
+    skip_if_missing!(fixtures);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let mut config = fixtures.runtime_config();
+        config.default_memory_mb = 128;
+        config.hotplug_memory_mb = 256;
+        config.hotplug_method = "virtio-mem".to_string();
+        let vm_id = format!("mem-reclaim-{}", std::process::id());
+
+        eprintln!("\n╔══════════════════════════════════════════════════════════╗");
+        eprintln!("║  VM Memory Reclaim — Integration Test                   ║");
+        eprintln!("╠══════════════════════════════════════════════════════════╣");
+
+        let mut vm = containerd_shim_cloudhv::vm::VmManager::new(vm_id, config).expect("VmManager");
+        vm.prepare().await.expect("prepare");
+        vm.start_virtiofsd().await.expect("virtiofsd");
+        vm.start_vmm().await.expect("vmm");
+        vm.create_and_boot_vm(None, None).await.expect("boot");
+        tokio::time::timeout(Duration::from_secs(30), vm.wait_for_agent())
+            .await
+            .expect("agent timeout")
+            .expect("agent");
+
+        // Grow to 256MB
+        eprintln!("  Phase 1 │ Growing 128MiB -> 256MiB");
+        vm.resize(None, Some(256 * 1024 * 1024))
+            .await
+            .expect("resize to 256MiB must succeed");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let vsock = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
+        let (agent, _h) = vsock.connect_ttrpc().await.expect("ttrpc");
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(5));
+        let grown = agent
+            .get_mem_info(ctx, &cloudhv_proto::GetMemInfoRequest::new())
+            .await
+            .expect("grown meminfo");
+        let grown_mb = grown.mem_total_kb / 1024;
+        eprintln!("           │ MemTotal: {}MiB", grown_mb);
+        assert!(
+            grown_mb > 120,
+            "growth didn't take effect: {}MiB. Kernel needs CONFIG_VIRTIO_MEM.",
+            grown_mb
+        );
+        drop(agent);
+        drop(_h);
+
+        // Shrink back to 128MB
+        eprintln!("  Phase 2 │ Shrinking 256MiB -> 128MiB");
+        vm.resize(None, Some(128 * 1024 * 1024))
+            .await
+            .expect("resize to 128MiB must succeed");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let vsock2 = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
+        let (agent2, _h2) = vsock2.connect_ttrpc().await.expect("ttrpc2");
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(5));
+        let shrunk = agent2
+            .get_mem_info(ctx, &cloudhv_proto::GetMemInfoRequest::new())
+            .await
+            .expect("shrunk meminfo");
+        let shrunk_mb = shrunk.mem_total_kb / 1024;
+        eprintln!("           │ MemTotal: {}MiB", shrunk_mb);
+        assert!(
+            shrunk_mb < grown_mb,
+            "VM memory did not shrink after resize: got {}MiB (was {}MiB). \
+             Kernel needs CONFIG_MEMORY_HOTREMOVE + CONFIG_VIRTIO_MEM.",
+            shrunk_mb,
+            grown_mb
+        );
+        eprintln!("           │ ✅ Memory successfully reclaimed");
+
+        drop(agent2);
+        drop(_h2);
+        vm.cleanup().await.expect("cleanup");
         eprintln!("╚══════════════════════════════════════════════════════════╝\n");
     });
 }

@@ -58,7 +58,7 @@ jobs:
         run: cargo bench -p containerd-shim-cloudhv --bench vm_overhead --no-run
 
   build:
-    name: Build (${{ matrix.target }})
+    name: Build ${{ matrix.artifact }}
     runs-on: ubuntu-latest
     strategy:
       matrix:

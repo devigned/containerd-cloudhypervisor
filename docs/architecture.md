@@ -122,3 +122,54 @@ cargo build --release -p containerd-shim-cloudhv --features embedded-virtiofsd
 ```
 
 Requires `libseccomp-dev` and `libcap-ng-dev` on Linux.
+
+## Dynamic Memory Management
+
+VMs can grow and shrink memory on demand using virtio-mem hotplug, bridging the
+gap between Kubernetes resource requests (boot memory) and limits (max memory).
+
+### Configuration
+
+Memory growth activates automatically when a pod's resource limit exceeds its request:
+
+```yaml
+resources:
+  requests:
+    memory: "128Mi"   # → VM boot memory
+  limits:
+    memory: "1Gi"     # → max memory (hotplug ceiling)
+```
+
+Or via annotation:
+
+```yaml
+annotations:
+  io.cloudhv.config.hypervisor.default_memory: "128"
+  io.cloudhv.config.hypervisor.memory_limit: "1024"
+```
+
+When limit > request, the shim automatically:
+- Sets `hotplug_memory_mb = limit - request` (896 MiB headroom)
+- Selects virtio-mem for bidirectional resize
+- Adds a balloon device with free page reporting
+
+### Growth
+
+Two mechanisms trigger memory growth, from fastest to slowest:
+
+1. **PSI pressure watcher** (< 1s response): the agent monitors
+   `/proc/pressure/memory` using a kernel PSI trigger. When 100ms of memory
+   stall accumulates in any 1s window, the agent writes a signal file to the
+   shared directory. The shim detects it and calls `vm.resize(+128MiB)` immediately.
+
+2. **Periodic polling** (5s cycle): the shim polls the agent's `GetMemInfo` RPC.
+   When `MemAvailable` drops below 20% of `MemTotal`, it grows memory in 128 MiB steps.
+
+### Reclaim
+
+When `MemAvailable` exceeds 50% of `MemTotal` for 60 consecutive seconds, the shim
+calls `vm.resize(-128MiB)` to return memory to the host. The floor is the original
+request — memory never shrinks below boot size.
+
+The balloon device with `free_page_reporting=on` lets the guest proactively report
+freed pages to the host for immediate reclaim, complementing the virtio-mem resize.

@@ -68,7 +68,8 @@ Kata Containers users to migrate without changing their pod annotations.
 
 | Annotation Suffix | Type | Description | Validation |
 |-------------------|------|-------------|------------|
-| `config.hypervisor.default_memory` | u64 (MiB) | VM memory size | min 128 MiB |
+| `config.hypervisor.default_memory` | u64 (MiB) | VM boot memory | min 128 MiB |
+| `config.hypervisor.memory_limit` | u64 (MiB) | Max memory (hotplug ceiling) | must be > default_memory |
 | `config.hypervisor.default_vcpus` | u32 | VM vCPU count | must be > 0 |
 | `config.hypervisor.default_max_vcpus` | u32 | Max vCPUs for hotplug | must be ≥ default_vcpus |
 | `config.hypervisor.kernel_params` | string | Extra kernel boot params | appended to config |
