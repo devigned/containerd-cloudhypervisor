@@ -756,17 +756,23 @@ impl VmManager {
     pub async fn shutdown(&mut self) -> Result<()> {
         info!("shutting down VM {}", self.vm_id);
 
-        // Try graceful shutdown via API
+        // Try graceful shutdown via API (short timeout — if CH doesn't respond
+        // quickly, we'll SIGKILL it below)
         if self.api_socket.exists() {
-            match self.api_request("PUT", "/api/v1/vm.shutdown", None).await {
-                Ok(_) => {
+            match tokio::time::timeout(
+                Duration::from_secs(2),
+                self.api_request("PUT", "/api/v1/vm.shutdown", None),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
                     info!("VM {} shutdown requested via API", self.vm_id);
                 }
-                Err(e) => {
-                    warn!(
-                        "VM {} API shutdown failed: {}, killing process",
-                        self.vm_id, e
-                    );
+                Ok(Err(e)) => {
+                    warn!("VM {} API shutdown failed: {e}", self.vm_id);
+                }
+                Err(_) => {
+                    warn!("VM {} API shutdown timed out (2s)", self.vm_id);
                 }
             }
         }
@@ -875,9 +881,9 @@ impl Drop for VmManager {
                     unsafe {
                         libc::kill(pid as i32, libc::SIGKILL);
                     }
-                    // Wait synchronously to reap the zombie
+                    // Non-blocking reap — don't hang if already reaped by tokio
                     unsafe {
-                        libc::waitpid(pid as i32, std::ptr::null_mut(), 0);
+                        libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG);
                     }
                     info!("killed {} (pid={})", name, pid);
                 }

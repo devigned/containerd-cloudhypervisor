@@ -2711,6 +2711,15 @@ fn test_volume_mounts() {
 
         // ── Phase 4: Cleanup ──────────────────────────────────────────
         eprintln!("  Phase 4 │ Cleaning up");
+        // Remove the hot-plugged block volume before shutdown
+        let remove_body = format!(r#"{{"id":"{vol_disk_id}"}}"#);
+        let _ = containerd_shim_cloudhv::vm::VmManager::api_request_to_socket(
+            vm.api_socket_path(),
+            "PUT",
+            "/api/v1/vm.remove-device",
+            Some(&remove_body),
+        )
+        .await;
         vm.cleanup().await.expect("cleanup");
         let _ = std::fs::remove_file(&block_img);
 
