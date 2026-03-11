@@ -637,6 +637,7 @@ impl Task for CloudHvShim {
                 if state.exit_code.is_none() {
                     state.exit_code = Some(0);
                 }
+                state.exit_notify.notify_waiters();
             }
             self.exit.signal();
             return Ok(api::Empty::new());
@@ -644,7 +645,7 @@ impl Task for CloudHvShim {
 
         // For app containers: mark stopped first, then best-effort agent RPC.
         // Setting exit_code before the agent RPC ensures wait() returns
-        // immediately even if the agent is unreachable.
+        // immediately via the Notify.
         {
             let mut containers = self.containers.lock().unwrap();
             if let Some(state) = containers.get_mut(container_id) {
@@ -654,10 +655,6 @@ impl Task for CloudHvShim {
                 state.exit_notify.notify_waiters();
             }
         }
-        // Signal shim exit so the container shim's wait() returns.
-        // For container shims (separate process per container), this
-        // is the only way to unblock wait() since Notify is in-process.
-        self.exit.signal();
 
         // Best-effort agent RPC — fire and forget since exit_code is
         // already set and wait() already unblocked.
@@ -773,8 +770,10 @@ impl Task for CloudHvShim {
             return Ok(resp);
         }
 
-        // Get the exit notify handle and ExitSignal for racing
-        let notify = {
+        // Clone the Notify and register the waiter while holding the lock.
+        // This prevents a race where kill() calls notify_waiters() between
+        // our lock release and our notified() registration.
+        let exit_notify = {
             let containers = self.containers.lock().unwrap();
             if let Some(state) = containers.get(container_id) {
                 if let Some(exit_code) = state.exit_code {
@@ -792,12 +791,16 @@ impl Task for CloudHvShim {
                 return Ok(resp);
             }
         };
+        // Register the waiter outside the lock — the clone ensures the
+        // Notify outlives the MutexGuard. Any notify_waiters() call after
+        // our lock release will wake this future.
+        let notified_future = exit_notify.notified();
 
         // Wait for either:
-        // 1. kill() sets exit_code and notifies (same process)
-        // 2. shim exit signal (sandbox killed, covers cross-process case)
+        // 1. kill() sets exit_code and notifies (in-process Notify)
+        // 2. shim exit signal (sandbox killed via ExitSignal)
         tokio::select! {
-            _ = notify.notified() => {},
+            _ = notified_future => {},
             _ = self.exit.wait() => {},
         }
 

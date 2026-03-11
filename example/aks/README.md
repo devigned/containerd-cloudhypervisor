@@ -51,7 +51,7 @@ The Helm chart is published to GHCR as an OCI artifact with each release.
 # Install the latest release
 helm install cloudhv-installer \
   oci://ghcr.io/devigned/charts/cloudhv-installer \
-  --version 0.1.2 \
+  --version 0.1.3 \
   --namespace kube-system
 ```
 
