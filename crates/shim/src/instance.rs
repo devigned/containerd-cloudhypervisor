@@ -8,10 +8,22 @@ use containerd_shim::{Config, Error, Flags, StartOpts, TtrpcResult};
 use containerd_shim_protos::shim_async::Task;
 use containerd_shim_protos::ttrpc::r#async::TtrpcContext;
 use log::info;
+use protobuf::well_known_types::timestamp::Timestamp;
 
 use crate::config::load_config;
 use crate::pool::VmPool;
 use crate::vm::VmManager;
+
+/// Create a protobuf Timestamp for the current time.
+fn timestamp_now() -> protobuf::MessageField<Timestamp> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let mut ts = Timestamp::new();
+    ts.seconds = now.as_secs() as i64;
+    ts.nanos = now.subsec_nanos() as i32;
+    protobuf::MessageField::some(ts)
+}
 
 /// A running VM that may host multiple containers.
 struct VmState {
@@ -26,6 +38,8 @@ struct ContainerState {
     vm_id: String,
     pid: Option<u32>,
     exit_code: Option<u32>,
+    /// Notifies wait() when exit_code is set by kill().
+    exit_notify: Arc<tokio::sync::Notify>,
     /// Host-side file in the virtio-fs shared dir (agent writes crun output here)
     stdout_shared_path: Option<std::path::PathBuf>,
     stderr_shared_path: Option<std::path::PathBuf>,
@@ -306,6 +320,7 @@ impl CloudHvShim {
                 vm_id,
                 pid: Some(1), // agent is PID 1 inside the VM
                 exit_code: None,
+                exit_notify: Arc::new(tokio::sync::Notify::new()),
                 stdout_shared_path: None,
                 stderr_shared_path: None,
                 stdout_fifo: None,
@@ -491,6 +506,7 @@ impl CloudHvShim {
                 vm_id: sandbox_id,
                 pid: Some(create_resp.pid),
                 exit_code: None,
+                exit_notify: Arc::new(tokio::sync::Notify::new()),
                 stdout_shared_path: Some(stdout_host_path),
                 stderr_shared_path: Some(stderr_host_path),
                 stdout_fifo: if req.stdout.is_empty() {
@@ -614,6 +630,7 @@ impl Task for CloudHvShim {
                 if state.vm_id == *container_id && state.exit_code.is_none() {
                     state.exit_code = Some(137);
                 }
+                state.exit_notify.notify_waiters();
             }
             // Mark the sandbox container itself
             if let Some(state) = containers.get_mut(container_id) {
@@ -625,7 +642,23 @@ impl Task for CloudHvShim {
             return Ok(api::Empty::new());
         }
 
-        // For app containers: try agent RPC, then mark stopped
+        // For app containers: mark stopped first, then best-effort agent RPC.
+        // Setting exit_code before the agent RPC ensures wait() returns
+        // immediately even if the agent is unreachable.
+        {
+            let mut containers = self.containers.lock().unwrap();
+            if let Some(state) = containers.get_mut(container_id) {
+                if state.exit_code.is_none() {
+                    state.exit_code = Some(137);
+                }
+                state.exit_notify.notify_waiters();
+            }
+        }
+        // Signal shim exit so the container shim's wait() returns.
+        // For container shims (separate process per container), this
+        // is the only way to unblock wait() since Notify is in-process.
+        self.exit.signal();
+
         if let Ok(agent) = self.get_agent_for_container(container_id) {
             let mut kreq = cloudhv_proto::KillContainerRequest::new();
             kreq.container_id = container_id.to_string();
@@ -633,16 +666,6 @@ impl Task for CloudHvShim {
             kreq.all = req.all;
             let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(5));
             let _ = agent.kill_container(ctx, &kreq).await;
-        }
-
-        // Mark container as stopped
-        {
-            let mut containers = self.containers.lock().unwrap();
-            if let Some(state) = containers.get_mut(container_id) {
-                if state.exit_code.is_none() {
-                    state.exit_code = Some(137);
-                }
-            }
         }
 
         Ok(api::Empty::new())
@@ -718,6 +741,7 @@ impl Task for CloudHvShim {
         let mut resp = api::DeleteResponse::new();
         resp.pid = pid;
         resp.exit_status = exit_status;
+        resp.exited_at = timestamp_now();
         Ok(resp)
     }
 
@@ -738,37 +762,49 @@ impl Task for CloudHvShim {
             self.exit.wait().await;
             let mut resp = api::WaitResponse::new();
             resp.exit_status = 0;
+            resp.exited_at = timestamp_now();
             return Ok(resp);
         }
 
-        // Check local state — if container already has exit code, return it
-        {
+        // Get the exit notify handle and ExitSignal for racing
+        let notify = {
             let containers = self.containers.lock().unwrap();
             if let Some(state) = containers.get(container_id) {
                 if let Some(exit_code) = state.exit_code {
                     info!("container {} already exited: {}", container_id, exit_code);
                     let mut resp = api::WaitResponse::new();
                     resp.exit_status = exit_code;
+                    resp.exited_at = timestamp_now();
                     return Ok(resp);
                 }
-            }
-        }
-
-        // Container still running — ask the agent
-        if let Ok(agent) = self.get_agent_for_container(container_id) {
-            let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
-            wait_req.container_id = container_id.to_string();
-            let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(300));
-            if let Ok(wait_resp) = agent.wait_container(ctx, &wait_req).await {
+                state.exit_notify.clone()
+            } else {
                 let mut resp = api::WaitResponse::new();
-                resp.exit_status = wait_resp.exit_status;
+                resp.exit_status = 0;
+                resp.exited_at = timestamp_now();
                 return Ok(resp);
             }
+        };
+
+        // Wait for either:
+        // 1. kill() sets exit_code and notifies (same process)
+        // 2. shim exit signal (sandbox killed, covers cross-process case)
+        tokio::select! {
+            _ = notify.notified() => {},
+            _ = self.exit.wait() => {},
         }
 
-        // Fallback
+        let exit_code = {
+            let containers = self.containers.lock().unwrap();
+            containers
+                .get(container_id)
+                .and_then(|s| s.exit_code)
+                .unwrap_or(137)
+        };
+        info!("container {} exited: {}", container_id, exit_code);
         let mut resp = api::WaitResponse::new();
-        resp.exit_status = 0;
+        resp.exit_status = exit_code;
+        resp.exited_at = timestamp_now();
         Ok(resp)
     }
 
