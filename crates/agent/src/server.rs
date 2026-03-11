@@ -138,6 +138,36 @@ impl AgentService for AgentServiceHandler {
             .await
             .map_err(|e| ttrpc::Error::Others(format!("state_container failed: {e}")))
     }
+
+    async fn get_mem_info(
+        &self,
+        _ctx: &TtrpcContext,
+        _req: GetMemInfoRequest,
+    ) -> ttrpc::Result<GetMemInfoResponse> {
+        debug!("RPC: get_mem_info");
+        let content = std::fs::read_to_string("/proc/meminfo")
+            .map_err(|e| ttrpc::Error::Others(format!("read /proc/meminfo: {e}")))?;
+
+        let mut resp = GetMemInfoResponse::new();
+        for line in content.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            let val: u64 = parts[1].parse().unwrap_or(0);
+            match parts[0] {
+                "MemTotal:" => resp.mem_total_kb = val,
+                "MemFree:" => resp.mem_free_kb = val,
+                "MemAvailable:" => resp.mem_available_kb = val,
+                "Buffers:" => resp.buffers_kb = val,
+                "Cached:" => resp.cached_kb = val,
+                "SwapTotal:" => resp.swap_total_kb = val,
+                "SwapFree:" => resp.swap_free_kb = val,
+                _ => {}
+            }
+        }
+        Ok(resp)
+    }
 }
 
 // --- HealthService implementation ---

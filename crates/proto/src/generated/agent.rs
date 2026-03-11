@@ -2298,6 +2298,339 @@ impl ::protobuf::reflect::ProtobufValue for CheckResponse {
     type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
 }
 
+// @@protoc_insertion_point(message:cloudhv.agent.GetMemInfoRequest)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct GetMemInfoRequest {
+    // special fields
+    // @@protoc_insertion_point(special_field:cloudhv.agent.GetMemInfoRequest.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a GetMemInfoRequest {
+    fn default() -> &'a GetMemInfoRequest {
+        <GetMemInfoRequest as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl GetMemInfoRequest {
+    pub fn new() -> GetMemInfoRequest {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(0);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<GetMemInfoRequest>(
+            "GetMemInfoRequest",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for GetMemInfoRequest {
+    const NAME: &'static str = "GetMemInfoRequest";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> GetMemInfoRequest {
+        GetMemInfoRequest::new()
+    }
+
+    fn clear(&mut self) {
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static GetMemInfoRequest {
+        static instance: GetMemInfoRequest = GetMemInfoRequest {
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for GetMemInfoRequest {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("GetMemInfoRequest").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for GetMemInfoRequest {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for GetMemInfoRequest {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+// @@protoc_insertion_point(message:cloudhv.agent.GetMemInfoResponse)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct GetMemInfoResponse {
+    // message fields
+    // @@protoc_insertion_point(field:cloudhv.agent.GetMemInfoResponse.mem_total_kb)
+    pub mem_total_kb: u64,
+    // @@protoc_insertion_point(field:cloudhv.agent.GetMemInfoResponse.mem_free_kb)
+    pub mem_free_kb: u64,
+    // @@protoc_insertion_point(field:cloudhv.agent.GetMemInfoResponse.mem_available_kb)
+    pub mem_available_kb: u64,
+    // @@protoc_insertion_point(field:cloudhv.agent.GetMemInfoResponse.buffers_kb)
+    pub buffers_kb: u64,
+    // @@protoc_insertion_point(field:cloudhv.agent.GetMemInfoResponse.cached_kb)
+    pub cached_kb: u64,
+    // @@protoc_insertion_point(field:cloudhv.agent.GetMemInfoResponse.swap_total_kb)
+    pub swap_total_kb: u64,
+    // @@protoc_insertion_point(field:cloudhv.agent.GetMemInfoResponse.swap_free_kb)
+    pub swap_free_kb: u64,
+    // special fields
+    // @@protoc_insertion_point(special_field:cloudhv.agent.GetMemInfoResponse.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a GetMemInfoResponse {
+    fn default() -> &'a GetMemInfoResponse {
+        <GetMemInfoResponse as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl GetMemInfoResponse {
+    pub fn new() -> GetMemInfoResponse {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(7);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "mem_total_kb",
+            |m: &GetMemInfoResponse| { &m.mem_total_kb },
+            |m: &mut GetMemInfoResponse| { &mut m.mem_total_kb },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "mem_free_kb",
+            |m: &GetMemInfoResponse| { &m.mem_free_kb },
+            |m: &mut GetMemInfoResponse| { &mut m.mem_free_kb },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "mem_available_kb",
+            |m: &GetMemInfoResponse| { &m.mem_available_kb },
+            |m: &mut GetMemInfoResponse| { &mut m.mem_available_kb },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "buffers_kb",
+            |m: &GetMemInfoResponse| { &m.buffers_kb },
+            |m: &mut GetMemInfoResponse| { &mut m.buffers_kb },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "cached_kb",
+            |m: &GetMemInfoResponse| { &m.cached_kb },
+            |m: &mut GetMemInfoResponse| { &mut m.cached_kb },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "swap_total_kb",
+            |m: &GetMemInfoResponse| { &m.swap_total_kb },
+            |m: &mut GetMemInfoResponse| { &mut m.swap_total_kb },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "swap_free_kb",
+            |m: &GetMemInfoResponse| { &m.swap_free_kb },
+            |m: &mut GetMemInfoResponse| { &mut m.swap_free_kb },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<GetMemInfoResponse>(
+            "GetMemInfoResponse",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for GetMemInfoResponse {
+    const NAME: &'static str = "GetMemInfoResponse";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                8 => {
+                    self.mem_total_kb = is.read_uint64()?;
+                },
+                16 => {
+                    self.mem_free_kb = is.read_uint64()?;
+                },
+                24 => {
+                    self.mem_available_kb = is.read_uint64()?;
+                },
+                32 => {
+                    self.buffers_kb = is.read_uint64()?;
+                },
+                40 => {
+                    self.cached_kb = is.read_uint64()?;
+                },
+                48 => {
+                    self.swap_total_kb = is.read_uint64()?;
+                },
+                56 => {
+                    self.swap_free_kb = is.read_uint64()?;
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if self.mem_total_kb != 0 {
+            my_size += ::protobuf::rt::uint64_size(1, self.mem_total_kb);
+        }
+        if self.mem_free_kb != 0 {
+            my_size += ::protobuf::rt::uint64_size(2, self.mem_free_kb);
+        }
+        if self.mem_available_kb != 0 {
+            my_size += ::protobuf::rt::uint64_size(3, self.mem_available_kb);
+        }
+        if self.buffers_kb != 0 {
+            my_size += ::protobuf::rt::uint64_size(4, self.buffers_kb);
+        }
+        if self.cached_kb != 0 {
+            my_size += ::protobuf::rt::uint64_size(5, self.cached_kb);
+        }
+        if self.swap_total_kb != 0 {
+            my_size += ::protobuf::rt::uint64_size(6, self.swap_total_kb);
+        }
+        if self.swap_free_kb != 0 {
+            my_size += ::protobuf::rt::uint64_size(7, self.swap_free_kb);
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if self.mem_total_kb != 0 {
+            os.write_uint64(1, self.mem_total_kb)?;
+        }
+        if self.mem_free_kb != 0 {
+            os.write_uint64(2, self.mem_free_kb)?;
+        }
+        if self.mem_available_kb != 0 {
+            os.write_uint64(3, self.mem_available_kb)?;
+        }
+        if self.buffers_kb != 0 {
+            os.write_uint64(4, self.buffers_kb)?;
+        }
+        if self.cached_kb != 0 {
+            os.write_uint64(5, self.cached_kb)?;
+        }
+        if self.swap_total_kb != 0 {
+            os.write_uint64(6, self.swap_total_kb)?;
+        }
+        if self.swap_free_kb != 0 {
+            os.write_uint64(7, self.swap_free_kb)?;
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> GetMemInfoResponse {
+        GetMemInfoResponse::new()
+    }
+
+    fn clear(&mut self) {
+        self.mem_total_kb = 0;
+        self.mem_free_kb = 0;
+        self.mem_available_kb = 0;
+        self.buffers_kb = 0;
+        self.cached_kb = 0;
+        self.swap_total_kb = 0;
+        self.swap_free_kb = 0;
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static GetMemInfoResponse {
+        static instance: GetMemInfoResponse = GetMemInfoResponse {
+            mem_total_kb: 0,
+            mem_free_kb: 0,
+            mem_available_kb: 0,
+            buffers_kb: 0,
+            cached_kb: 0,
+            swap_total_kb: 0,
+            swap_free_kb: 0,
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for GetMemInfoResponse {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("GetMemInfoResponse").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for GetMemInfoResponse {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for GetMemInfoResponse {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
 #[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
 // @@protoc_insertion_point(enum:cloudhv.agent.ContainerState)
 pub enum ContainerState {
@@ -2408,23 +2741,31 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     R\x06status\x12\x1f\n\x0bexit_status\x18\x04\x20\x01(\rR\nexitStatus\x12\
     \x1b\n\texited_at\x18\x05\x20\x01(\tR\x08exitedAt\"\x0e\n\x0cCheckReques\
     t\"?\n\rCheckResponse\x12\x14\n\x05ready\x18\x01\x20\x01(\x08R\x05ready\
-    \x12\x18\n\x07version\x18\x02\x20\x01(\tR\x07version*P\n\x0eContainerSta\
-    te\x12\x0b\n\x07UNKNOWN\x10\0\x12\x0b\n\x07CREATED\x10\x01\x12\x0b\n\x07\
-    RUNNING\x10\x02\x12\x0b\n\x07STOPPED\x10\x03\x12\n\n\x06PAUSED\x10\x042\
-    \x9e\x05\n\x0cAgentService\x12`\n\x0fCreateContainer\x12%.cloudhv.agent.\
-    CreateContainerRequest\x1a&.cloudhv.agent.CreateContainerResponse\x12]\n\
-    \x0eStartContainer\x12$.cloudhv.agent.StartContainerRequest\x1a%.cloudhv\
-    .agent.StartContainerResponse\x12Z\n\rKillContainer\x12#.cloudhv.agent.K\
-    illContainerRequest\x1a$.cloudhv.agent.KillContainerResponse\x12`\n\x0fD\
-    eleteContainer\x12%.cloudhv.agent.DeleteContainerRequest\x1a&.cloudhv.ag\
-    ent.DeleteContainerResponse\x12Z\n\rWaitContainer\x12#.cloudhv.agent.Wai\
-    tContainerRequest\x1a$.cloudhv.agent.WaitContainerResponse\x12T\n\x0bExe\
-    cProcess\x12!.cloudhv.agent.ExecProcessRequest\x1a\".cloudhv.agent.ExecP\
-    rocessResponse\x12]\n\x0eStateContainer\x12$.cloudhv.agent.StateContaine\
-    rRequest\x1a%.cloudhv.agent.StateContainerResponse2S\n\rHealthService\
-    \x12B\n\x05Check\x12\x1b.cloudhv.agent.CheckRequest\x1a\x1c.cloudhv.agen\
-    t.CheckResponseB6Z4github.com/devigned/containerd-cloudhypervisor/protob\
-    \x06proto3\
+    \x12\x18\n\x07version\x18\x02\x20\x01(\tR\x07version\"\x13\n\x11GetMemIn\
+    foRequest\"\x82\x02\n\x12GetMemInfoResponse\x12\x20\n\x0cmem_total_kb\
+    \x18\x01\x20\x01(\x04R\nmemTotalKb\x12\x1e\n\x0bmem_free_kb\x18\x02\x20\
+    \x01(\x04R\tmemFreeKb\x12(\n\x10mem_available_kb\x18\x03\x20\x01(\x04R\
+    \x0ememAvailableKb\x12\x1d\n\nbuffers_kb\x18\x04\x20\x01(\x04R\tbuffersK\
+    b\x12\x1b\n\tcached_kb\x18\x05\x20\x01(\x04R\x08cachedKb\x12\"\n\rswap_t\
+    otal_kb\x18\x06\x20\x01(\x04R\x0bswapTotalKb\x12\x20\n\x0cswap_free_kb\
+    \x18\x07\x20\x01(\x04R\nswapFreeKb*P\n\x0eContainerState\x12\x0b\n\x07UN\
+    KNOWN\x10\0\x12\x0b\n\x07CREATED\x10\x01\x12\x0b\n\x07RUNNING\x10\x02\
+    \x12\x0b\n\x07STOPPED\x10\x03\x12\n\n\x06PAUSED\x10\x042\xf1\x05\n\x0cAg\
+    entService\x12`\n\x0fCreateContainer\x12%.cloudhv.agent.CreateContainerR\
+    equest\x1a&.cloudhv.agent.CreateContainerResponse\x12]\n\x0eStartContain\
+    er\x12$.cloudhv.agent.StartContainerRequest\x1a%.cloudhv.agent.StartCont\
+    ainerResponse\x12Z\n\rKillContainer\x12#.cloudhv.agent.KillContainerRequ\
+    est\x1a$.cloudhv.agent.KillContainerResponse\x12`\n\x0fDeleteContainer\
+    \x12%.cloudhv.agent.DeleteContainerRequest\x1a&.cloudhv.agent.DeleteCont\
+    ainerResponse\x12Z\n\rWaitContainer\x12#.cloudhv.agent.WaitContainerRequ\
+    est\x1a$.cloudhv.agent.WaitContainerResponse\x12T\n\x0bExecProcess\x12!.\
+    cloudhv.agent.ExecProcessRequest\x1a\".cloudhv.agent.ExecProcessResponse\
+    \x12]\n\x0eStateContainer\x12$.cloudhv.agent.StateContainerRequest\x1a%.\
+    cloudhv.agent.StateContainerResponse\x12Q\n\nGetMemInfo\x12\x20.cloudhv.\
+    agent.GetMemInfoRequest\x1a!.cloudhv.agent.GetMemInfoResponse2S\n\rHealt\
+    hService\x12B\n\x05Check\x12\x1b.cloudhv.agent.CheckRequest\x1a\x1c.clou\
+    dhv.agent.CheckResponseB6Z4github.com/devigned/containerd-cloudhyperviso\
+    r/protob\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file
@@ -2442,7 +2783,7 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
     file_descriptor.get(|| {
         let generated_file_descriptor = generated_file_descriptor_lazy.get(|| {
             let mut deps = ::std::vec::Vec::with_capacity(0);
-            let mut messages = ::std::vec::Vec::with_capacity(16);
+            let mut messages = ::std::vec::Vec::with_capacity(18);
             messages.push(CreateContainerRequest::generated_message_descriptor_data());
             messages.push(CreateContainerResponse::generated_message_descriptor_data());
             messages.push(StartContainerRequest::generated_message_descriptor_data());
@@ -2459,6 +2800,8 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
             messages.push(StateContainerResponse::generated_message_descriptor_data());
             messages.push(CheckRequest::generated_message_descriptor_data());
             messages.push(CheckResponse::generated_message_descriptor_data());
+            messages.push(GetMemInfoRequest::generated_message_descriptor_data());
+            messages.push(GetMemInfoResponse::generated_message_descriptor_data());
             let mut enums = ::std::vec::Vec::with_capacity(1);
             enums.push(ContainerState::generated_enum_descriptor_data());
             ::protobuf::reflect::GeneratedFileDescriptor::new_generated(

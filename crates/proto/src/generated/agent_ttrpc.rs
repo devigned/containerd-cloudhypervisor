@@ -65,6 +65,11 @@ impl AgentServiceClient {
         let mut cres = super::agent::StateContainerResponse::new();
         ::ttrpc::async_client_request!(self, ctx, req, "cloudhv.agent.AgentService", "StateContainer", cres);
     }
+
+    pub async fn get_mem_info(&self, ctx: ttrpc::context::Context, req: &super::agent::GetMemInfoRequest) -> ::ttrpc::Result<super::agent::GetMemInfoResponse> {
+        let mut cres = super::agent::GetMemInfoResponse::new();
+        ::ttrpc::async_client_request!(self, ctx, req, "cloudhv.agent.AgentService", "GetMemInfo", cres);
+    }
 }
 
 struct CreateContainerMethod {
@@ -144,6 +149,17 @@ impl ::ttrpc::r#async::MethodHandler for StateContainerMethod {
     }
 }
 
+struct GetMemInfoMethod {
+    service: Arc<dyn AgentService + Send + Sync>,
+}
+
+#[async_trait]
+impl ::ttrpc::r#async::MethodHandler for GetMemInfoMethod {
+    async fn handler(&self, ctx: ::ttrpc::r#async::TtrpcContext, req: ::ttrpc::Request) -> ::ttrpc::Result<::ttrpc::Response> {
+        ::ttrpc::async_request_handler!(self, ctx, req, agent, GetMemInfoRequest, get_mem_info);
+    }
+}
+
 #[async_trait]
 pub trait AgentService: Sync {
     async fn create_container(&self, _ctx: &::ttrpc::r#async::TtrpcContext, _: super::agent::CreateContainerRequest) -> ::ttrpc::Result<super::agent::CreateContainerResponse> {
@@ -166,6 +182,9 @@ pub trait AgentService: Sync {
     }
     async fn state_container(&self, _ctx: &::ttrpc::r#async::TtrpcContext, _: super::agent::StateContainerRequest) -> ::ttrpc::Result<super::agent::StateContainerResponse> {
         Err(::ttrpc::Error::RpcStatus(::ttrpc::get_status(::ttrpc::Code::NOT_FOUND, "/cloudhv.agent.AgentService/StateContainer is not supported".to_string())))
+    }
+    async fn get_mem_info(&self, _ctx: &::ttrpc::r#async::TtrpcContext, _: super::agent::GetMemInfoRequest) -> ::ttrpc::Result<super::agent::GetMemInfoResponse> {
+        Err(::ttrpc::Error::RpcStatus(::ttrpc::get_status(::ttrpc::Code::NOT_FOUND, "/cloudhv.agent.AgentService/GetMemInfo is not supported".to_string())))
     }
 }
 
@@ -194,6 +213,9 @@ pub fn create_agent_service(service: Arc<dyn AgentService + Send + Sync>) -> Has
 
     methods.insert("StateContainer".to_string(),
                     Box::new(StateContainerMethod{service: service.clone()}) as Box<dyn ::ttrpc::r#async::MethodHandler + Send + Sync>);
+
+    methods.insert("GetMemInfo".to_string(),
+                    Box::new(GetMemInfoMethod{service: service.clone()}) as Box<dyn ::ttrpc::r#async::MethodHandler + Send + Sync>);
 
     ret.insert("cloudhv.agent.AgentService".to_string(), ::ttrpc::r#async::Service{ methods, streams });
     ret

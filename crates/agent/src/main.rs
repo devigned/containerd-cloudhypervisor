@@ -3,6 +3,7 @@ use nix::unistd::getpid;
 
 mod container;
 mod mount;
+mod pressure;
 mod reaper;
 mod server;
 
@@ -52,6 +53,10 @@ fn init_setup() {
     }
 
     reaper::set_child_subreaper();
+
+    // Start PSI memory pressure watcher — writes to shared dir on pressure events
+    pressure::start_pressure_watcher(std::path::Path::new(cloudhv_common::VIRTIOFS_GUEST_MOUNT));
+
     info!("init setup complete");
 }
 

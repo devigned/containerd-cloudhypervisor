@@ -61,10 +61,19 @@ if [ -f "../${CONFIG_FILE}" ]; then
     scripts/config --enable NET_CORE
     scripts/config --enable IP_PNP
     scripts/config --enable HOTPLUG_PCI_ACPI
+    # Memory hotplug and virtio-mem for dynamic memory growth/reclaim
+    scripts/config --enable MEMORY_HOTPLUG
+    scripts/config --enable MEMORY_HOTREMOVE
+    scripts/config --enable VIRTIO_MEM
+    scripts/config --enable VIRTIO_BALLOON
+    scripts/config --enable PAGE_REPORTING
+    # PSI for memory pressure detection
+    scripts/config --enable PSI
+    scripts/config --disable PSI_DEFAULT_DISABLED
     make olddefconfig
 
     # Verify critical configs are enabled
-    for opt in PCI_MSI VSOCKETS VIRTIO_VSOCKETS PVH BPF_SYSCALL CGROUP_BPF HOTPLUG_PCI; do
+    for opt in PCI_MSI VSOCKETS VIRTIO_VSOCKETS PVH BPF_SYSCALL CGROUP_BPF HOTPLUG_PCI VIRTIO_MEM PSI; do
         if ! grep -q "CONFIG_${opt}=y" .config; then
             echo "ERROR: CONFIG_${opt} is not enabled!"
             exit 1

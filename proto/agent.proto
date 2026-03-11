@@ -27,6 +27,9 @@ service AgentService {
 
     // StateContainer returns the current state of a container.
     rpc StateContainer(StateContainerRequest) returns (StateContainerResponse);
+
+    // GetMemInfo returns guest memory statistics from /proc/meminfo.
+    rpc GetMemInfo(GetMemInfoRequest) returns (GetMemInfoResponse);
 }
 
 // HealthService provides health checking for the guest agent.
@@ -142,4 +145,19 @@ message CheckRequest {}
 message CheckResponse {
     bool ready = 1;
     string version = 2;
+}
+
+// --- GetMemInfo ---
+
+message GetMemInfoRequest {}
+
+message GetMemInfoResponse {
+    // All values in KiB (matching /proc/meminfo units)
+    uint64 mem_total_kb = 1;
+    uint64 mem_free_kb = 2;
+    uint64 mem_available_kb = 3;
+    uint64 buffers_kb = 4;
+    uint64 cached_kb = 5;
+    uint64 swap_total_kb = 6;
+    uint64 swap_free_kb = 7;
 }
