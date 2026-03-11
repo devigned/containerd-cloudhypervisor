@@ -45,6 +45,7 @@ const KATA_PREFIX: &str = "io.katacontainers.";
 
 // Annotation suffixes (shared between io.cloudhv. and io.katacontainers.)
 const SUFFIX_MEMORY: &str = "config.hypervisor.default_memory";
+const SUFFIX_MEMORY_LIMIT: &str = "config.hypervisor.memory_limit";
 const SUFFIX_VCPUS: &str = "config.hypervisor.default_vcpus";
 const SUFFIX_MAX_VCPUS: &str = "config.hypervisor.default_max_vcpus";
 const SUFFIX_KERNEL_PARAMS: &str = "config.hypervisor.kernel_params";
@@ -91,6 +92,38 @@ pub fn apply_annotations(
             ),
             Err(_) => warn!(
                 "annotation: default_memory={:?} is not a valid number, ignored",
+                val
+            ),
+        }
+    }
+
+    // Memory limit (MiB) — sets hotplug headroom for dynamic growth.
+    // When limit > request, the VM boots with request as initial memory and
+    // can grow up to limit via virtio-mem hotplug.
+    if let Some(val) = resolve_annotation(annotations, SUFFIX_MEMORY_LIMIT) {
+        match val.parse::<u64>() {
+            Ok(limit_mb) if limit_mb > config.default_memory_mb => {
+                let headroom = limit_mb - config.default_memory_mb;
+                info!(
+                    "annotation: memory_limit={}MiB, hotplug_memory_mb={}MiB (headroom for growth)",
+                    limit_mb, headroom
+                );
+                config.hotplug_memory_mb = headroom;
+                // Auto-select virtio-mem for bidirectional resize
+                if config.hotplug_method == "acpi" {
+                    config.hotplug_method = "virtio-mem".to_string();
+                    info!("annotation: auto-selected virtio-mem for memory growth/reclaim");
+                }
+            }
+            Ok(limit_mb) if limit_mb > 0 => {
+                info!(
+                    "annotation: memory_limit={}MiB <= default_memory={}MiB, no hotplug needed",
+                    limit_mb, config.default_memory_mb
+                );
+            }
+            Ok(_) => {}
+            Err(_) => warn!(
+                "annotation: memory_limit={:?} is not a valid number, ignored",
                 val
             ),
         }
@@ -171,6 +204,71 @@ pub fn annotations_from_spec(spec: &serde_json::Value) -> HashMap<String, String
         }
     }
     result
+}
+
+/// Extract memory request and limit from the OCI spec's linux.resources.
+///
+/// Kubernetes sets `linux.resources.memory.limit` (in bytes) from
+/// `resources.limits.memory` in the pod spec. Returns (request_mb, limit_mb).
+/// If not set, returns None for that field.
+pub fn memory_resources_from_spec(spec: &serde_json::Value) -> (Option<u64>, Option<u64>) {
+    let limit_bytes = spec
+        .pointer("/linux/resources/memory/limit")
+        .and_then(|v| v.as_i64())
+        .filter(|&v| v > 0);
+
+    // OCI spec doesn't have a "request" field — only limit and reservation.
+    // Reservation maps to Kubernetes memory requests.
+    let request_bytes = spec
+        .pointer("/linux/resources/memory/reservation")
+        .and_then(|v| v.as_i64())
+        .filter(|&v| v > 0);
+
+    let to_mb = |bytes: i64| -> u64 { (bytes as u64) / (1024 * 1024) };
+
+    (request_bytes.map(to_mb), limit_bytes.map(to_mb))
+}
+
+/// Apply OCI resource limits to the runtime config.
+///
+/// When a memory limit exceeds the configured boot memory, automatically
+/// enables virtio-mem hotplug with headroom up to the limit.
+pub fn apply_resource_limits(
+    mut config: RuntimeConfig,
+    request_mb: Option<u64>,
+    limit_mb: Option<u64>,
+) -> RuntimeConfig {
+    // If request is set and valid, use it as boot memory
+    if let Some(req) = request_mb {
+        if req >= MIN_MEMORY_MB {
+            info!(
+                "resource request: default_memory_mb {} -> {}",
+                config.default_memory_mb, req
+            );
+            config.default_memory_mb = req;
+        }
+    }
+
+    // If limit exceeds boot memory, enable hotplug for growth
+    if let Some(limit) = limit_mb {
+        if limit > config.default_memory_mb {
+            let headroom = limit - config.default_memory_mb;
+            if config.hotplug_memory_mb < headroom {
+                info!(
+                    "resource limit: hotplug_memory_mb {} -> {} (limit={}MiB, boot={}MiB)",
+                    config.hotplug_memory_mb, headroom, limit, config.default_memory_mb
+                );
+                config.hotplug_memory_mb = headroom;
+                // Auto-select virtio-mem for bidirectional resize
+                if config.hotplug_method == "acpi" {
+                    config.hotplug_method = "virtio-mem".to_string();
+                    info!("auto-selected virtio-mem for dynamic memory growth/reclaim");
+                }
+            }
+        }
+    }
+
+    config
 }
 
 #[cfg(test)]
@@ -359,5 +457,77 @@ mod tests {
         assert_eq!(config.default_memory_mb, 2048);
         assert_eq!(config.default_vcpus, 4);
         assert!(config.kernel_args.contains("debug"));
+    }
+
+    #[test]
+    fn test_memory_limit_enables_hotplug() {
+        let mut ann = HashMap::new();
+        ann.insert(
+            "io.cloudhv.config.hypervisor.default_memory".into(),
+            "128".into(),
+        );
+        ann.insert(
+            "io.cloudhv.config.hypervisor.memory_limit".into(),
+            "1024".into(),
+        );
+        let config = apply_annotations(default_config(), &ann);
+        assert_eq!(config.default_memory_mb, 128);
+        assert_eq!(config.hotplug_memory_mb, 896);
+        assert_eq!(config.hotplug_method, "virtio-mem");
+    }
+
+    #[test]
+    fn test_memory_limit_below_request_no_hotplug() {
+        let mut ann = HashMap::new();
+        ann.insert(
+            "io.cloudhv.config.hypervisor.default_memory".into(),
+            "512".into(),
+        );
+        ann.insert(
+            "io.cloudhv.config.hypervisor.memory_limit".into(),
+            "256".into(),
+        );
+        let config = apply_annotations(default_config(), &ann);
+        assert_eq!(config.default_memory_mb, 512);
+        assert_eq!(config.hotplug_memory_mb, 0);
+    }
+
+    #[test]
+    fn test_resource_limits_from_spec() {
+        let spec = serde_json::json!({
+            "linux": {
+                "resources": {
+                    "memory": {
+                        "limit": 1073741824_i64,
+                        "reservation": 134217728_i64
+                    }
+                }
+            }
+        });
+        let (req, lim) = memory_resources_from_spec(&spec);
+        assert_eq!(req, Some(128));
+        assert_eq!(lim, Some(1024));
+    }
+
+    #[test]
+    fn test_apply_resource_limits_enables_hotplug() {
+        let config = apply_resource_limits(default_config(), Some(128), Some(1024));
+        assert_eq!(config.default_memory_mb, 128);
+        assert_eq!(config.hotplug_memory_mb, 896);
+        assert_eq!(config.hotplug_method, "virtio-mem");
+    }
+
+    #[test]
+    fn test_apply_resource_limits_no_limit() {
+        let config = apply_resource_limits(default_config(), Some(256), None);
+        assert_eq!(config.default_memory_mb, 256);
+        assert_eq!(config.hotplug_memory_mb, 0);
+    }
+
+    #[test]
+    fn test_apply_resource_limits_limit_equals_request() {
+        let config = apply_resource_limits(default_config(), Some(512), Some(512));
+        assert_eq!(config.default_memory_mb, 512);
+        assert_eq!(config.hotplug_memory_mb, 0);
     }
 }
