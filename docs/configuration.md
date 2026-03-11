@@ -10,7 +10,7 @@ The shim loads its configuration from `/opt/cloudhv/config.json` at startup.
 | `virtiofsd_binary` | `/usr/libexec/virtiofsd` | Path to virtiofsd |
 | `kernel_path` | — | Path to guest vmlinux |
 | `rootfs_path` | — | Path to guest rootfs.ext4 |
-| `kernel_args` | `console=hvc0 root=/dev/vda rw quiet init=/init net.ifnames=0` | Guest kernel cmdline |
+| `kernel_args` | `console=hvc0 root=/dev/vda rw quiet init=/init net.ifnames=0` | Guest kernel cmdline (see [Architecture Notes](#architecture-notes)) |
 | `default_vcpus` | `1` | Boot vCPUs per VM |
 | `default_memory_mb` | `128` | Boot memory in MiB |
 | `pool_size` | `2` | Pre-warmed VM pool size (0 = disabled) |
@@ -41,6 +41,16 @@ The shim loads its configuration from `/opt/cloudhv/config.json` at startup.
 - `net.ifnames=0` in `kernel_args` is **required for networking**. It forces classic
   interface naming (`eth0`) so the kernel IP_PNP parameter can configure the correct
   device at boot.
+
+#### Architecture Notes
+
+- The default `kernel_args` console device is set at compile time based on the target
+  architecture. On **x86_64** it defaults to `console=hvc0` (virtio console); on
+  **ARM64 (aarch64)** it defaults to `console=ttyAMA0` (PL011 UART). If you override
+  `kernel_args` in the config file, use the correct console for your architecture.
+- The kernel config used to build the guest kernel also differs per architecture:
+  `guest/kernel/configs/microvm.config` for x86_64 and
+  `guest/kernel/configs/microvm-aarch64.config` for ARM64.
 - `pool_size` controls how many VMs are pre-booted and kept ready. Set to `0` to
   disable pooling (every pod gets a cold-booted VM).
 - `max_containers_per_vm` limits density. Each container gets its own hot-plugged
