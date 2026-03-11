@@ -118,15 +118,19 @@ spec:
   ports:
     - port: 80
       targetPort: 5678
-  type: ClusterIP
+  type: LoadBalancer
 EOF
 
 # Wait for the deployment to be ready
 kubectl rollout status deployment echo-cloudhv
 
-# Test via the service
-kubectl run curl-test --image=curlimages/curl:latest --rm -it --restart=Never \
-  -- curl -s http://echo-cloudhv/
+# Get the external IP (may take a minute to provision)
+echo "Waiting for external IP..."
+kubectl get service echo-cloudhv -w
+
+# Once EXTERNAL-IP is assigned:
+EXTERNAL_IP=$(kubectl get service echo-cloudhv -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+curl http://$EXTERNAL_IP/
 # Output: Hello from Cloud Hypervisor on AKS!
 ```
 
