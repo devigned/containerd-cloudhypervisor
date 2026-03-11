@@ -176,31 +176,36 @@ impl CloudHvShim {
     ) -> TtrpcResult<api::CreateTaskResponse> {
         info!("creating sandbox (VM): {}", sandbox_id);
 
-        // Extract network namespace and annotations from the OCI spec
+        // Extract network namespace, annotations, and resource limits from the OCI spec
         let spec_path = std::path::Path::new(bundle_path).join("config.json");
-        let (netns_path, pod_annotations) = if let Ok(data) = std::fs::read_to_string(&spec_path) {
-            if let Ok(spec) = serde_json::from_str::<serde_json::Value>(&data) {
-                let netns = spec
-                    .pointer("/linux/namespaces")
-                    .and_then(|v| v.as_array())
-                    .and_then(|ns| {
-                        ns.iter()
-                            .find(|n| n.get("type").and_then(|t| t.as_str()) == Some("network"))
-                    })
-                    .and_then(|n| n.get("path").and_then(|p| p.as_str()))
-                    .map(String::from);
-                let annotations = crate::annotations::annotations_from_spec(&spec);
-                info!("sandbox netns: {:?}", netns);
-                if !annotations.is_empty() {
-                    info!("sandbox annotations: {:?}", annotations);
+        let (netns_path, pod_annotations, mem_request, mem_limit) =
+            if let Ok(data) = std::fs::read_to_string(&spec_path) {
+                if let Ok(spec) = serde_json::from_str::<serde_json::Value>(&data) {
+                    let netns = spec
+                        .pointer("/linux/namespaces")
+                        .and_then(|v| v.as_array())
+                        .and_then(|ns| {
+                            ns.iter()
+                                .find(|n| n.get("type").and_then(|t| t.as_str()) == Some("network"))
+                        })
+                        .and_then(|n| n.get("path").and_then(|p| p.as_str()))
+                        .map(String::from);
+                    let annotations = crate::annotations::annotations_from_spec(&spec);
+                    let (req, lim) = crate::annotations::memory_resources_from_spec(&spec);
+                    info!("sandbox netns: {:?}", netns);
+                    if !annotations.is_empty() {
+                        info!("sandbox annotations: {:?}", annotations);
+                    }
+                    if req.is_some() || lim.is_some() {
+                        info!("sandbox resources: request={:?}MiB limit={:?}MiB", req, lim);
+                    }
+                    (netns, annotations, req, lim)
+                } else {
+                    (None, std::collections::HashMap::new(), None, None)
                 }
-                (netns, annotations)
             } else {
-                (None, std::collections::HashMap::new())
-            }
-        } else {
-            (None, std::collections::HashMap::new())
-        };
+                (None, std::collections::HashMap::new(), None, None)
+            };
 
         // Set up TAP device in the pod's network namespace
         let (tap_name, tap_mac, ip_config) = if let Some(ref netns) = netns_path {
@@ -232,6 +237,9 @@ impl CloudHvShim {
 
         // Apply pod annotations to override VM resource settings
         let config = crate::annotations::apply_annotations(config, &pod_annotations);
+
+        // Apply OCI resource limits — enables hotplug when limit > request
+        let config = crate::annotations::apply_resource_limits(config, mem_request, mem_limit);
 
         let (vm, agent) = {
             let mut pool = self.pool.lock().await;
@@ -302,6 +310,8 @@ impl CloudHvShim {
         };
         let shared_dir = vm.shared_dir().to_path_buf();
         let vm_id = vm.vm_id().to_string();
+        let api_socket_path = vm.api_socket_path().to_path_buf();
+        let vsock_socket_path = vm.vsock_socket().to_path_buf();
 
         self.vms.lock().unwrap().insert(
             vm_id.clone(),
@@ -309,7 +319,7 @@ impl CloudHvShim {
                 vm,
                 agent,
                 container_count: 0,
-                shared_dir,
+                shared_dir: shared_dir.clone(),
             },
         );
 
@@ -329,6 +339,30 @@ impl CloudHvShim {
         );
 
         info!("sandbox VM {} ready", sandbox_id);
+
+        // Start memory monitor if hotplug is configured (limit > request)
+        if config.hotplug_memory_mb > 0 {
+            let boot_bytes = config.default_memory_mb * 1024 * 1024;
+            let max_bytes = boot_bytes + config.hotplug_memory_mb * 1024 * 1024;
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let monitor_config = crate::memory::MemoryMonitorConfig {
+                boot_memory_bytes: boot_bytes,
+                max_memory_bytes: max_bytes,
+                api_socket: api_socket_path.clone(),
+                vsock_socket: vsock_socket_path.clone(),
+                shared_dir: shared_dir.clone(),
+            };
+            let _monitor = crate::memory::spawn_memory_monitor(monitor_config, shutdown_rx);
+            info!(
+                "memory monitor started: boot={}MiB max={}MiB",
+                config.default_memory_mb,
+                config.default_memory_mb + config.hotplug_memory_mb
+            );
+            // Keep shutdown_tx alive — the monitor stops when the shim process exits.
+            // Using mem::forget since the shim is one-process-per-pod.
+            std::mem::forget(shutdown_tx);
+        }
+
         let mut resp = api::CreateTaskResponse::new();
         resp.pid = std::process::id();
         Ok(resp)

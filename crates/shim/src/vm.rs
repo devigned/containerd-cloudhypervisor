@@ -359,6 +359,16 @@ impl VmManager {
                 &self.state_dir.join("console.log").to_string_lossy(),
             )),
             console: Some(VmConsoleConfig::off()),
+            balloon: if self.config.hotplug_memory_mb > 0
+                && self.config.hotplug_method != "virtio-mem"
+            {
+                Some(VmBalloon {
+                    size: 0,
+                    free_page_reporting: true,
+                })
+            } else {
+                None
+            },
             tpm: if self.config.tpm_enabled {
                 Some(VmTpm {
                     socket: self.tpm_socket.to_string_lossy().to_string(),
@@ -430,6 +440,7 @@ impl VmManager {
             }),
             serial: Some(VmConsoleConfig::off()),
             console: Some(VmConsoleConfig::off()),
+            balloon: None,
             tpm: None,
         };
 

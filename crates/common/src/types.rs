@@ -116,6 +116,8 @@ pub struct VmConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub console: Option<VmConsoleConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub balloon: Option<VmBalloon>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tpm: Option<VmTpm>,
 }
 
@@ -214,4 +216,14 @@ impl VmConsoleConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmTpm {
     pub socket: String,
+}
+
+/// Balloon device for memory reclaim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmBalloon {
+    /// Initial balloon size in bytes (0 = deflated).
+    pub size: u64,
+    /// Enable free page reporting so the host can reclaim freed pages.
+    #[serde(default)]
+    pub free_page_reporting: bool,
 }
