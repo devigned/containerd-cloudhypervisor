@@ -2,7 +2,7 @@
 # package everything into a minimal image for the DaemonSet installer.
 #
 # Usage:
-#   docker build -t cloudhv-installer:latest -f example/aks/installer/Dockerfile .
+#   docker build -t cloudhv-installer:latest -f installer/Dockerfile .
 #
 # The resulting image contains:
 #   /opt/cloudhv/containerd-shim-cloudhv-v1  (host shim binary)
@@ -83,7 +83,7 @@ COPY --from=builder /src/target/release/containerd-shim-cloudhv-v1 ./
 COPY --from=builder /virtiofsd-out/bin/virtiofsd ./
 COPY --from=kernel-builder /kernel/vmlinux ./
 COPY --from=rootfs-builder /rootfs/rootfs.ext4 ./
-COPY example/aks/installer/install.sh ./
+COPY installer/install.sh ./
 
 RUN chmod +x install.sh containerd-shim-cloudhv-v1 virtiofsd
 

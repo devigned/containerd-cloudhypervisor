@@ -143,7 +143,7 @@ jobs:
             /tmp/image-root/opt/cloudhv/
           cp /tmp/artifacts/vmlinux/vmlinux /tmp/image-root/opt/cloudhv/
           cp /tmp/artifacts/rootfs/rootfs.ext4 /tmp/image-root/opt/cloudhv/
-          cp example/aks/installer/install.sh /tmp/image-root/opt/cloudhv/
+          cp installer/install.sh /tmp/image-root/opt/cloudhv/
           chmod +x /tmp/image-root/opt/cloudhv/containerd-shim-cloudhv-v1
           chmod +x /tmp/image-root/opt/cloudhv/install.sh
           # Download virtiofsd

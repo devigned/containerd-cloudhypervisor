@@ -1,150 +1,155 @@
-# AKS Example: VM-Isolated Containers with Cloud Hypervisor
+# Running VM-Isolated Containers on AKS
 
-This example deploys the containerd-cloudhypervisor shim onto an AKS cluster,
-demonstrating VM-isolated container workloads with block device rootfs delivery.
-
-## What This Demo Shows
-
-1. **VM isolation on Kubernetes** — each pod runs inside its own Cloud Hypervisor
-   microVM with a dedicated kernel, providing hardware-level isolation
-2. **Block device rootfs** — container images are delivered as hot-plugged virtio-blk
-   disks (no FUSE), enabling proper mount namespaces and multi-container pods
-3. **Cold start latency** — ~460ms from pod creation to running (257ms VM boot +
-   58ms disk image + 145ms container start)
-
-## Architecture
-
-```text
-┌── AKS Cluster ──────────────────────────────────────────────┐
-│                                                             │
-│  System Pool (D2s_v5)        Worker Pool (D4s_v5, KVM)      │
-│  ┌──────────────┐            ┌────────────────────────────┐ │
-│  │ kube-system  │            │ ┌─ Pod (cloudhv) ────────┐ │ │
-│  │ coredns, etc │            │ │  cloud-hypervisor VMM  │ │ │
-│  └──────────────┘            │ │  ┌───────────────────┐ │ │ │
-│                              │ │  │ Guest VM          │ │ │ │
-│  RuntimeClass: cloudhv       │ │  │  agent → crun     │ │ │ │
-│  ┌──────────────────┐        │ │  │  /dev/vdb (rootfs)│ │ │ │
-│  │ handler: cloudhv │────►   │ │  └───────────────────┘ │ │ │
-│  └──────────────────┘        │ └────────────────────────┘ │ │
-│                              │                            │ │
-│  DaemonSet: installer        │  Installs: shim, kernel,   │ │
-│  (one per node)              │  rootfs, virtiofsd, CH     │ │
-│                              └────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**Container rootfs flow:**
-
-1. containerd pulls image → overlayfs snapshot on host
-2. Shim creates ext4 disk image from snapshot
-3. Hot-plugs disk into VM via Cloud Hypervisor `vm.add-disk` API
-4. Agent discovers `/dev/vdX`, mounts ext4, runs crun
+This example walks through deploying the containerd-cloudhypervisor shim on
+Azure Kubernetes Service using the published Helm chart and release artifacts.
 
 ## Prerequisites
 
-- Azure CLI (`az`) logged in with AKS quota
-- `kubectl` configured
-- Docker with buildx (to build the installer image)
-- A container registry (ACR recommended)
+- Azure CLI (`az`) authenticated
+- `kubectl` and `helm` installed
+- An Azure subscription with quota for D-series VMs
 
-## Quick Start
-
-### 1. Set environment variables
+## 1. Create an AKS Cluster
 
 ```bash
-export AZURE_SUBSCRIPTION="<your-subscription-id>"
-export AZURE_REGION="eastus2"
-export RESOURCE_GROUP="rg-cloudhv-demo"
-export CLUSTER_NAME="aks-cloudhv-demo"
-export INSTALLER_IMAGE="<your-registry>/cloudhv-installer:latest"
+REGION="westus3"
+RG="rg-cloudhv-demo"
+CLUSTER="cloudhv-demo"
+
+# Create resource group
+az group create --name "$RG" --location "$REGION"
+
+# Create cluster with a system node pool
+az aks create \
+  --resource-group "$RG" \
+  --name "$CLUSTER" \
+  --location "$REGION" \
+  --node-count 1 \
+  --node-vm-size Standard_D2s_v5 \
+  --nodepool-name system \
+  --generate-ssh-keys \
+  --network-plugin azure
+
+# Add a worker pool with the cloudhv label (3 nodes with nested virt)
+az aks nodepool add \
+  --resource-group "$RG" \
+  --cluster-name "$CLUSTER" \
+  --name cloudhv \
+  --node-count 3 \
+  --node-vm-size Standard_D4s_v5 \
+  --labels workload=cloudhv
+
+# Get credentials
+az aks get-credentials --resource-group "$RG" --name "$CLUSTER"
 ```
 
-### 2. Build and push the installer image
+## 2. Install the Shim with Helm
 
-From the repository root:
+The Helm chart is published to GHCR as an OCI artifact with each release.
 
 ```bash
-docker buildx build -t "$INSTALLER_IMAGE" -f example/aks/installer/Dockerfile . --push
+# Install the latest release
+helm install cloudhv-installer \
+  oci://ghcr.io/devigned/charts/cloudhv-installer \
+  --version 0.1.2 \
+  --namespace kube-system
 ```
 
-This multi-stage build compiles the shim, agent, guest kernel (with BPF + ACPI
-hot-plug), crun, virtiofsd, and rootfs into a single image.
+This creates:
+- A **DaemonSet** that installs the shim, kernel, rootfs, virtiofsd, and
+  Cloud Hypervisor onto each node labeled `workload=cloudhv`
+- A **RuntimeClass** named `cloudhv` with pod overhead annotations
 
-### 3. Create cluster and deploy
+Verify installation:
 
 ```bash
-# Create AKS cluster with KVM-capable nodes
-bash example/aks/setup.sh
+# Check installer pods (should show Running on each worker node)
+kubectl -n kube-system get pods -l app.kubernetes.io/name=cloudhv-installer
 
-# Install shim on nodes via DaemonSet
-sed "s|INSTALLER_IMAGE_PLACEHOLDER|${INSTALLER_IMAGE}|g" \
-  example/aks/manifests/daemonset.yaml | kubectl apply -f -
-kubectl apply -f example/aks/manifests/runtimeclass.yaml
+# Check installer logs
+kubectl -n kube-system logs -l app.kubernetes.io/name=cloudhv-installer --tail=5
 
-# Wait for installer to complete
-kubectl -n kube-system wait --for=condition=ready pod -l app=cloudhv-installer --timeout=120s
+# Verify RuntimeClass exists
+kubectl get runtimeclass cloudhv
 ```
 
-### 4. Run a VM-isolated container
+## 3. Run a Container in a MicroVM
 
 ```bash
-kubectl run test --image=busybox:latest --restart=Never --runtime-class=cloudhv -- echo hello
-kubectl get pod test        # Should show 1/1 Running
-kubectl delete pod test
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: echo-test
+spec:
+  runtimeClassName: cloudhv
+  containers:
+    - name: echo
+      image: hashicorp/http-echo:latest
+      args: ["-text=Hello from Cloud Hypervisor on AKS!", "-listen=:5678"]
+      ports:
+        - containerPort: 5678
+  restartPolicy: Never
+EOF
+
+# Wait for it to start
+kubectl get pod echo-test -w
+
+# Verify it responds
+POD_IP=$(kubectl get pod echo-test -o jsonpath='{.status.podIP}')
+kubectl run curl-test --image=curlimages/curl:latest --rm -it --restart=Never \
+  -- curl -s "http://$POD_IP:5678/"
+# Output: Hello from Cloud Hypervisor on AKS!
+
+# Check logs
+kubectl logs echo-test
 ```
 
-### 5. Deploy the echo server workload
+## 4. Customize VM Resources (Optional)
+
+Override VM memory and vCPUs per-pod using annotations:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: large-vm-pod
+  annotations:
+    io.cloudhv.config.hypervisor.default_memory: "2048"
+    io.cloudhv.config.hypervisor.default_vcpus: "4"
+spec:
+  runtimeClassName: cloudhv
+  containers:
+    - name: app
+      image: myapp:latest
+```
+
+See [Configuration — Pod Annotations](../../docs/configuration.md#pod-annotations) for
+the full list of supported annotations.
+
+## 5. Clean Up
 
 ```bash
-kubectl apply -f example/aks/manifests/echo-deployment.yaml
-kubectl get pods -l app=echo-cloudhv
+# Delete test pods
+kubectl delete pod echo-test --ignore-not-found
+
+# Uninstall the shim
+helm uninstall cloudhv-installer --namespace kube-system
+
+# Delete the AKS cluster
+az aks delete --resource-group "$RG" --name "$CLUSTER" --yes --no-wait
+az group delete --name "$RG" --yes --no-wait
 ```
 
-## Performance
+## Helm Chart Values
 
-Measured on Azure D8s_v5 (8 vCPU, KVM):
+| Key | Default | Description |
+|-----|---------|-------------|
+| `image.repository` | `ghcr.io/devigned/cloudhv-installer` | Installer image |
+| `image.tag` | `v<appVersion>` | Image tag |
+| `nodeSelector` | `workload: cloudhv` | Target nodes |
+| `runtimeClass.enabled` | `true` | Create RuntimeClass |
+| `runtimeClass.overhead.memory` | `50Mi` | Pod overhead |
 
-| Phase | Latency |
-| ------- | --------- |
-| VM boot (sandbox creation) | 257ms |
-| Container create (disk image + hot-plug) | 58ms |
-| Container start (crun run) | 145ms |
-| **Total cold start** | **~460ms** |
-| Sandbox stop + cleanup | 92ms |
-
-| Resource | Per-VM Overhead |
-| ---------- | ---------------- |
-| Cloud Hypervisor VMM | ~50 MB RSS |
-| virtiofsd | ~5 MB RSS |
-| Shim processes | ~10 MB RSS |
-| VM guest memory | 512 MB (configurable) |
-
-## Files
-
-```text
-example/aks/
-├── README.md                          # This file
-├── setup.sh                           # Create AKS cluster
-├── teardown.sh                        # Delete cluster + resource group
-├── demo.sh                            # Full demo orchestration
-├── installer/
-│   ├── Dockerfile                     # Multi-stage: shim + kernel + rootfs + crun + virtiofsd
-│   └── install.sh                     # Node-level install (copies binaries, patches containerd)
-└── manifests/
-    ├── runtimeclass.yaml              # RuntimeClass: cloudhv
-    ├── daemonset.yaml                 # DaemonSet: shim installer
-    └── echo-deployment.yaml           # Demo: echo server + LoadBalancer
-```
-
-## Cleanup
-
-```bash
-# Delete workloads only
-kubectl delete -f example/aks/manifests/echo-deployment.yaml
-kubectl delete -f example/aks/manifests/runtimeclass.yaml
-kubectl -n kube-system delete daemonset cloudhv-installer
-
-# Delete everything (cluster + resource group)
-bash example/aks/teardown.sh
-```
+See [`charts/cloudhv-installer/values.yaml`](../../charts/cloudhv-installer/values.yaml)
+for all configurable values.
