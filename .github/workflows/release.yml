@@ -19,17 +19,31 @@ env:
 
 jobs:
   build-binaries:
-    name: Build Binaries
-    runs-on: ubuntu-latest
+    name: Build Binaries (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
             package: containerd-shim-cloudhv
             artifact: containerd-shim-cloudhv-v1
+            runner: ubuntu-latest
+            arch: x86_64
           - target: x86_64-unknown-linux-musl
             package: cloudhv-agent
             artifact: cloudhv-agent
+            runner: ubuntu-latest
+            arch: x86_64
+          - target: aarch64-unknown-linux-musl
+            package: containerd-shim-cloudhv
+            artifact: containerd-shim-cloudhv-v1
+            runner: ubuntu-24.04-arm
+            arch: aarch64
+          - target: aarch64-unknown-linux-musl
+            package: cloudhv-agent
+            artifact: cloudhv-agent
+            runner: ubuntu-24.04-arm
+            arch: aarch64
     steps:
       - uses: actions/checkout@v4
 
@@ -54,8 +68,19 @@ jobs:
           path: target/${{ matrix.target }}/release/${{ matrix.artifact }}
 
   build-kernel:
-    name: Build Guest Kernel
-    runs-on: ubuntu-latest
+    name: Build Guest Kernel (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            config: guest/kernel/configs/microvm.config
+            artifact_name: vmlinux-x86_64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            config: guest/kernel/configs/microvm-aarch64.config
+            artifact_name: vmlinux-aarch64
     steps:
       - uses: actions/checkout@v4
 
@@ -64,7 +89,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: guest/kernel/vmlinux
-          key: kernel-${{ env.KERNEL_VERSION }}-${{ hashFiles('guest/kernel/configs/microvm.config', 'guest/kernel/build-kernel.sh') }}
+          key: kernel-${{ matrix.arch }}-${{ env.KERNEL_VERSION }}-${{ hashFiles(matrix.config, 'guest/kernel/build-kernel.sh') }}
 
       - name: Install kernel build dependencies
         if: steps.kernel-cache.outputs.cache-hit != 'true'
@@ -77,20 +102,31 @@ jobs:
       - name: Upload kernel
         uses: actions/upload-artifact@v4
         with:
-          name: vmlinux
+          name: ${{ matrix.artifact_name }}
           path: guest/kernel/vmlinux
 
   build-rootfs:
-    name: Build Guest Rootfs
-    runs-on: ubuntu-latest
+    name: Build Guest Rootfs (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     needs: [build-binaries]
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            agent_artifact: cloudhv-agent-x86_64-unknown-linux-musl
+            rootfs_artifact: rootfs-x86_64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            agent_artifact: cloudhv-agent-aarch64-unknown-linux-musl
+            rootfs_artifact: rootfs-aarch64
     steps:
       - uses: actions/checkout@v4
 
       - name: Download agent binary
         uses: actions/download-artifact@v4
         with:
-          name: cloudhv-agent-x86_64-unknown-linux-musl
+          name: ${{ matrix.agent_artifact }}
           path: /tmp/agent
 
       - name: Build rootfs
@@ -102,54 +138,47 @@ jobs:
       - name: Upload rootfs
         uses: actions/upload-artifact@v4
         with:
-          name: rootfs
+          name: ${{ matrix.rootfs_artifact }}
           path: guest/rootfs/rootfs.ext4
 
   build-installer-image:
-    name: Build & Push Installer Image
+    name: Build & Push Installer Image (multi-arch)
     runs-on: ubuntu-latest
     needs: [build-binaries, build-kernel, build-rootfs]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download shim binary
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          name: containerd-shim-cloudhv-v1-x86_64-unknown-linux-musl
-          path: /tmp/artifacts/containerd-shim-cloudhv-v1-x86_64-unknown-linux-musl
+          path: /tmp/artifacts
 
-      - name: Download agent binary
-        uses: actions/download-artifact@v4
-        with:
-          name: cloudhv-agent-x86_64-unknown-linux-musl
-          path: /tmp/artifacts/cloudhv-agent-x86_64-unknown-linux-musl
-
-      - name: Download kernel
-        uses: actions/download-artifact@v4
-        with:
-          name: vmlinux
-          path: /tmp/artifacts/vmlinux
-
-      - name: Download rootfs
-        uses: actions/download-artifact@v4
-        with:
-          name: rootfs
-          path: /tmp/artifacts/rootfs
-
-      - name: Prepare image contents
+      - name: Prepare image contents (amd64)
         run: |
-          mkdir -p /tmp/image-root/opt/cloudhv
+          mkdir -p /tmp/image-root-amd64/opt/cloudhv
           cp /tmp/artifacts/containerd-shim-cloudhv-v1-x86_64-unknown-linux-musl/containerd-shim-cloudhv-v1 \
-            /tmp/image-root/opt/cloudhv/
-          cp /tmp/artifacts/vmlinux/vmlinux /tmp/image-root/opt/cloudhv/
-          cp /tmp/artifacts/rootfs/rootfs.ext4 /tmp/image-root/opt/cloudhv/
-          cp installer/install.sh /tmp/image-root/opt/cloudhv/
-          chmod +x /tmp/image-root/opt/cloudhv/containerd-shim-cloudhv-v1
-          chmod +x /tmp/image-root/opt/cloudhv/install.sh
-          # Download virtiofsd
+            /tmp/image-root-amd64/opt/cloudhv/
+          cp /tmp/artifacts/vmlinux-x86_64/vmlinux /tmp/image-root-amd64/opt/cloudhv/
+          cp /tmp/artifacts/rootfs-x86_64/rootfs.ext4 /tmp/image-root-amd64/opt/cloudhv/
+          cp installer/install.sh /tmp/image-root-amd64/opt/cloudhv/
+          chmod +x /tmp/image-root-amd64/opt/cloudhv/containerd-shim-cloudhv-v1
+          chmod +x /tmp/image-root-amd64/opt/cloudhv/install.sh
+          # Download virtiofsd for amd64
           sudo apt-get update && sudo apt-get install -y virtiofsd
-          cp /usr/libexec/virtiofsd /tmp/image-root/opt/cloudhv/
-          ls -lh /tmp/image-root/opt/cloudhv/
+          cp /usr/libexec/virtiofsd /tmp/image-root-amd64/opt/cloudhv/
+          ls -lh /tmp/image-root-amd64/opt/cloudhv/
+
+      - name: Prepare image contents (arm64)
+        run: |
+          mkdir -p /tmp/image-root-arm64/opt/cloudhv
+          cp /tmp/artifacts/containerd-shim-cloudhv-v1-aarch64-unknown-linux-musl/containerd-shim-cloudhv-v1 \
+            /tmp/image-root-arm64/opt/cloudhv/
+          cp /tmp/artifacts/vmlinux-aarch64/vmlinux /tmp/image-root-arm64/opt/cloudhv/
+          cp /tmp/artifacts/rootfs-aarch64/rootfs.ext4 /tmp/image-root-arm64/opt/cloudhv/
+          cp installer/install.sh /tmp/image-root-arm64/opt/cloudhv/
+          chmod +x /tmp/image-root-arm64/opt/cloudhv/containerd-shim-cloudhv-v1
+          chmod +x /tmp/image-root-arm64/opt/cloudhv/install.sh
+          ls -lh /tmp/image-root-arm64/opt/cloudhv/
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -158,6 +187,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set up QEMU (for multi-arch builds)
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -165,18 +197,37 @@ jobs:
         id: version
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push installer image
+      - name: Build and push installer image (amd64)
         uses: docker/build-push-action@v6
         with:
-          context: /tmp/image-root
+          context: /tmp/image-root-amd64
           file: .github/Dockerfile.installer
+          platforms: linux/amd64
           push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-amd64
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.version=${{ steps.version.outputs.VERSION }}
+
+      - name: Build and push installer image (arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: /tmp/image-root-arm64
+          file: .github/Dockerfile.installer
+          platforms: linux/arm64
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-arm64
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.version.outputs.VERSION }}
+
+      - name: Create and push multi-arch manifest
+        run: |
+          docker buildx imagetools create \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }} \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-amd64 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-arm64
 
   release:
     name: Create GitHub Release
@@ -187,41 +238,32 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download shim binary
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          name: containerd-shim-cloudhv-v1-x86_64-unknown-linux-musl
-          path: /tmp/artifacts/containerd-shim-cloudhv-v1-x86_64-unknown-linux-musl
-
-      - name: Download agent binary
-        uses: actions/download-artifact@v4
-        with:
-          name: cloudhv-agent-x86_64-unknown-linux-musl
-          path: /tmp/artifacts/cloudhv-agent-x86_64-unknown-linux-musl
-
-      - name: Download kernel
-        uses: actions/download-artifact@v4
-        with:
-          name: vmlinux
-          path: /tmp/artifacts/vmlinux
-
-      - name: Download rootfs
-        uses: actions/download-artifact@v4
-        with:
-          name: rootfs
-          path: /tmp/artifacts/rootfs
+          path: /tmp/artifacts
 
       - name: Prepare release assets
         run: |
           mkdir -p /tmp/release
+          # x86_64
           cp /tmp/artifacts/containerd-shim-cloudhv-v1-x86_64-unknown-linux-musl/containerd-shim-cloudhv-v1 \
             /tmp/release/containerd-shim-cloudhv-v1-linux-amd64
           cp /tmp/artifacts/cloudhv-agent-x86_64-unknown-linux-musl/cloudhv-agent \
             /tmp/release/cloudhv-agent-linux-amd64
-          cp /tmp/artifacts/vmlinux/vmlinux /tmp/release/vmlinux
-          cp /tmp/artifacts/rootfs/rootfs.ext4 /tmp/release/rootfs.ext4
+          cp /tmp/artifacts/vmlinux-x86_64/vmlinux /tmp/release/vmlinux-amd64
+          cp /tmp/artifacts/rootfs-x86_64/rootfs.ext4 /tmp/release/rootfs-amd64.ext4
           chmod +x /tmp/release/containerd-shim-cloudhv-v1-linux-amd64
           chmod +x /tmp/release/cloudhv-agent-linux-amd64
+          # aarch64
+          cp /tmp/artifacts/containerd-shim-cloudhv-v1-aarch64-unknown-linux-musl/containerd-shim-cloudhv-v1 \
+            /tmp/release/containerd-shim-cloudhv-v1-linux-arm64
+          cp /tmp/artifacts/cloudhv-agent-aarch64-unknown-linux-musl/cloudhv-agent \
+            /tmp/release/cloudhv-agent-linux-arm64
+          cp /tmp/artifacts/vmlinux-aarch64/vmlinux /tmp/release/vmlinux-arm64
+          cp /tmp/artifacts/rootfs-aarch64/rootfs.ext4 /tmp/release/rootfs-arm64.ext4
+          chmod +x /tmp/release/containerd-shim-cloudhv-v1-linux-arm64
+          chmod +x /tmp/release/cloudhv-agent-linux-arm64
           # Generate checksums
           cd /tmp/release && sha256sum * > checksums-sha256.txt
 

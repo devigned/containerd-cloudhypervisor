@@ -35,6 +35,11 @@ bash build-kernel.sh    # Downloads Linux 6.12.8, applies minimal config, builds
 The kernel config (`guest/kernel/configs/microvm.config`) includes only what's needed:
 PVH boot, virtio (blk, net, vsock, fs), BPF/cgroup v2, ACPI hot-plug, IP_PNP.
 
+For ARM64 builds, the script auto-detects `aarch64` and uses
+`guest/kernel/configs/microvm-aarch64.config` instead, which replaces PVH boot with
+direct kernel boot, uses PL011 serial (`SERIAL_AMBA_PL011`) instead of 8250, and
+enables the ARM GIC interrupt controller.
+
 ### Rootfs
 
 ```bash
@@ -95,6 +100,20 @@ make remote-test REMOTE_HOST=user@host
 make remote-integration REMOTE_HOST=user@host
 ```
 
+## ARM64 Builds
+
+The project supports ARM64 (aarch64) natively. The same `make build` and `cargo build`
+commands work on ARM64 hosts — architecture is auto-detected at build time.
+
+Key differences on ARM64:
+
+- **Target triple**: `aarch64-unknown-linux-musl` (agent), `aarch64-unknown-linux-gnu` (shim)
+- **Console device**: the shim compiles with `console=ttyAMA0` (PL011 UART) instead of `hvc0`
+- **Guest kernel config**: `build-kernel.sh` selects `guest/kernel/configs/microvm-aarch64.config`
+  automatically on aarch64 hosts
+- **CI runners**: ARM64 CI jobs run on `ubuntu-24.04-arm` runners
+- **Cloud Hypervisor**: requires the `cloud-hypervisor-static-aarch64` binary
+
 ## Contributing
 
 1. **Fork and clone** the repository
@@ -114,6 +133,7 @@ make remote-integration REMOTE_HOST=user@host
    ```
 
 5. **Submit a PR** — CI runs lint, build (gnu + musl), unit tests, and integration tests with KVM
+   on both x86_64 and ARM64 (aarch64) runners
 
 ## Code Quality Standards
 

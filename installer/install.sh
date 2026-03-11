@@ -9,7 +9,24 @@ set -euo pipefail
 ARTIFACTS=/opt/cloudhv
 HOST=/host
 
-echo "[cloudhv] Installing on $(cat /host/etc/hostname)..."
+# Detect architecture
+HOST_ARCH="$(uname -m)"
+case "${HOST_ARCH}" in
+    x86_64)
+        CH_ARCH_SUFFIX="static"
+        KERNEL_CONSOLE="console=ttyS0"
+        ;;
+    aarch64)
+        CH_ARCH_SUFFIX="static-aarch64"
+        KERNEL_CONSOLE="console=ttyAMA0"
+        ;;
+    *)
+        echo "[cloudhv] ERROR: unsupported architecture: ${HOST_ARCH}"
+        exit 1
+        ;;
+esac
+
+echo "[cloudhv] Installing on $(cat /host/etc/hostname) (${HOST_ARCH})..."
 
 # 1. Copy binaries
 echo "[cloudhv] Copying shim binary..."
@@ -27,13 +44,13 @@ install -m 644 "$ARTIFACTS/rootfs.ext4" "$HOST/opt/cloudhv/rootfs.ext4"
 
 # 3. Write runtime config
 echo "[cloudhv] Writing runtime config..."
-cat > "$HOST/opt/cloudhv/config.json" << 'CONFIG'
+cat > "$HOST/opt/cloudhv/config.json" << CONFIG
 {
   "cloud_hypervisor_binary": "/usr/local/bin/cloud-hypervisor",
   "virtiofsd_binary": "/usr/libexec/virtiofsd",
   "kernel_path": "/opt/cloudhv/vmlinux",
   "rootfs_path": "/opt/cloudhv/rootfs.ext4",
-  "kernel_args": "console=ttyS0 root=/dev/vda rw init=/init net.ifnames=0",
+  "kernel_args": "${KERNEL_CONSOLE} root=/dev/vda rw init=/init net.ifnames=0",
   "default_vcpus": 1,
   "default_memory_mb": 512,
   "pool_size": 2,
@@ -85,9 +102,9 @@ fi
 
 # 5. Install cloud-hypervisor and virtiofsd if not present
 if [ ! -f "$HOST/usr/local/bin/cloud-hypervisor" ]; then
-  echo "[cloudhv] Installing cloud-hypervisor..."
+  echo "[cloudhv] Installing cloud-hypervisor (${HOST_ARCH})..."
   CH_VERSION="v44.0"
-  curl -sL "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-static" \
+  curl -sL "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-${CH_ARCH_SUFFIX}" \
     -o "$HOST/usr/local/bin/cloud-hypervisor"
   chmod 755 "$HOST/usr/local/bin/cloud-hypervisor"
 fi

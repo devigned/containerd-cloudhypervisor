@@ -37,8 +37,9 @@ containerd           │                                                        
   OCI specs, delegates to crun.
 - **Communication**: vsock + ttrpc — no network stack for the control plane.
 - **Container runtime**: crun (1.8 MB static) — lighter than runc (10 MB).
-- **Kernel**: Custom kernel (~27 MB) with PVH boot, virtio, vsock, BPF, ACPI hot-plug,
-  IP_PNP, and virtio-net.
+- **Kernel**: Custom kernel (~27 MB) with virtio, vsock, BPF, ACPI hot-plug,
+  IP_PNP, and virtio-net. Supports both x86_64 (PVH boot, `console=hvc0`) and
+  ARM64/aarch64 (direct kernel boot, PL011 serial `console=ttyAMA0`).
 
 ## Sandbox and Container Split
 

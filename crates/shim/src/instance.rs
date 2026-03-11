@@ -82,8 +82,14 @@ impl Shim for CloudHvShim {
                 default_memory_mb: cloudhv_common::DEFAULT_MEMORY_MB,
                 vsock_port: cloudhv_common::AGENT_VSOCK_PORT,
                 agent_startup_timeout_secs: cloudhv_common::AGENT_STARTUP_TIMEOUT_SECS,
-                kernel_args: "console=hvc0 root=/dev/vda rw quiet init=/init net.ifnames=0"
-                    .to_string(),
+                kernel_args: {
+                    let console = if cfg!(target_arch = "aarch64") {
+                        "ttyAMA0"
+                    } else {
+                        "hvc0"
+                    };
+                    format!("console={console} root=/dev/vda rw quiet init=/init net.ifnames=0")
+                },
                 debug: false,
                 pool_size: cloudhv_common::DEFAULT_POOL_SIZE,
                 max_containers_per_vm: cloudhv_common::DEFAULT_MAX_CONTAINERS_PER_VM,

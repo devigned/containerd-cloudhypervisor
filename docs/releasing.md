@@ -22,14 +22,18 @@ Pre-release tags like `v0.2.0-beta.1` are also supported.
 ### GitHub Release
 
 The release page at `github.com/devigned/containerd-cloudhypervisor/releases`
-contains downloadable binaries and checksums:
+contains downloadable binaries and checksums for both amd64 and arm64:
 
 | Asset | Description |
 |-------|-------------|
-| `containerd-shim-cloudhv-v1-linux-amd64` | Host shim binary |
-| `cloudhv-agent-linux-amd64` | Guest agent (static musl) |
-| `vmlinux` | Guest kernel (PVH boot, virtio, vsock, IP_PNP) |
-| `rootfs.ext4` | Guest rootfs (agent + crun, 16 MB) |
+| `containerd-shim-cloudhv-v1-linux-amd64` | Host shim binary (x86_64) |
+| `containerd-shim-cloudhv-v1-linux-arm64` | Host shim binary (aarch64) |
+| `cloudhv-agent-linux-amd64` | Guest agent (x86_64, static musl) |
+| `cloudhv-agent-linux-arm64` | Guest agent (aarch64, static musl) |
+| `vmlinux` | Guest kernel — x86_64 (PVH boot, virtio, vsock, IP_PNP) |
+| `vmlinux-arm64` | Guest kernel — aarch64 (direct boot, PL011, ARM GIC) |
+| `rootfs.ext4` | Guest rootfs — x86_64 (agent + crun, 16 MB) |
+| `rootfs-arm64.ext4` | Guest rootfs — aarch64 (agent + crun) |
 | `cloudhv-installer-chart-<version>.tgz` | Helm chart archive |
 | `checksums-sha256.txt` | SHA-256 checksums for all assets |
 
@@ -37,10 +41,11 @@ contains downloadable binaries and checksums:
 
 | Image | Purpose |
 |-------|---------|
-| `ghcr.io/devigned/cloudhv-installer:<tag>` | DaemonSet installer image |
+| `ghcr.io/devigned/cloudhv-installer:<tag>` | DaemonSet installer image (multi-arch: amd64 + arm64) |
 | `ghcr.io/devigned/charts/cloudhv-installer:<version>` | Helm chart (OCI) |
 
-Both are tagged with the release version and `latest`.
+Both are tagged with the release version and `latest`. The installer image is a
+multi-arch manifest — `docker pull` automatically selects the correct platform.
 
 ## Release Notes
 
@@ -64,25 +69,26 @@ the container image.
 
 ### Bare Linux (binaries)
 
-Download from the GitHub Release page:
+Download from the GitHub Release page (use `arm64` suffix for aarch64 hosts):
 
 ```bash
 VERSION="v0.1.0"
+ARCH="amd64"  # or "arm64" for aarch64
 BASE="https://github.com/devigned/containerd-cloudhypervisor/releases/download/$VERSION"
 
 # Download and install
-wget "$BASE/containerd-shim-cloudhv-v1-linux-amd64"
-wget "$BASE/vmlinux"
-wget "$BASE/rootfs.ext4"
+wget "$BASE/containerd-shim-cloudhv-v1-linux-${ARCH}"
+wget "$BASE/vmlinux$([ "$ARCH" = "arm64" ] && echo "-arm64")"
+wget "$BASE/rootfs$([ "$ARCH" = "arm64" ] && echo "-arm64").ext4"
 wget "$BASE/checksums-sha256.txt"
 
 # Verify checksums
-sha256sum -c checksums-sha256.txt
+sha256sum -c checksums-sha256.txt --ignore-missing
 
 # Install
-sudo install -m 755 containerd-shim-cloudhv-v1-linux-amd64 /usr/local/bin/containerd-shim-cloudhv-v1
+sudo install -m 755 "containerd-shim-cloudhv-v1-linux-${ARCH}" /usr/local/bin/containerd-shim-cloudhv-v1
 sudo mkdir -p /opt/cloudhv
-sudo cp vmlinux rootfs.ext4 /opt/cloudhv/
+sudo cp vmlinux* rootfs*.ext4 /opt/cloudhv/
 ```
 
 Then create `/opt/cloudhv/config.json` — see [Configuration](configuration.md).
@@ -155,8 +161,9 @@ build-rootfs ────┘                           │
   (creates GitHub Release, pushes Helm to GHCR)
 ```
 
-1. **build-binaries**: compiles shim (gnu) and agent (musl) in parallel
-2. **build-kernel**: builds or restores cached guest kernel
-3. **build-rootfs**: creates rootfs ext4 image with agent + crun
-4. **build-installer-image**: packages everything into a container, pushes to GHCR
-5. **release**: creates GitHub Release with binaries, checksums, Helm chart, and notes
+1. **build-binaries**: compiles shim (gnu) and agent (musl) in parallel for both x86_64 and aarch64
+2. **build-kernel**: builds or restores cached guest kernel (per architecture)
+3. **build-rootfs**: creates rootfs ext4 image with agent + crun (per architecture)
+4. **build-installer-image**: packages arch-specific artifacts into per-platform images,
+   then creates a multi-arch manifest combining amd64 and arm64
+5. **release**: creates GitHub Release with all binaries, checksums, Helm chart, and notes
