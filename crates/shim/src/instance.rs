@@ -62,6 +62,8 @@ pub struct CloudHvInstance {
     exit: WaitableCell<(u32, DateTime<Utc>)>,
     is_sandbox: bool,
     sandbox_id: String,
+    stdout: PathBuf,
+    stderr: PathBuf,
 }
 
 impl Instance for CloudHvInstance {
@@ -77,6 +79,8 @@ impl Instance for CloudHvInstance {
             exit: WaitableCell::new(),
             is_sandbox,
             sandbox_id,
+            stdout: cfg.stdout.clone(),
+            stderr: cfg.stderr.clone(),
         })
     }
 
@@ -394,6 +398,33 @@ impl CloudHvInstance {
 
         vm_state.container_count.fetch_add(1, Ordering::SeqCst);
 
+        // Forward container stdout/stderr from virtio-fs files to containerd FIFOs.
+        // This makes `kubectl logs` and `crictl logs` work.
+        // We open the FIFOs synchronously here (before start returns) so containerd's
+        // reader sees an active writer and doesn't get EOF.
+        let stdout_src = io_dir.join("stdout");
+        let stderr_src = io_dir.join("stderr");
+        let stdout_dst = self.stdout.to_string_lossy().to_string();
+        let stderr_dst = self.stderr.to_string_lossy().to_string();
+        if !stdout_dst.is_empty() {
+            let fifo = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&stdout_dst);
+            if let Ok(fifo) = fifo {
+                tokio::spawn(forward_output(stdout_src, fifo));
+            }
+        }
+        if !stderr_dst.is_empty() {
+            let fifo = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&stderr_dst);
+            if let Ok(fifo) = fifo {
+                tokio::spawn(forward_output(stderr_src, fifo));
+            }
+        }
+
         // Background task monitors container exit via agent WaitContainer RPC
         let exit = self.exit.clone();
         let cid = container_id.to_string();
@@ -416,6 +447,58 @@ impl CloudHvInstance {
         let pid = start_resp.pid;
         info!("started container {} pid={}", container_id, pid);
         Ok(pid)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// I/O forwarding
+// ---------------------------------------------------------------------------
+
+/// Forward container output from a virtio-fs file to an already-opened containerd FIFO.
+///
+/// The agent writes crun's stdout/stderr to files in the virtio-fs shared
+/// directory. This task tails the file and writes to the FIFO so that
+/// `crictl logs` and `kubectl logs` work.
+async fn forward_output(src: std::path::PathBuf, fifo: std::fs::File) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    // Wait for the source file to appear (agent creates it on container start)
+    for _ in 0..100 {
+        if src.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let src_file = match tokio::fs::File::open(&src).await {
+        Ok(f) => f,
+        Err(e) => {
+            info!("I/O forward: can't open source {}: {e}", src.display());
+            return;
+        }
+    };
+
+    let mut reader = BufReader::new(src_file);
+    let mut writer = tokio::fs::File::from_std(fifo);
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => {
+                // EOF — file may still be written to, poll
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                if tokio::fs::metadata(&src).await.is_err() {
+                    break; // File removed, stop
+                }
+            }
+            Ok(_) => {
+                if writer.write_all(line.as_bytes()).await.is_err() {
+                    break; // FIFO reader disconnected
+                }
+            }
+            Err(_) => break,
+        }
     }
 }
 

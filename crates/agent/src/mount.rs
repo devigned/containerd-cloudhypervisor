@@ -4,6 +4,7 @@ use anyhow::Result;
 #[cfg(target_os = "linux")]
 use log::debug;
 use log::info;
+use log::warn;
 
 #[cfg(target_os = "linux")]
 use cloudhv_common::{VIRTIOFS_GUEST_MOUNT, VIRTIOFS_TAG};
@@ -100,22 +101,38 @@ pub fn mount_virtiofs() -> Result<()> {
     std::fs::create_dir_all(mount_point)
         .with_context(|| format!("failed to create mount point: {mount_point}"))?;
 
-    info!(
-        "mounting virtio-fs: tag={} at {}",
-        VIRTIOFS_TAG, mount_point
-    );
-
-    mount(
-        Some(VIRTIOFS_TAG),
-        mount_point,
-        Some("virtiofs"),
-        MsFlags::empty(),
-        None::<&str>,
-    )
-    .with_context(|| format!("failed to mount virtio-fs tag={VIRTIOFS_TAG} at {mount_point}"))?;
-
-    info!("virtio-fs mounted at {}", mount_point);
-    Ok(())
+    // Retry the mount — the virtio-fs device may not be ready immediately
+    // after the kernel boots (vhost-user handshake with virtiofsd is async).
+    for attempt in 1..=10 {
+        match mount(
+            Some(VIRTIOFS_TAG),
+            mount_point,
+            Some("virtiofs"),
+            MsFlags::empty(),
+            None::<&str>,
+        ) {
+            Ok(()) => {
+                info!("virtio-fs mounted at {} (attempt {})", mount_point, attempt);
+                return Ok(());
+            }
+            Err(e) if attempt < 10 => {
+                warn!(
+                    "virtio-fs mount attempt {}/10 failed: {} (retrying in 100ms)",
+                    attempt, e
+                );
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => {
+                anyhow::bail!(
+                    "failed to mount virtio-fs tag={} at {} after 10 attempts: {}",
+                    VIRTIOFS_TAG,
+                    mount_point,
+                    e
+                );
+            }
+        }
+    }
+    unreachable!()
 }
 
 #[cfg(not(target_os = "linux"))]
