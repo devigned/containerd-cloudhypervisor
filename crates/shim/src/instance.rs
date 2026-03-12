@@ -460,24 +460,45 @@ impl CloudHvInstance {
             None
         };
 
-        // Background task monitors container exit via agent WaitContainer RPC.
-        // When the container exits, abort the forward_output tasks to release
-        // the FIFO file descriptors — shimkit needs them closed for exit detection.
+        // Watch for exit file in virtio-fs shared directory (fast path),
+        // with WaitContainer RPC as fallback if the exit file never appears.
         let exit = self.exit.clone();
         let cid = container_id.to_string();
-        let agent_clone = agent.clone();
+        let exit_file = io_dir.join("exit");
+        let fallback_agent = agent.clone();
         tokio::spawn(async move {
-            let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
-            wait_req.container_id = cid.clone();
-            let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(86400));
-            let exit_code = match agent_clone.wait_container(ctx, &wait_req).await {
-                Ok(resp) => resp.exit_status,
-                Err(e) => {
-                    info!("wait_container RPC error for {}: {e}", cid);
-                    137
+            // Fast path: poll for exit file (10ms resolution, near-instant via virtio-fs)
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            let exit_code = loop {
+                if exit_file.exists() {
+                    let code = std::fs::read_to_string(&exit_file)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                        .unwrap_or(137);
+                    info!("container {} exited with code {} (exit file)", cid, code);
+                    break code;
                 }
+                if tokio::time::Instant::now() >= deadline {
+                    // Fallback: WaitContainer RPC (handles agent panic / missing exit file)
+                    info!(
+                        "container {}: exit file not found after 30s, falling back to RPC",
+                        cid
+                    );
+                    let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
+                    wait_req.container_id = cid.clone();
+                    let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(600));
+                    let code = match fallback_agent.wait_container(ctx, &wait_req).await {
+                        Ok(resp) => resp.exit_status,
+                        Err(e) => {
+                            info!("wait_container RPC fallback error for {}: {e}", cid);
+                            137
+                        }
+                    };
+                    info!("container {} exited with code {} (RPC fallback)", cid, code);
+                    break code;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             };
-            info!("container {} exited with code {}", cid, exit_code);
 
             // Abort I/O forwarding to close FIFOs
             if let Some(h) = stdout_handle {
@@ -650,7 +671,7 @@ fn create_rootfs_disk_image(
     let status = Command::new("cp")
         .args(["-a", "--"])
         .arg(format!("{}/.", rootfs_path.display()))
-        .arg(&staging.join("rootfs"))
+        .arg(staging.join("rootfs"))
         .status()
         .context("cp rootfs to staging dir")?;
     if !status.success() {
