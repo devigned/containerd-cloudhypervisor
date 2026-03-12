@@ -83,6 +83,7 @@ impl TestFixtures {
             hotplug_memory_mb: 0,
             hotplug_method: "acpi".to_string(),
             tpm_enabled: false,
+            pool_size: 0,
         }
     }
 }

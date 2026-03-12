@@ -284,6 +284,9 @@ impl ContainerManager {
     ) -> Result<u32> {
         info!("creating container: id={}", container_id);
 
+        // Ensure virtio-fs is mounted (may not be after snapshot restore)
+        crate::mount::ensure_virtiofs_mounted();
+
         // The bundle_path from the shim tells us the guest mount point.
         // The host has already hot-plugged a block device containing the
         // rootfs + config.json. We need to find and mount it.

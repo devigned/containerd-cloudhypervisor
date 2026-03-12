@@ -141,6 +141,20 @@ pub fn mount_virtiofs() -> Result<()> {
     Ok(())
 }
 
+/// Ensure virtio-fs is mounted. Called before container operations that need
+/// the shared directory (e.g. stdout/stderr file creation). This handles the
+/// case where the VM was restored from a snapshot — the agent's init-time
+/// mount may have failed because virtiofsd wasn't available yet.
+pub fn ensure_virtiofs_mounted() {
+    if is_mounted(cloudhv_common::VIRTIOFS_GUEST_MOUNT) {
+        return;
+    }
+    info!("virtio-fs not mounted, attempting mount (post-restore)");
+    if let Err(e) = mount_virtiofs() {
+        warn!("virtio-fs mount retry failed: {e}");
+    }
+}
+
 /// Helper: mount a filesystem if the target is not already mounted.
 #[cfg(target_os = "linux")]
 fn mount_if_needed(

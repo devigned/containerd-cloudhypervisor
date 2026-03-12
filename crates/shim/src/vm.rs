@@ -86,6 +86,51 @@ impl VmManager {
         })
     }
 
+    /// Wrap an already-running Cloud Hypervisor process (restored from
+    /// a golden snapshot) into a VmManager. The VM is already booted and
+    /// the agent is reachable — no boot sequence needed.
+    ///
+    /// Note: restored VMs have no virtiofs (snapshot excludes it), so
+    /// `shared_dir()` exists but virtiofs is not mounted inside the guest.
+    pub fn from_restored(restored: crate::snapshot::RestoredVm, config: RuntimeConfig) -> Self {
+        let vm_id = restored
+            .state_dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let cid = allocate_cid();
+        let state_dir = restored.state_dir;
+        let shared_dir = state_dir.join("shared");
+        // Create shared dir for virtiofsd (not present in snapshot state)
+        std::fs::create_dir_all(&shared_dir).ok();
+        let virtiofsd_socket = state_dir.join("virtiofsd.sock");
+        let tpm_socket = state_dir.join("tpm.sock");
+
+        info!(
+            "VmManager from restored snapshot: vm_id={}, state_dir={}",
+            vm_id,
+            state_dir.display()
+        );
+
+        Self {
+            vm_id,
+            cid,
+            state_dir,
+            api_socket: restored.api_socket,
+            vsock_socket: restored.vsock_socket,
+            virtiofsd_socket,
+            shared_dir,
+            tpm_socket,
+            ch_process: Some(restored.ch_process),
+            virtiofsd_process: None,
+            #[cfg(all(target_os = "linux", feature = "embedded-virtiofsd"))]
+            virtiofsd_backend: None,
+            swtpm_process: None,
+            config,
+        }
+    }
+
     /// Prepare the state directory and shared filesystem.
     pub async fn prepare(&self) -> Result<()> {
         tokio::fs::create_dir_all(&self.shared_dir)
@@ -215,6 +260,11 @@ impl VmManager {
         };
         self.ch_process = Some(child);
         Ok(())
+    }
+
+    /// Start CH without a network namespace.
+    pub fn spawn_vmm(&mut self) -> Result<()> {
+        self.spawn_vmm_in_netns(None)
     }
 
     /// Wait for CH API socket to appear.
@@ -466,6 +516,98 @@ impl VmManager {
     /// Send an HTTP request to the Cloud Hypervisor API over Unix socket.
     async fn api_request(&self, method: &str, path: &str, body: Option<&str>) -> Result<String> {
         Self::api_request_to_socket(&self.api_socket, method, path, body).await
+    }
+
+    /// Boot a minimal VM for creating a golden snapshot.
+    ///
+    /// This boots without virtiofs (which blocks snapshot/restore due to
+    /// vhost-user protocol state). The VM has only: kernel, rootfs disk,
+    /// and vsock — enough for the agent to boot and be reachable.
+    pub async fn create_and_boot_vm_for_snapshot(&self) -> Result<()> {
+        let vm_config = VmConfig {
+            payload: VmPayload {
+                kernel: self.config.kernel_path.clone(),
+                cmdline: Some(self.config.kernel_args.clone()),
+                initramfs: None,
+            },
+            cpus: VmCpus {
+                boot_vcpus: self.config.default_vcpus,
+                max_vcpus: std::cmp::max(
+                    self.config.default_vcpus,
+                    std::thread::available_parallelism()
+                        .map(|n| n.get() as u32)
+                        .unwrap_or(self.config.default_vcpus),
+                ),
+            },
+            memory: VmMemory {
+                size: self.config.default_memory_mb * 1024 * 1024,
+                shared: true,
+                hotplug_size: None,
+                hotplug_method: None,
+            },
+            disks: vec![VmDisk {
+                path: self.config.rootfs_path.clone(),
+                readonly: false,
+                id: None,
+            }],
+            net: vec![],
+            fs: vec![],
+            vsock: Some(VmVsock {
+                cid: self.cid,
+                socket: self.vsock_socket.to_string_lossy().to_string(),
+            }),
+            serial: Some(VmConsoleConfig::off()),
+            console: Some(VmConsoleConfig::off()),
+            balloon: None,
+            tpm: None,
+        };
+
+        let config_json = serde_json::to_string(&vm_config)?;
+        debug!("VM snapshot config: {}", config_json);
+
+        self.api_request("PUT", "/api/v1/vm.create", Some(&config_json))
+            .await
+            .context("failed to create VM for snapshot")?;
+
+        self.api_request("PUT", "/api/v1/vm.boot", None)
+            .await
+            .context("failed to boot VM for snapshot")?;
+
+        info!(
+            "VM {} created for snapshot (cid={}, no virtiofs)",
+            self.vm_id, self.cid
+        );
+        Ok(())
+    }
+
+    /// Pause the VM and write a snapshot to `destination`.
+    pub async fn snapshot(&self, destination: &Path) -> Result<()> {
+        self.api_request("PUT", "/api/v1/vm.pause", None)
+            .await
+            .context("vm.pause")?;
+
+        let body = serde_json::to_string(&serde_json::json!({
+            "destination_url": format!("file://{}", destination.display())
+        }))?;
+        self.api_request("PUT", "/api/v1/vm.snapshot", Some(&body))
+            .await
+            .context("vm.snapshot")?;
+
+        info!(
+            "VM {} snapshot saved to {}",
+            self.vm_id,
+            destination.display()
+        );
+        Ok(())
+    }
+
+    /// Resume a paused VM.
+    pub async fn resume(&self) -> Result<()> {
+        self.api_request("PUT", "/api/v1/vm.resume", None)
+            .await
+            .context("vm.resume")?;
+        info!("VM {} resumed", self.vm_id);
+        Ok(())
     }
 
     /// Shutdown the VM gracefully.

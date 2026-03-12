@@ -57,6 +57,10 @@ pub struct RuntimeConfig {
     /// Enable TPM 2.0 device (requires swtpm installed on host)
     #[serde(default)]
     pub tpm_enabled: bool,
+
+    /// Number of pre-warmed VMs in the snapshot pool (0 = disabled).
+    #[serde(default)]
+    pub pool_size: usize,
 }
 
 fn default_ch_binary() -> String {

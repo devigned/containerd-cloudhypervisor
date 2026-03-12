@@ -36,6 +36,10 @@ const CRI_SANDBOX_ID: &str = "/annotations/io.kubernetes.cri.sandbox-id";
 static VMS: LazyLock<RwLock<HashMap<String, Arc<SharedVmState>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
+/// Optional pre-warmed VM pool (pool_size > 0 enables it).
+static POOL: LazyLock<std::sync::Mutex<Option<crate::pool::VmPool>>> =
+    LazyLock::new(|| std::sync::Mutex::new(None));
+
 /// Look up a VM by sandbox ID (takes a brief read-lock on VMS).
 fn get_vm(sandbox_id: &str) -> Option<Arc<SharedVmState>> {
     VMS.read()
@@ -80,6 +84,27 @@ async fn get_or_connect_agent(
         })
         .await
         .cloned()
+}
+
+/// Initialize and warm the VM pool if pool_size > 0 and not already initialized.
+async fn ensure_pool_initialized(config: &cloudhv_common::types::RuntimeConfig) {
+    if config.pool_size == 0 {
+        return;
+    }
+    let needs_init = {
+        let pool_guard = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        pool_guard.is_none()
+    };
+    if needs_init {
+        let mut pool = crate::pool::VmPool::new(config.clone());
+        info!("warming VM pool (pool_size={})", config.pool_size);
+        if let Err(e) = pool.warm().await {
+            info!("pool warm failed (will use cold boot): {e}");
+        } else {
+            info!("VM pool warmed: {} VMs ready", pool.available_count());
+        }
+        *POOL.lock().unwrap_or_else(|e| e.into_inner()) = Some(pool);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +280,91 @@ impl CloudHvInstance {
         let config = load_config(None).ctx("config error")?;
         let config = crate::annotations::apply_annotations(config, &pod_annotations);
         let config = crate::annotations::apply_resource_limits(config, mem_request, mem_limit);
+
+        // Initialize the warm pool on first use (lazy, only if pool_size > 0)
+        ensure_pool_initialized(&config).await;
+
+        // Try warm pool first (instant ~2ms vs 100ms+ cold boot).
+        // Use try_lock() so we don't block if a refill is in progress —
+        // if we can't acquire the mutex, fall through to cold boot.
+        let pool_vm = POOL
+            .try_lock()
+            .ok()
+            .and_then(|mut guard| guard.as_mut().and_then(|p| p.try_acquire()));
+
+        if let Some(warm) = pool_vm {
+            info!("acquired warm VM from pool for sandbox {}", sandbox_id);
+            let mut vm = warm.vm;
+
+            // Start virtiofsd for this sandbox (pool VMs don't have it)
+            vm.spawn_virtiofsd().ctx("virtiofsd for pool VM")?;
+            vm.wait_virtiofsd_ready().await.ctx("virtiofsd ready")?;
+
+            // Hot-add virtio-fs device to the running VM
+            let fs_json = serde_json::json!({
+                "tag": cloudhv_common::VIRTIOFS_TAG,
+                "socket": vm.state_dir().join("virtiofsd.sock").to_string_lossy(),
+                "num_queues": 1,
+                "queue_size": 128
+            });
+            VmManager::api_request_to_socket(
+                vm.api_socket_path(),
+                "PUT",
+                "/api/v1/vm.add-fs",
+                Some(&fs_json.to_string()),
+            )
+            .await
+            .ctx("hot-add virtio-fs")?;
+
+            let shared_dir = vm.shared_dir().to_path_buf();
+            let api_socket = vm.api_socket_path().to_path_buf();
+            let vsock_socket = vm.vsock_socket().to_path_buf();
+            let ch_pid = vm.ch_pid().unwrap_or(std::process::id());
+
+            // Pre-populate the agent OnceCell with the already-connected client
+            let agent_cell = OnceCell::new();
+            let _ = agent_cell.set(warm.agent);
+
+            let vm_state = Arc::new(SharedVmState {
+                vm,
+                agent: agent_cell,
+                vsock_socket,
+                shared_dir,
+                container_count: AtomicUsize::new(1),
+                api_socket,
+            });
+            VMS.write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(sandbox_id.clone(), vm_state);
+
+            // Refill the pool in the background. Create VMs outside the
+            // mutex so concurrent sandbox starts can still acquire from pool.
+            let refill_config = config.clone();
+            tokio::spawn(async move {
+                let target = refill_config.pool_size;
+                let current = POOL
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.as_ref().map(|p| p.available_count()))
+                    .unwrap_or(0);
+                if current >= target {
+                    return;
+                }
+                // Create VMs outside the lock
+                let mut pool_for_create = crate::pool::VmPool::new(refill_config);
+                pool_for_create.refill().await;
+                // Push new VMs into the real pool
+                if let Ok(mut guard) = POOL.lock() {
+                    if let Some(ref mut real_pool) = *guard {
+                        while let Some(vm) = pool_for_create.try_acquire() {
+                            real_pool.push_warm(vm);
+                        }
+                    }
+                }
+            });
+
+            return Ok(ch_pid);
+        }
 
         // Cold-boot a new VM
         let mut vm = VmManager::new(sandbox_id.clone(), config.clone()).ctx("VmManager")?;

@@ -5,6 +5,8 @@ mod config;
 mod hypervisor;
 mod instance;
 mod memory;
+mod pool;
+mod snapshot;
 mod virtfs;
 mod vm;
 mod vsock;
