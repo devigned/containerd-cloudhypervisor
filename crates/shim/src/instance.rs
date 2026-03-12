@@ -186,12 +186,14 @@ impl Instance for CloudHvInstance {
 impl CloudHvInstance {
     /// Boot a VM for the sandbox container.
     async fn start_sandbox(&self) -> Result<u32, Error> {
+        let t_total = std::time::Instant::now();
         let sandbox_id = self.id.clone();
 
         let spec_path = self.bundle.join("config.json");
         let (netns_path, pod_annotations, mem_request, mem_limit) = parse_sandbox_spec(&spec_path);
 
         // Set up TAP device in the pod's network namespace
+        let t_net = std::time::Instant::now();
         let (tap_name, tap_mac, ip_config) = if let Some(ref netns) = netns_path {
             match setup_tap_in_netns(netns, &sandbox_id) {
                 Ok(tap_info) => {
@@ -214,12 +216,14 @@ impl CloudHvInstance {
             info!("no network namespace — VM will boot without networking");
             (None, None, None)
         };
+        let net_ms = t_net.elapsed().as_millis();
 
         let config = load_config(None).ctx("config error")?;
         let config = crate::annotations::apply_annotations(config, &pod_annotations);
         let config = crate::annotations::apply_resource_limits(config, mem_request, mem_limit);
 
         // Cold-boot a new VM
+        let t_prepare = std::time::Instant::now();
         let mut vm = VmManager::new(sandbox_id.clone(), config.clone()).ctx("VmManager")?;
 
         vm.prepare().await.ctx("prepare")?;
@@ -231,26 +235,29 @@ impl CloudHvInstance {
             let mask = prefix_to_netmask(prefix);
             let ip_param = format!(" ip={ip}::{gw}:{mask}::eth0:off");
             vm.append_kernel_args(&ip_param);
-            info!("kernel network: {}", ip_param.trim());
         }
 
         vm.start_swtpm().await.ctx("swtpm")?;
-
         vm.spawn_virtiofsd().ctx("virtiofsd")?;
         vm.spawn_vmm_in_netns(netns_path.as_deref()).ctx("vmm")?;
 
         let (vfsd_r, vmm_r) = tokio::join!(vm.wait_virtiofsd_ready(), vm.wait_vmm_ready());
         vfsd_r.ctx("virtiofsd")?;
         vmm_r.ctx("vmm")?;
+        let prepare_ms = t_prepare.elapsed().as_millis();
 
+        let t_boot = std::time::Instant::now();
         vm.create_and_boot_vm(tap_name.as_deref(), tap_mac.as_deref())
             .await
             .ctx("boot")?;
+        let boot_ms = t_boot.elapsed().as_millis();
 
+        let t_agent = std::time::Instant::now();
         vm.wait_for_agent().await.ctx("agent")?;
 
         let vsock_client = crate::vsock::VsockClient::new(vm.vsock_socket());
         let (agent, _health) = vsock_client.connect_ttrpc().await.ctx("ttrpc")?;
+        let agent_ms = t_agent.elapsed().as_millis();
 
         let shared_dir = vm.shared_dir().to_path_buf();
         let api_socket = vm.api_socket_path().to_path_buf();
@@ -269,19 +276,20 @@ impl CloudHvInstance {
                 shared_dir: shared_dir.clone(),
             };
             let _monitor = crate::memory::spawn_memory_monitor(monitor_config, shutdown_rx);
-            info!(
-                "memory monitor started: boot={}MiB max={}MiB",
-                config.default_memory_mb,
-                config.default_memory_mb + config.hotplug_memory_mb
-            );
             std::mem::forget(shutdown_tx);
         }
+
+        let total_ms = t_total.elapsed().as_millis();
+        info!(
+            "sandbox {} started: total={}ms net={}ms prepare={}ms boot={}ms agent={}ms",
+            sandbox_id, total_ms, net_ms, prepare_ms, boot_ms, agent_ms
+        );
 
         let vm_state = Arc::new(SharedVmState {
             vm,
             agent,
             shared_dir,
-            container_count: AtomicUsize::new(1), // sandbox itself counts
+            container_count: AtomicUsize::new(1),
             api_socket,
         });
 
@@ -289,12 +297,12 @@ impl CloudHvInstance {
             .unwrap_or_else(|e| e.into_inner())
             .insert(sandbox_id.clone(), vm_state.clone());
 
-        info!("sandbox VM {} ready (ch_pid={})", sandbox_id, ch_pid);
         Ok(ch_pid)
     }
 
     /// Create and start an application container inside an existing sandbox VM.
     async fn start_container(&self) -> Result<u32, Error> {
+        let t_total = std::time::Instant::now();
         let container_id = &self.id;
         info!("starting app container: {}", container_id);
 
@@ -327,12 +335,7 @@ impl CloudHvInstance {
             .unwrap_or(shared_dir)
             .join(format!("{}.img", disk_id));
 
-        info!(
-            "creating disk image: {} from rootfs {}",
-            disk_path.display(),
-            rootfs_path.display()
-        );
-
+        let t_disk = std::time::Instant::now();
         let bundle_str = self.bundle.to_string_lossy().to_string();
         let disk_path_clone = disk_path.clone();
         let rootfs_clone = rootfs_path.clone();
@@ -342,24 +345,18 @@ impl CloudHvInstance {
         .await
         .map_err(|_| Error::Any(anyhow::anyhow!("disk image task panicked")))?
         .ctx("disk image")?;
-
-        info!("disk image created: {}", disk_path.display());
+        let disk_ms = t_disk.elapsed().as_millis();
 
         // Hot-plug the disk into the VM
+        let t_hotplug = std::time::Instant::now();
         let disk_path_str = disk_path.to_string_lossy().to_string();
         let api_socket = vm_state.api_socket.clone();
-
-        info!(
-            "hot-plugging disk {} to VM via {}",
-            disk_id,
-            api_socket.display()
-        );
         let disk_json = serde_json::json!({
             "path": disk_path_str,
             "readonly": false,
             "id": disk_id,
         });
-        let add_disk_resp = VmManager::api_request_to_socket(
+        VmManager::api_request_to_socket(
             &api_socket,
             "PUT",
             "/api/v1/vm.add-disk",
@@ -367,11 +364,12 @@ impl CloudHvInstance {
         )
         .await
         .ctx("hot-plug disk")?;
-        info!("disk hot-plugged: {}", add_disk_resp);
+        let hotplug_ms = t_hotplug.elapsed().as_millis();
 
         let bundle_guest = format!("/run/containers/{}", container_id);
 
         // Send CreateContainer RPC to the guest agent
+        let t_create = std::time::Instant::now();
         {
             let mut create_req = cloudhv_proto::CreateContainerRequest::new();
             create_req.container_id = container_id.to_string();
@@ -382,8 +380,10 @@ impl CloudHvInstance {
             agent.create_container(ctx, &create_req).await
         }
         .ctx("CreateContainer RPC error")?;
+        let create_ms = t_create.elapsed().as_millis();
 
         // Start the container
+        let t_start = std::time::Instant::now();
         let start_resp = {
             let mut start_req = cloudhv_proto::StartContainerRequest::new();
             start_req.container_id = container_id.to_string();
@@ -391,6 +391,13 @@ impl CloudHvInstance {
             agent.start_container(ctx, &start_req).await
         }
         .ctx("StartContainer RPC error")?;
+        let start_ms = t_start.elapsed().as_millis();
+
+        let total_ms = t_total.elapsed().as_millis();
+        info!(
+            "container {} started: total={}ms disk={}ms hotplug={}ms create={}ms start={}ms",
+            container_id, total_ms, disk_ms, hotplug_ms, create_ms, start_ms
+        );
 
         vm_state.container_count.fetch_add(1, Ordering::SeqCst);
 
@@ -497,24 +504,21 @@ fn create_rootfs_disk_image(
     use anyhow::Context;
     use std::process::Command;
 
+    let t0 = std::time::Instant::now();
+
     // Calculate rootfs size
     let rootfs_size = dir_size(rootfs_path)?;
-    // Add 50% headroom + 16MB for ext4 metadata, minimum 64MB
     let image_size_mb = std::cmp::max(64, (rootfs_size * 3 / 2 / 1024 / 1024 + 16) as u64);
-
-    log::info!(
-        "creating disk image: {}MB for rootfs ({}MB content)",
-        image_size_mb,
-        rootfs_size / 1024 / 1024
-    );
 
     // Create sparse file
     let f = std::fs::File::create(disk_path)
         .with_context(|| format!("create disk image: {}", disk_path.display()))?;
     f.set_len(image_size_mb * 1024 * 1024)?;
     drop(f);
+    let alloc_ms = t0.elapsed().as_millis();
 
     // Format as ext4
+    let t1 = std::time::Instant::now();
     let status = Command::new("mkfs.ext4")
         .args(["-q", "-F"])
         .arg(disk_path)
@@ -523,8 +527,10 @@ fn create_rootfs_disk_image(
     if !status.success() {
         anyhow::bail!("mkfs.ext4 failed: {status}");
     }
+    let mkfs_ms = t1.elapsed().as_millis();
 
-    // Mount, copy content, unmount
+    // Mount
+    let t2 = std::time::Instant::now();
     let mount_dir = disk_path.with_extension("mnt");
     std::fs::create_dir_all(&mount_dir)?;
 
@@ -537,8 +543,10 @@ fn create_rootfs_disk_image(
     if !status.success() {
         anyhow::bail!("mount disk image failed: {status}");
     }
+    let mount_ms = t2.elapsed().as_millis();
 
     // Copy rootfs content into the image
+    let t3 = std::time::Instant::now();
     let rootfs_dest = mount_dir.join("rootfs");
     std::fs::create_dir_all(&rootfs_dest)?;
     let status = Command::new("cp")
@@ -553,10 +561,26 @@ fn create_rootfs_disk_image(
     if config_src.exists() {
         std::fs::copy(&config_src, mount_dir.join("config.json"))?;
     }
+    let copy_ms = t3.elapsed().as_millis();
 
     // Unmount
+    let t4 = std::time::Instant::now();
     let umount_status = Command::new("umount").arg(&mount_dir).status();
     std::fs::remove_dir(&mount_dir).ok();
+    let umount_ms = t4.elapsed().as_millis();
+
+    let total_ms = t0.elapsed().as_millis();
+    log::info!(
+        "disk image {}: total={}ms alloc={}ms mkfs={}ms mount={}ms copy={}ms umount={}ms ({}MB)",
+        disk_path.display(),
+        total_ms,
+        alloc_ms,
+        mkfs_ms,
+        mount_ms,
+        copy_ms,
+        umount_ms,
+        image_size_mb
+    );
 
     if !status.success() {
         anyhow::bail!("cp rootfs failed: {status}");
