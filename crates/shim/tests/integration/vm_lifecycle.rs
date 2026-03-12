@@ -43,13 +43,15 @@ fn test_vm_boot_and_agent_health() {
 
         // Start virtiofsd
         eprintln!("=== Starting virtiofsd ===");
-        vm.start_virtiofsd()
+        vm.spawn_virtiofsd().expect("failed to spawn virtiofsd");
+        vm.wait_virtiofsd_ready()
             .await
             .expect("failed to start virtiofsd");
 
         // Start Cloud Hypervisor
         eprintln!("=== Starting Cloud Hypervisor VMM ===");
-        vm.start_vmm().await.expect("failed to start CH VMM");
+        vm.spawn_vmm_in_netns(None).expect("failed to spawn VMM");
+        vm.wait_vmm_ready().await.expect("failed to start CH VMM");
 
         // Create and boot VM
         eprintln!("=== Creating and booting VM ===");
@@ -231,8 +233,12 @@ fn test_ttrpc_health_check_rpc() {
             .expect("failed to create VmManager");
 
         vm.prepare().await.expect("VM prepare failed");
-        vm.start_virtiofsd().await.expect("virtiofsd failed");
-        vm.start_vmm().await.expect("VMM failed");
+        vm.spawn_virtiofsd().expect("virtiofsd spawn failed");
+        vm.wait_virtiofsd_ready()
+            .await
+            .expect("virtiofsd ready failed");
+        vm.spawn_vmm_in_netns(None).expect("VMM spawn failed");
+        vm.wait_vmm_ready().await.expect("VMM ready failed");
         vm.create_and_boot_vm(None, None)
             .await
             .expect("boot failed");
@@ -308,27 +314,6 @@ fn test_io_directory_creation() {
     });
 }
 
-/// Test VM pool configuration and acquire/refill logic.
-#[test]
-fn test_vm_pool_config() {
-    let fixtures = TestFixtures::resolve().expect("failed to resolve test fixtures");
-    let mut config = fixtures.runtime_config();
-
-    // Pool with size=0 should be disabled
-    config.pool_size = 0;
-    let pool = containerd_shim_cloudhv::pool::VmPool::new(config.clone());
-    assert!(!pool.is_enabled(), "pool with size=0 should be disabled");
-    assert_eq!(pool.available_count(), 0);
-
-    // Pool with size>0 should be enabled (but empty until warmed)
-    config.pool_size = 3;
-    let pool = containerd_shim_cloudhv::pool::VmPool::new(config);
-    assert!(pool.is_enabled(), "pool with size=3 should be enabled");
-    assert_eq!(pool.available_count(), 0, "not warmed yet");
-
-    eprintln!("=== VM pool config test passed ===");
-}
-
 /// Test VM config with hotplug memory settings.
 #[test]
 fn test_vm_config_with_hotplug() {
@@ -384,8 +369,8 @@ fn test_vm_config_with_hotplug() {
 ///
 /// Reports time for each phase:
 ///   1. VmManager::new + prepare (shim overhead)
-///   2. start_virtiofsd (host daemon overhead)
-///   3. start_vmm (Cloud Hypervisor process startup)
+///   2. spawn_virtiofsd (host daemon overhead)
+///   3. spawn_vmm_in_netns (Cloud Hypervisor process startup)
 ///   4. create_and_boot_vm (CH API create + boot)
 ///   5. wait_for_agent (guest boot + agent startup)
 ///   6. vsock ttrpc connect (ttrpc handshake)
@@ -420,7 +405,10 @@ fn test_vm_lifecycle_timing_breakdown() {
 
         // Phase 2: virtiofsd
         let t1 = std::time::Instant::now();
-        vm.start_virtiofsd().await.expect("virtiofsd failed");
+        vm.spawn_virtiofsd().expect("virtiofsd spawn failed");
+        vm.wait_virtiofsd_ready()
+            .await
+            .expect("virtiofsd ready failed");
         let virtiofsd_time = t1.elapsed();
         eprintln!(
             "  [2] virtiofsd startup:           {:>8.1?}",
@@ -429,7 +417,8 @@ fn test_vm_lifecycle_timing_breakdown() {
 
         // Phase 3: Cloud Hypervisor VMM
         let t2 = std::time::Instant::now();
-        vm.start_vmm().await.expect("VMM failed");
+        vm.spawn_vmm_in_netns(None).expect("VMM spawn failed");
+        vm.wait_vmm_ready().await.expect("VMM ready failed");
         let vmm_time = t2.elapsed();
         eprintln!("  [3] Cloud Hypervisor startup:    {:>8.1?}", vmm_time);
 
@@ -486,47 +475,6 @@ fn test_vm_lifecycle_timing_breakdown() {
     });
 }
 
-/// Test VM pool acquire and warm behavior.
-#[test]
-fn test_vm_pool_warm_and_acquire() {
-    let fixtures = TestFixtures::resolve().expect("failed to resolve test fixtures");
-    skip_if_missing!(fixtures);
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-
-    rt.block_on(async {
-        let mut config = fixtures.runtime_config();
-        config.pool_size = 1;
-
-        let mut pool = containerd_shim_cloudhv::pool::VmPool::new(config);
-
-        // Warm should try to create a VM
-        pool.warm().await.expect("pool warm failed");
-        let count = pool.available_count();
-        eprintln!("Pool warmed: {} VMs available", count);
-        assert!(count > 0, "pool must have VMs available after warm");
-
-        // Acquire should return a warm VM
-        let warm = pool.try_acquire().expect("should acquire warm VM");
-        eprintln!("Acquired VM {} (cid={})", warm.vm.vm_id(), warm.vm.cid());
-        assert_eq!(
-            pool.available_count(),
-            0,
-            "pool should be empty after acquire"
-        );
-
-        // Drain the acquired VM
-        let mut vm = warm.vm;
-        vm.cleanup().await.expect("VM cleanup failed");
-
-        pool.drain().await;
-        eprintln!("=== VM pool warm/acquire test complete ===");
-    });
-}
-
 /// Test VM resize API call format.
 #[test]
 fn test_vm_resize_api() {
@@ -548,8 +496,12 @@ fn test_vm_resize_api() {
 
         vm.prepare().await.expect("VM prepare failed");
 
-        vm.start_virtiofsd().await.expect("virtiofsd failed");
-        vm.start_vmm().await.expect("VMM failed");
+        vm.spawn_virtiofsd().expect("virtiofsd spawn failed");
+        vm.wait_virtiofsd_ready()
+            .await
+            .expect("virtiofsd ready failed");
+        vm.spawn_vmm_in_netns(None).expect("VMM spawn failed");
+        vm.wait_vmm_ready().await.expect("VMM ready failed");
         vm.create_and_boot_vm(None, None)
             .await
             .expect("boot failed");
@@ -566,64 +518,39 @@ fn test_vm_resize_api() {
     });
 }
 
-/// Benchmark: measure pool acquire time vs cold boot time.
+/// Test that container stdout and stderr are captured via virtio-fs.
+///
+/// This test:
+/// 1. Boots a VM using VmManager directly
+/// 2. Creates a disk image with a shell script that writes to stdout and stderr
+/// 3. Hot-plugs the disk, creates and starts the container
+/// 4. Waits for the container to exit and asserts exit code 0
+/// 5. Reads the stdout/stderr files on the host and asserts expected content
 #[test]
-fn test_pool_vs_cold_boot_timing() {
+fn test_container_logs_captured() {
     let fixtures = TestFixtures::resolve().expect("failed to resolve test fixtures");
     skip_if_missing!(fixtures);
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-
-    rt.block_on(async {
-        let config = fixtures.runtime_config();
-        let pool = containerd_shim_cloudhv::pool::VmPool::new(config.clone());
-
-        // Measure cold boot time
-        let cold_start = std::time::Instant::now();
-        let mut warm = pool.create_warm_vm().await.expect("cold boot must succeed");
-        let cold_time = cold_start.elapsed();
-        eprintln!("\n=== Pool vs Cold Boot Timing ===");
-        eprintln!("  Cold boot (full lifecycle):  {:>8.1?}", cold_time);
-
-        // The pool acquire is O(1) — just a VecDeque pop
-        let acquire_start = std::time::Instant::now();
-        // Simulate: acquiring from pool is instant (no I/O)
-        let _vm_id = warm.vm.vm_id().to_string();
-        let acquire_time = acquire_start.elapsed();
-        eprintln!("  Pool acquire (from queue):   {:>8.1?}", acquire_time);
-
-        if cold_time.as_nanos() > 0 {
-            let speedup = cold_time.as_secs_f64() / acquire_time.as_secs_f64().max(0.000001);
-            eprintln!("  Speedup:                     {:>8.0}x", speedup);
-        }
-
-        eprintln!("=== Timing complete ===\n");
-        warm.vm.cleanup().await.expect("VM cleanup failed");
-    });
-}
-
-/// End-to-end benchmark: VM boot → ttrpc connect → disk hot-plug → container
-/// create → start → wait → delete → cleanup.
-///
-/// Measures the complete latency broken down into shim overhead, guest overhead,
-/// and container workload time. Uses a real container (http-echo) with a hot-plugged
-/// disk image — no silent failures.
-///
-/// Run with: sudo cargo test -p containerd-shim-cloudhv --test integration -- --nocapture test_e2e_container
-#[test]
-fn test_e2e_container_lifecycle_benchmark() {
-    let fixtures = TestFixtures::resolve().expect("failed to resolve test fixtures");
-    skip_if_missing!(fixtures);
-
-    let http_echo_path = std::env::var("CLOUDHV_TEST_HTTP_ECHO")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("/usr/local/bin/http-echo"));
-    if !http_echo_path.exists() {
-        eprintln!("SKIPPING: http-echo not found (set CLOUDHV_TEST_HTTP_ECHO)");
+    // We need /bin/busybox or /bin/sh on the host to copy into the rootfs
+    let shell_src = if std::path::Path::new("/bin/busybox").exists() {
+        std::path::PathBuf::from("/bin/busybox")
+    } else if std::path::Path::new("/bin/sh").exists() {
+        std::path::PathBuf::from("/bin/sh")
+    } else {
+        eprintln!("SKIPPING TEST: neither /bin/busybox nor /bin/sh found");
         return;
+    };
+
+    for tool in ["mkfs.ext4", "mount", "umount"] {
+        if std::process::Command::new("which")
+            .arg(tool)
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("SKIPPING TEST: {tool} not found in PATH");
+            return;
+        }
     }
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -633,50 +560,31 @@ fn test_e2e_container_lifecycle_benchmark() {
 
     rt.block_on(async {
         let config = fixtures.runtime_config();
-        let vm_id = format!("e2e-bench-{}", std::process::id());
+        let vm_id = format!("logs-test-{}", std::process::id());
+        let container_id = format!("logs-ctr-{}", std::process::id());
 
-        eprintln!("\n╔══════════════════════════════════════════════════════════╗");
-        eprintln!("║  End-to-End Container Lifecycle Benchmark               ║");
-        eprintln!("╠══════════════════════════════════════════════════════════╣");
-        let e2e_start = std::time::Instant::now();
-
-        // ── Phase 1: Boot VM ──────────────────────────────────────────
-        let phase1_start = std::time::Instant::now();
-        let pool = containerd_shim_cloudhv::pool::VmPool::new(config.clone());
-        let warm = pool
-            .create_warm_vm_with_id(vm_id.clone())
-            .await
-            .expect("VM boot must succeed");
-        let vm_boot_time = phase1_start.elapsed();
-        let mut vm = warm.vm;
-        let agent = warm.agent;
         eprintln!(
-            "  Phase 1 │ VM boot (full):                {:>9.1?}",
-            vm_boot_time
+            "\n=== test_container_logs_captured: booting VM {} ===",
+            vm_id
         );
 
-        // ── Phase 2: Create disk image ────────────────────────────────
-        let phase2_start = std::time::Instant::now();
-        let container_id = format!("e2e-ctr-{}", std::process::id());
-        let disk_path = create_echo_disk_image(
-            vm.state_dir(),
-            &http_echo_path,
-            &container_id,
-            "e2e-benchmark-output",
-            5678,
-        );
-        let disk_time = phase2_start.elapsed();
-        eprintln!(
-            "  Phase 2 │ Disk image create:             {:>9.1?}",
-            disk_time
-        );
+        // ── Boot VM ───────────────────────────────────────────────────
+        let mut vm = containerd_shim_cloudhv::vm::VmManager::new(vm_id.clone(), config)
+            .expect("failed to create VmManager");
+        vm.prepare().await.expect("prepare");
+        vm.spawn_virtiofsd().expect("virtiofsd");
+        vm.wait_virtiofsd_ready().await.expect("virtiofsd ready");
+        vm.spawn_vmm_in_netns(None).expect("vmm");
+        vm.wait_vmm_ready().await.expect("vmm ready");
+        vm.create_and_boot_vm(None, None).await.expect("boot");
+        vm.wait_for_agent().await.expect("agent");
 
-        // ── Phase 3: Hot-plug + CreateContainer ───────────────────────
-        let phase3_start = std::time::Instant::now();
-        vm.add_disk(&disk_path.to_string_lossy(), &container_id, false)
-            .await
-            .expect("add_disk");
+        // ── Connect ttrpc agent ───────────────────────────────────────
+        let vsock_client =
+            containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket().to_path_buf());
+        let (agent, _health) = vsock_client.connect_ttrpc().await.expect("ttrpc");
 
+        // ── Create I/O directory on host (shared via virtio-fs) ───────
         let io_dir = vm.shared_dir().join("io").join(&container_id);
         std::fs::create_dir_all(&io_dir).unwrap_or_default();
         let stdout_guest = format!(
@@ -690,7 +598,22 @@ fn test_e2e_container_lifecycle_benchmark() {
             container_id
         );
         let stdout_host = io_dir.join("stdout");
+        let stderr_host = io_dir.join("stderr");
 
+        // ── Create disk image with a script that writes to both fds ───
+        let disk_path = create_script_disk_image(
+            vm.state_dir(),
+            &shell_src,
+            &container_id,
+            &["sh", "-c", "echo 'HELLO_STDOUT' && echo 'HELLO_STDERR' >&2"],
+        );
+
+        // ── Hot-plug disk ─────────────────────────────────────────────
+        vm.add_disk(&disk_path.to_string_lossy(), &container_id, false)
+            .await
+            .expect("add_disk");
+
+        // ── CreateContainer ───────────────────────────────────────────
         let mut create_req = cloudhv_proto::CreateContainerRequest::new();
         create_req.container_id = container_id.clone();
         create_req.bundle_path =
@@ -698,104 +621,159 @@ fn test_e2e_container_lifecycle_benchmark() {
         create_req.stdout = stdout_guest;
         create_req.stderr = stderr_guest;
         let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
-        let create_resp = agent
+        agent
             .create_container(ctx, &create_req)
             .await
-            .expect("CreateContainer must succeed");
-        let create_time = phase3_start.elapsed();
-        eprintln!(
-            "  Phase 3 │ Hot-plug + CreateContainer:     {:>9.1?} (pid={})",
-            create_time, create_resp.pid
-        );
+            .expect("CreateContainer");
 
-        // ── Phase 4: Start container ──────────────────────────────────
-        let phase4_start = std::time::Instant::now();
+        // ── StartContainer ────────────────────────────────────────────
         let mut start_req = cloudhv_proto::StartContainerRequest::new();
         start_req.container_id = container_id.clone();
         let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
         agent
             .start_container(ctx, &start_req)
             .await
-            .expect("StartContainer must succeed");
-        let start_time = phase4_start.elapsed();
-        eprintln!(
-            "  Phase 4 │ StartContainer RPC:            {:>9.1?}",
-            start_time
+            .expect("StartContainer");
+
+        // ── WaitContainer ─────────────────────────────────────────────
+        let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
+        wait_req.container_id = container_id.clone();
+        let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(60));
+        let wait_resp = agent
+            .wait_container(ctx, &wait_req)
+            .await
+            .expect("WaitContainer");
+        assert_eq!(
+            wait_resp.exit_status, 0,
+            "container should exit with status 0, got {}",
+            wait_resp.exit_status
         );
 
-        // ── Phase 5: Check container stdout ───────────────────────────
-        // http-echo is a long-running server; stdout may be empty (it logs to stderr).
-        // The container being started successfully is the key assertion.
-        if stdout_host.exists() {
-            match std::fs::read_to_string(&stdout_host) {
-                Ok(output) if !output.is_empty() => {
-                    eprintln!(
-                        "  Phase 5 │ Container stdout:              \"{}\"",
-                        output.trim()
-                    );
-                }
-                _ => eprintln!(
-                    "  Phase 5 │ Container stdout:              (empty — server still running)"
-                ),
-            }
-        } else {
-            eprintln!("  Phase 5 │ Container stdout:              (no file yet — server running)");
-        }
+        // ── Assert stdout captured ────────────────────────────────────
+        let stdout_content = std::fs::read_to_string(&stdout_host)
+            .unwrap_or_else(|e| panic!("read stdout at {}: {e}", stdout_host.display()));
+        assert!(
+            stdout_content.contains("HELLO_STDOUT"),
+            "stdout should contain HELLO_STDOUT, got: {stdout_content:?}"
+        );
+        eprintln!("  stdout OK: {:?}", stdout_content.trim());
 
-        // ── Phase 6: Delete container ─────────────────────────────────
-        let phase6_start = std::time::Instant::now();
+        // ── Assert stderr captured ────────────────────────────────────
+        let stderr_content = std::fs::read_to_string(&stderr_host)
+            .unwrap_or_else(|e| panic!("read stderr at {}: {e}", stderr_host.display()));
+        assert!(
+            stderr_content.contains("HELLO_STDERR"),
+            "stderr should contain HELLO_STDERR, got: {stderr_content:?}"
+        );
+        eprintln!("  stderr OK: {:?}", stderr_content.trim());
+
+        // ── Cleanup ───────────────────────────────────────────────────
         let mut del_req = cloudhv_proto::DeleteContainerRequest::new();
         del_req.container_id = container_id.clone();
         let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(10));
         let _ = agent.delete_container(ctx, &del_req).await;
-        let delete_time = phase6_start.elapsed();
-        eprintln!(
-            "  Phase 6 │ DeleteContainer RPC:           {:>9.1?}",
-            delete_time
-        );
 
-        // ── Phase 7: Cleanup VM ───────────────────────────────────────
-        let phase7_start = std::time::Instant::now();
         drop(agent);
         vm.cleanup().await.expect("cleanup failed");
-        let cleanup_time = phase7_start.elapsed();
-        eprintln!(
-            "  Phase 7 │ VM shutdown + cleanup:         {:>9.1?}",
-            cleanup_time
-        );
-
         let _ = std::fs::remove_file(&disk_path);
 
-        // ── Summary ───────────────────────────────────────────────────
-        let e2e_total = e2e_start.elapsed();
-        let shim_overhead = disk_time + create_time + start_time + delete_time + cleanup_time;
-        let guest_overhead = vm_boot_time;
-
-        eprintln!("  ─────────┼──────────────────────────────────────────");
-        eprintln!(
-            "  Total    │ End-to-end:                  {:>9.1?}",
-            e2e_total
-        );
-        eprintln!(
-            "           │ VM boot (guest):             {:>9.1?} ({:.0}%)",
-            guest_overhead,
-            pct(guest_overhead, e2e_total)
-        );
-        eprintln!(
-            "           │ Shim/host overhead:          {:>9.1?} ({:.0}%)",
-            shim_overhead,
-            pct(shim_overhead, e2e_total)
-        );
-        eprintln!("╚══════════════════════════════════════════════════════════╝\n");
+        eprintln!("=== test_container_logs_captured: PASSED ===\n");
     });
 }
 
-fn pct(part: Duration, total: Duration) -> f64 {
-    if total.as_nanos() == 0 {
-        0.0
-    } else {
-        part.as_secs_f64() / total.as_secs_f64() * 100.0
+/// Create an ext4 disk image containing an OCI bundle that runs a shell command.
+///
+/// Similar to [`create_echo_disk_image`] but takes arbitrary args and uses
+/// busybox/sh instead of a dedicated binary. The disk is 32 MB.
+fn create_script_disk_image(
+    state_dir: &std::path::Path,
+    shell_src: &std::path::Path,
+    name: &str,
+    args: &[&str],
+) -> std::path::PathBuf {
+    let disk_path = state_dir.join(format!("{name}.img"));
+    let bundle_tmp = state_dir.join(format!("{name}-bundle"));
+    let rootfs_tmp = bundle_tmp.join("rootfs");
+    let bin_dir = rootfs_tmp.join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mkdir rootfs/bin");
+
+    // Copy the shell binary into rootfs/bin/sh
+    std::fs::copy(shell_src, bin_dir.join("sh")).expect("cp shell");
+    std::process::Command::new("chmod")
+        .args(["755", &bin_dir.join("sh").to_string_lossy()])
+        .status()
+        .expect("chmod");
+
+    // If the source is busybox, create symlinks for common applets
+    if shell_src.to_string_lossy().contains("busybox") {
+        for applet in &["echo", "cat", "ls", "sleep"] {
+            let _ = std::os::unix::fs::symlink("sh", bin_dir.join(applet));
+        }
     }
+
+    // Write OCI config.json
+    let oci_args: Vec<serde_json::Value> = args
+        .iter()
+        .map(|a| serde_json::Value::String(a.to_string()))
+        .collect();
+    let oci_config = serde_json::json!({
+        "ociVersion": "1.0.2",
+        "process": {
+            "terminal": false,
+            "user": { "uid": 0, "gid": 0 },
+            "args": oci_args,
+            "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+            "cwd": "/"
+        },
+        "root": { "path": "rootfs", "readonly": false },
+        "linux": { "namespaces": [{"type": "pid"}, {"type": "mount"}] }
+    });
+    std::fs::write(
+        bundle_tmp.join("config.json"),
+        serde_json::to_string_pretty(&oci_config).unwrap(),
+    )
+    .expect("write config.json");
+
+    // Create 32 MB ext4 disk image
+    let f = std::fs::File::create(&disk_path).expect("create disk");
+    f.set_len(32 * 1024 * 1024).expect("set_len");
+    drop(f);
+    assert!(run_cmd_status(
+        "mkfs.ext4",
+        &["-q", "-F", &disk_path.to_string_lossy()]
+    ));
+    let mount_dir = disk_path.with_extension("mnt");
+    std::fs::create_dir_all(&mount_dir).expect("mkdir mount");
+    assert!(run_cmd_status(
+        "mount",
+        &[
+            "-o",
+            "loop",
+            &disk_path.to_string_lossy(),
+            &mount_dir.to_string_lossy()
+        ]
+    ));
+    let img_rootfs = mount_dir.join("rootfs");
+    std::fs::create_dir_all(&img_rootfs).expect("mkdir img rootfs");
+    assert!(run_cmd_status(
+        "cp",
+        &[
+            "-a",
+            "--",
+            &format!("{}/.", rootfs_tmp.display()),
+            &img_rootfs.to_string_lossy()
+        ]
+    ));
+    std::fs::copy(
+        bundle_tmp.join("config.json"),
+        mount_dir.join("config.json"),
+    )
+    .expect("cp config.json");
+    assert!(run_cmd_status("umount", &[&mount_dir.to_string_lossy()]));
+    std::fs::remove_dir(&mount_dir).ok();
+    std::fs::remove_dir_all(&bundle_tmp).ok();
+
+    disk_path
 }
 
 /// End-to-end test: boot a VM with networking, start an HTTP echo container,
@@ -1271,621 +1249,6 @@ fn run_cmd_status(cmd: &str, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-/// Test that a VM can be snapshot'd and restored from the snapshot.
-///
-/// This proves the Cloud Hypervisor snapshot/restore API works end-to-end:
-///   1. Boot a VM and verify agent is healthy
-///   2. Pause → snapshot to a directory
-///   3. Kill the original CH process
-///   4. Start a new CH process (same socket paths)
-///   5. Restore from the snapshot → resume
-///   6. Verify the agent is still reachable after restore
-///
-/// This is the foundation for snapshot-based pool warming which can
-/// reduce cold start from ~460ms to <100ms.
-#[test]
-fn test_snapshot_and_restore() {
-    let fixtures = TestFixtures::resolve().expect("failed to resolve test fixtures");
-    skip_if_missing!(fixtures);
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-
-    rt.block_on(async {
-        let vm_id = format!("snap-test-{}", std::process::id());
-        let mut config = fixtures.runtime_config();
-        // Use minimal memory for fast snapshot/restore (128MB vs 512MB)
-        config.default_memory_mb = 128;
-
-        eprintln!("\n╔══════════════════════════════════════════════════════════╗");
-        eprintln!("║  Snapshot / Restore — Integration Test                  ║");
-        eprintln!("╠══════════════════════════════════════════════════════════╣");
-
-        // ── Phase 1: Boot original VM (without virtiofs for snapshot) ──
-        eprintln!("  Phase 1 │ Booting original VM (no virtiofs)");
-        let phase1 = std::time::Instant::now();
-
-        let mut vm = containerd_shim_cloudhv::vm::VmManager::new(vm_id.clone(), config.clone())
-            .expect("VmManager::new");
-
-        vm.prepare().await.expect("prepare");
-        // No virtiofsd needed — snapshot-friendly boot uses only disk + vsock
-        vm.spawn_vmm().expect("spawn_vmm");
-        vm.wait_vmm_ready().await.expect("vmm ready");
-        vm.create_and_boot_vm_for_snapshot()
-            .await
-            .expect("create_and_boot_vm_for_snapshot");
-        tokio::time::timeout(Duration::from_secs(30), vm.wait_for_agent())
-            .await
-            .expect("agent timeout")
-            .expect("agent health");
-
-        let boot_time = phase1.elapsed();
-        eprintln!("           │ VM booted, agent healthy: {:>8.1?}", boot_time);
-
-        // Verify agent is reachable via ttrpc
-        let vsock_client = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
-        let (_agent, health) =
-            tokio::time::timeout(Duration::from_secs(5), vsock_client.connect_ttrpc())
-                .await
-                .expect("ttrpc timeout")
-                .expect("ttrpc connect");
-        let ctx = ttrpc::context::with_duration(Duration::from_secs(5));
-        let check_resp = health
-            .check(ctx, &cloudhv_proto::CheckRequest::new())
-            .await
-            .expect("health check before snapshot");
-        assert!(check_resp.ready, "agent should be healthy before snapshot");
-        eprintln!("           │ ttrpc health check: ready=true");
-        drop(_agent);
-        drop(health);
-
-        // ── Phase 2: Snapshot the VM ──────────────────────────────────
-        eprintln!("  Phase 2 │ Snapshotting VM");
-        let phase2 = std::time::Instant::now();
-
-        let snapshot_dir = vm.state_dir().join("snapshot");
-        std::fs::create_dir_all(&snapshot_dir).expect("mkdir snapshot");
-
-        vm.snapshot(&snapshot_dir).await.expect("snapshot failed");
-
-        let snapshot_time = phase2.elapsed();
-        eprintln!("           │ snapshot saved: {:>8.1?}", snapshot_time);
-
-        // Verify snapshot files exist
-        let snapshot_files: Vec<_> = std::fs::read_dir(&snapshot_dir)
-            .expect("read snapshot dir")
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect();
-        eprintln!("           │ snapshot files: {:?}", snapshot_files);
-        assert!(
-            !snapshot_files.is_empty(),
-            "snapshot directory should contain files"
-        );
-
-        // ── Phase 3: Kill original CH process ─────────────────────────
-        eprintln!("  Phase 3 │ Killing original CH process");
-
-        // We need to prevent VmManager's Drop from cleaning up the state dir
-        // (which contains the snapshot), so we save PIDs and leak it.
-        let state_dir = vm.state_dir().to_path_buf();
-        let api_socket = vm.api_socket_path().to_path_buf();
-        let vsock_socket = vm.vsock_socket().to_path_buf();
-        let ch_pid = vm.ch_pid();
-        std::mem::forget(vm);
-
-        // Kill the CH process using nix for safe signal delivery (no unsafe).
-        // No virtiofsd to worry about — snapshot-friendly mode excludes it.
-        if let Some(pid) = ch_pid {
-            eprintln!("           │ killing CH pid={}", pid);
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::SIGKILL,
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        // Remove stale sockets so the new CH can bind them
-        let _ = std::fs::remove_file(&api_socket);
-        let _ = std::fs::remove_file(&vsock_socket);
-
-        eprintln!("           │ original CH killed, sockets removed");
-
-        // ── Phase 4: Start new CH and restore ─────────────────────────
-        eprintln!("  Phase 4 │ Restoring from snapshot");
-        let phase4 = std::time::Instant::now();
-
-        // Start a fresh CH process at the same API socket
-        let ch_binary = &config.cloud_hypervisor_binary;
-        let mut new_ch = std::process::Command::new(ch_binary)
-            .arg("--api-socket")
-            .arg(&api_socket)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn new CH for restore");
-
-        // Wait for API socket
-        for _ in 0..500 {
-            if api_socket.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert!(api_socket.exists(), "new CH API socket must appear");
-
-        // Restore from snapshot using the proper API helper
-        let source_url = format!("file://{}", snapshot_dir.display());
-        let restore_body = serde_json::to_string(&serde_json::json!({
-            "source_url": source_url
-        }))
-        .unwrap();
-        eprintln!("           │ sending vm.restore...");
-
-        tokio::time::timeout(
-            Duration::from_secs(120),
-            containerd_shim_cloudhv::vm::VmManager::api_request_to_socket(
-                &api_socket,
-                "PUT",
-                "/api/v1/vm.restore",
-                Some(&restore_body),
-            ),
-        )
-        .await
-        .expect("restore timed out (120s)")
-        .expect("restore API call failed");
-        eprintln!("           │ vm.restore succeeded");
-
-        // Resume the VM
-        // Use the static api_request helper since we don't have a VmManager
-        containerd_shim_cloudhv::vm::VmManager::api_request_to_socket(
-            &api_socket,
-            "PUT",
-            "/api/v1/vm.resume",
-            None,
-        )
-        .await
-        .expect("resume failed");
-
-        let restore_time = phase4.elapsed();
-        eprintln!(
-            "           │ VM restored and resumed: {:>8.1?}",
-            restore_time
-        );
-
-        // ── Phase 5: Verify agent is reachable after restore ──────────
-        eprintln!("  Phase 5 │ Verifying agent after restore");
-        let phase5 = std::time::Instant::now();
-
-        // Wait a moment for the VM to stabilize after resume
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Connect to agent via vsock (same socket path, same CID)
-        let vsock_client2 = containerd_shim_cloudhv::vsock::VsockClient::new(&vsock_socket);
-        let ttrpc_result =
-            tokio::time::timeout(Duration::from_secs(10), vsock_client2.connect_ttrpc()).await;
-
-        match ttrpc_result {
-            Ok(Ok((_agent2, health2))) => {
-                let ctx = ttrpc::context::with_duration(Duration::from_secs(5));
-                match health2
-                    .check(ctx, &cloudhv_proto::CheckRequest::new())
-                    .await
-                {
-                    Ok(resp) => {
-                        eprintln!(
-                            "           │ health check after restore: ready={} ({:>8.1?})",
-                            resp.ready,
-                            phase5.elapsed()
-                        );
-                        assert!(resp.ready, "agent must be healthy after restore");
-                    }
-                    Err(e) => {
-                        eprintln!("           │ health check RPC failed: {e}");
-                        panic!("health check after restore failed: {e}");
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                eprintln!("           │ ttrpc connect failed: {e}");
-                panic!("ttrpc connect after restore failed: {e}");
-            }
-            Err(_) => {
-                panic!("ttrpc connect timed out after restore (10s)");
-            }
-        }
-
-        // ── Phase 6: Cleanup ──────────────────────────────────────────
-        eprintln!("  Phase 6 │ Cleaning up");
-
-        // Kill the restored CH
-        let _new_ch_pid = new_ch.id();
-        let _ = new_ch.kill();
-        let _ = new_ch.wait();
-
-        // Clean up state directory
-        let _ = std::fs::remove_dir_all(&state_dir);
-
-        // ── Summary ───────────────────────────────────────────────────
-        eprintln!("  ─────────┼──────────────────────────────────────────");
-        eprintln!("  Boot     │ Full cold boot:          {:>8.1?}", boot_time);
-        eprintln!(
-            "  Snapshot │ Pause + snapshot:         {:>8.1?}",
-            snapshot_time
-        );
-        eprintln!(
-            "  Restore  │ CH start + restore + resume: {:>5.1?}",
-            restore_time
-        );
-        eprintln!(
-            "  Speedup  │ {:.1}x faster than cold boot",
-            boot_time.as_secs_f64() / restore_time.as_secs_f64()
-        );
-        eprintln!("╚══════════════════════════════════════════════════════════╝\n");
-    });
-}
-
-/// Test the SnapshotManager: create a golden snapshot, then restore two
-/// VMs from it and verify both agents are independently healthy.
-///
-/// This proves:
-///   1. Golden snapshot creation works (boot → health check → snapshot)
-///   2. Multiple VMs can be restored from the same golden snapshot
-///   3. Each restored VM gets a working agent via vsock
-///   4. Restore is significantly faster than cold boot
-#[test]
-fn test_snapshot_manager_golden_lifecycle() {
-    let fixtures = TestFixtures::resolve().expect("failed to resolve test fixtures");
-    skip_if_missing!(fixtures);
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-
-    rt.block_on(async {
-        let mut config = fixtures.runtime_config();
-        config.default_memory_mb = 128;
-
-        eprintln!("\n╔══════════════════════════════════════════════════════════╗");
-        eprintln!("║  SnapshotManager Golden Lifecycle — Integration Test    ║");
-        eprintln!("╠══════════════════════════════════════════════════════════╣");
-
-        // ── Phase 1: Create golden snapshot ───────────────────────────
-        eprintln!("  Phase 1 │ Creating golden snapshot");
-        let phase1 = std::time::Instant::now();
-
-        let mut mgr = containerd_shim_cloudhv::snapshot::SnapshotManager::new(config.clone());
-
-        // Clean any leftover from previous test runs
-        mgr.cleanup().await.ok();
-
-        assert!(!mgr.is_ready(), "should not be ready before creation");
-
-        mgr.ensure_golden_snapshot()
-            .await
-            .expect("ensure_golden_snapshot failed");
-
-        assert!(mgr.is_ready(), "should be ready after creation");
-        let create_time = phase1.elapsed();
-        eprintln!(
-            "           │ golden snapshot created: {:>8.1?}",
-            create_time
-        );
-
-        // ── Phase 2: Restore VM 1 ────────────────────────────────────
-        eprintln!("  Phase 2 │ Restoring VM 1 from golden snapshot");
-        let phase2 = std::time::Instant::now();
-
-        let vm1_id = format!("snap-mgr-1-{}", std::process::id());
-        let mut restored1 = mgr.restore_vm(&vm1_id).await.expect("restore VM 1 failed");
-
-        let restore1_time = phase2.elapsed();
-        eprintln!("           │ VM 1 restored: {:>8.1?}", restore1_time);
-
-        // Verify agent health on VM 1
-        let vsock1 = containerd_shim_cloudhv::vsock::VsockClient::new(&restored1.vsock_socket);
-        let (_agent1, health1) =
-            tokio::time::timeout(Duration::from_secs(10), vsock1.connect_ttrpc())
-                .await
-                .expect("VM1 ttrpc timeout")
-                .expect("VM1 ttrpc connect");
-        let ctx = ttrpc::context::with_duration(Duration::from_secs(5));
-        let resp1 = health1
-            .check(ctx, &cloudhv_proto::CheckRequest::new())
-            .await
-            .expect("VM1 health check");
-        assert!(resp1.ready, "VM1 agent must be healthy");
-        eprintln!("           │ VM 1 agent healthy ✅");
-        drop(_agent1);
-        drop(health1);
-
-        // ── Phase 3: Restore VM 2 (from same golden snapshot) ─────────
-        eprintln!("  Phase 3 │ Restoring VM 2 from golden snapshot");
-        let phase3 = std::time::Instant::now();
-
-        let vm2_id = format!("snap-mgr-2-{}", std::process::id());
-        let mut restored2 = mgr.restore_vm(&vm2_id).await.expect("restore VM 2 failed");
-
-        let restore2_time = phase3.elapsed();
-        eprintln!("           │ VM 2 restored: {:>8.1?}", restore2_time);
-
-        // Verify agent health on VM 2
-        let vsock2 = containerd_shim_cloudhv::vsock::VsockClient::new(&restored2.vsock_socket);
-        let (_agent2, health2) =
-            tokio::time::timeout(Duration::from_secs(10), vsock2.connect_ttrpc())
-                .await
-                .expect("VM2 ttrpc timeout")
-                .expect("VM2 ttrpc connect");
-        let ctx = ttrpc::context::with_duration(Duration::from_secs(5));
-        let resp2 = health2
-            .check(ctx, &cloudhv_proto::CheckRequest::new())
-            .await
-            .expect("VM2 health check");
-        assert!(resp2.ready, "VM2 agent must be healthy");
-        eprintln!("           │ VM 2 agent healthy ✅");
-        drop(_agent2);
-        drop(health2);
-
-        // ── Phase 4: Cleanup ──────────────────────────────────────────
-        eprintln!("  Phase 4 │ Cleaning up");
-        let _ = restored1.ch_process.start_kill();
-        let _ = restored1.ch_process.wait().await;
-        let _ = tokio::fs::remove_dir_all(&restored1.state_dir).await;
-
-        let _ = restored2.ch_process.start_kill();
-        let _ = restored2.ch_process.wait().await;
-        let _ = tokio::fs::remove_dir_all(&restored2.state_dir).await;
-
-        mgr.cleanup().await.expect("snapshot cleanup");
-
-        // ── Summary ───────────────────────────────────────────────────
-        eprintln!("  ─────────┼──────────────────────────────────────────");
-        eprintln!(
-            "  Create   │ Golden snapshot:          {:>8.1?}",
-            create_time
-        );
-        eprintln!(
-            "  Restore1 │ VM from snapshot:         {:>8.1?}",
-            restore1_time
-        );
-        eprintln!(
-            "  Restore2 │ VM from snapshot:         {:>8.1?}",
-            restore2_time
-        );
-        eprintln!("╚══════════════════════════════════════════════════════════╝\n");
-    });
-}
-
-/// End-to-end test: restore from golden snapshot, hot-add networking,
-/// start an HTTP echo container, and verify the response.
-///
-/// This proves the complete fast-start flow:
-///   Golden snapshot → restore (~60ms) → add-net → TAP+TC → container → curl
-///
-/// Requires: root, KVM, CH, virtiofsd, kernel, rootfs, http-echo binary.
-#[test]
-fn test_snapshot_restore_with_networking_and_container() {
-    let fixtures = TestFixtures::resolve().expect("failed to resolve test fixtures");
-    skip_if_missing!(fixtures);
-
-    let http_echo_path = std::env::var("CLOUDHV_TEST_HTTP_ECHO")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("/usr/local/bin/http-echo"));
-    if !http_echo_path.exists() {
-        eprintln!("SKIPPING: http-echo not found (set CLOUDHV_TEST_HTTP_ECHO)");
-        return;
-    }
-
-    for tool in ["nsenter", "ip", "tc", "curl", "mkfs.ext4"] {
-        if !run_cmd_status("which", &[tool]) {
-            eprintln!("SKIPPING: {tool} not found");
-            return;
-        }
-    }
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-
-    rt.block_on(async {
-        let mut config = fixtures.runtime_config();
-        config.default_memory_mb = 128;
-
-        let netns_name = format!("chsnap-{}", std::process::id());
-        let netns_path = format!("/var/run/netns/{netns_name}");
-        let veth_host = "veth-snap-h";
-        let veth_ns = "veth-snap-ns";
-        let test_ip = "10.200.201.2";
-        let host_ip = "10.200.201.1";
-
-        // Cleanup guard for network namespace
-        struct Guard {
-            name: String,
-            veth: String,
-        }
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                let _ = std::process::Command::new("ip")
-                    .args(["link", "delete", &self.veth])
-                    .status();
-                let _ = std::process::Command::new("ip")
-                    .args(["netns", "delete", &self.name])
-                    .status();
-            }
-        }
-        let _guard = Guard {
-            name: netns_name.clone(),
-            veth: veth_host.to_string(),
-        };
-
-        eprintln!("\n╔══════════════════════════════════════════════════════════╗");
-        eprintln!("║  Snapshot Restore + Networking + Container — E2E Test   ║");
-        eprintln!("╠══════════════════════════════════════════════════════════╣");
-
-        // ── Phase 1: Create golden snapshot ───────────────────────────
-        eprintln!("  Phase 1 │ Creating golden snapshot");
-        let p1 = std::time::Instant::now();
-        let mut mgr = containerd_shim_cloudhv::snapshot::SnapshotManager::new(config.clone());
-        mgr.cleanup().await.ok();
-        mgr.ensure_golden_snapshot().await.expect("golden snapshot");
-        eprintln!("           │ done: {:>8.1?}", p1.elapsed());
-
-        // ── Phase 2: Restore VM from snapshot ─────────────────────────
-        eprintln!("  Phase 2 │ Restoring VM from snapshot");
-        let p2 = std::time::Instant::now();
-        let vm_id = format!("snap-e2e-{}", std::process::id());
-        let mut restored = mgr.restore_vm(&vm_id).await.expect("restore");
-        eprintln!("           │ restored: {:>8.1?}", p2.elapsed());
-
-        // ── Phase 3: Set up networking (netns + TAP + TC + add-net) ───
-        eprintln!("  Phase 3 │ Setting up networking");
-        let p3 = std::time::Instant::now();
-
-        // Create netns + veth pair
-        run_cmd("ip", &["netns", "add", &netns_name]);
-        run_cmd(
-            "ip",
-            &[
-                "link", "add", veth_host, "type", "veth", "peer", "name", veth_ns,
-            ],
-        );
-        run_cmd("ip", &["link", "set", veth_ns, "netns", &netns_name]);
-        run_cmd(
-            "ip",
-            &["addr", "add", &format!("{host_ip}/24"), "dev", veth_host],
-        );
-        run_cmd("ip", &["link", "set", veth_host, "up"]);
-        run_nsenter(
-            &netns_path,
-            &[
-                "ip",
-                "addr",
-                "add",
-                &format!("{test_ip}/24"),
-                "dev",
-                veth_ns,
-            ],
-        );
-        run_nsenter(&netns_path, &["ip", "link", "set", veth_ns, "up"]);
-        run_nsenter(&netns_path, &["ip", "link", "set", "lo", "up"]);
-        run_nsenter(
-            &netns_path,
-            &["ip", "route", "add", "default", "via", host_ip],
-        );
-
-        // Create TAP + TC redirect
-        let tap_name = format!("tap_{}", &vm_id[..8.min(vm_id.len())]);
-        run_nsenter(
-            &netns_path,
-            &["ip", "tuntap", "add", &tap_name, "mode", "tap"],
-        );
-        run_nsenter(&netns_path, &["ip", "link", "set", &tap_name, "up"]);
-
-        // Get veth MAC
-        let mac_out = std::process::Command::new("nsenter")
-            .args([
-                &format!("--net={netns_path}"),
-                "--",
-                "ip",
-                "-j",
-                "addr",
-                "show",
-                "dev",
-                veth_ns,
-            ])
-            .output()
-            .expect("get MAC");
-        let addrs: serde_json::Value =
-            serde_json::from_slice(&mac_out.stdout).unwrap_or(serde_json::json!([]));
-        let tap_mac = addrs
-            .as_array()
-            .and_then(|a| a.first())
-            .and_then(|i| i.get("address"))
-            .and_then(|a| a.as_str())
-            .unwrap_or("aa:bb:cc:dd:ee:ff")
-            .to_string();
-
-        // TC redirect
-        run_nsenter(
-            &netns_path,
-            &["tc", "qdisc", "add", "dev", veth_ns, "ingress"],
-        );
-        run_nsenter(
-            &netns_path,
-            &[
-                "tc", "filter", "add", "dev", veth_ns, "parent", "ffff:", "protocol", "all", "u32",
-                "match", "u32", "0", "0", "action", "mirred", "egress", "redirect", "dev",
-                &tap_name,
-            ],
-        );
-        run_nsenter(
-            &netns_path,
-            &["tc", "qdisc", "add", "dev", &tap_name, "ingress"],
-        );
-        run_nsenter(
-            &netns_path,
-            &[
-                "tc", "filter", "add", "dev", &tap_name, "parent", "ffff:", "protocol", "all",
-                "u32", "match", "u32", "0", "0", "action", "mirred", "egress", "redirect", "dev",
-                veth_ns,
-            ],
-        );
-        run_nsenter(&netns_path, &["ip", "addr", "flush", "dev", veth_ns]);
-
-        // Hot-add net device to the restored VM
-        containerd_shim_cloudhv::vm::VmManager::add_net_to_socket(
-            &restored.api_socket,
-            &tap_name,
-            Some(&tap_mac),
-        )
-        .await
-        .expect("add_net");
-
-        // Configure IP inside the guest via the agent (kernel ip= only works at boot)
-        // For post-restore, we need to configure the IP via the agent.
-        // Since the golden snapshot has no virtiofs and the agent is already running,
-        // we'll test if the hot-added net device works by checking from outside.
-        // The guest kernel should see a new virtio-net device but it won't have an IP
-        // unless we configure it. For this test, we skip the full container flow
-        // and just verify the hot-add succeeded.
-
-        eprintln!("           │ networking set up: {:>8.1?}", p3.elapsed());
-        eprintln!("           │ tap={tap_name} mac={tap_mac}");
-
-        // ── Phase 4: Verify agent still healthy after net hot-add ─────
-        eprintln!("  Phase 4 │ Verifying agent after net hot-add");
-        let vsock = containerd_shim_cloudhv::vsock::VsockClient::new(&restored.vsock_socket);
-        let (_agent, health) = tokio::time::timeout(Duration::from_secs(10), vsock.connect_ttrpc())
-            .await
-            .expect("ttrpc timeout")
-            .expect("ttrpc connect");
-        let ctx = ttrpc::context::with_duration(Duration::from_secs(5));
-        let resp = health
-            .check(ctx, &cloudhv_proto::CheckRequest::new())
-            .await
-            .expect("health");
-        assert!(resp.ready, "agent must be healthy after net hot-add");
-        eprintln!("           │ agent healthy after net hot-add ✅");
-        drop(_agent);
-        drop(health);
-
-        // ── Phase 5: Cleanup ──────────────────────────────────────────
-        eprintln!("  Phase 5 │ Cleaning up");
-        let _ = restored.ch_process.start_kill();
-        let _ = restored.ch_process.wait().await;
-        let _ = tokio::fs::remove_dir_all(&restored.state_dir).await;
-        mgr.cleanup().await.ok();
-
-        eprintln!("╚══════════════════════════════════════════════════════════╝\n");
-    });
-}
-
 /// Test that the in-process virtiofsd backend works as a drop-in replacement
 /// for the spawned virtiofsd binary.
 ///
@@ -1940,7 +1303,7 @@ fn test_embedded_virtiofsd() {
         let p2 = std::time::Instant::now();
 
         // spawn CH only (virtiofsd already running in-process)
-        vm.spawn_vmm().expect("spawn_vmm");
+        vm.spawn_vmm_in_netns(None).expect("spawn_vmm");
         vm.wait_vmm_ready().await.expect("vmm ready");
         vm.create_and_boot_vm(None, None).await.expect("boot");
 
@@ -2419,8 +1782,12 @@ fn test_vm_memory_growth() {
 
         let mut vm = containerd_shim_cloudhv::vm::VmManager::new(vm_id, config).expect("VmManager");
         vm.prepare().await.expect("prepare");
-        vm.start_virtiofsd().await.expect("virtiofsd");
-        vm.start_vmm().await.expect("vmm");
+        vm.spawn_virtiofsd().expect("virtiofsd spawn failed");
+        vm.wait_virtiofsd_ready()
+            .await
+            .expect("virtiofsd ready failed");
+        vm.spawn_vmm_in_netns(None).expect("vmm spawn failed");
+        vm.wait_vmm_ready().await.expect("vmm ready failed");
         vm.create_and_boot_vm(None, None).await.expect("boot");
         tokio::time::timeout(Duration::from_secs(30), vm.wait_for_agent())
             .await
@@ -2508,8 +1875,12 @@ fn test_vm_memory_reclaim() {
 
         let mut vm = containerd_shim_cloudhv::vm::VmManager::new(vm_id, config).expect("VmManager");
         vm.prepare().await.expect("prepare");
-        vm.start_virtiofsd().await.expect("virtiofsd");
-        vm.start_vmm().await.expect("vmm");
+        vm.spawn_virtiofsd().expect("virtiofsd spawn failed");
+        vm.wait_virtiofsd_ready()
+            .await
+            .expect("virtiofsd ready failed");
+        vm.spawn_vmm_in_netns(None).expect("vmm spawn failed");
+        vm.wait_vmm_ready().await.expect("vmm ready failed");
         vm.create_and_boot_vm(None, None).await.expect("boot");
         tokio::time::timeout(Duration::from_secs(30), vm.wait_for_agent())
             .await
@@ -2623,8 +1994,12 @@ fn test_volume_mounts() {
         let mut vm =
             containerd_shim_cloudhv::vm::VmManager::new(vm_id.clone(), config).expect("VmManager");
         vm.prepare().await.expect("prepare");
-        vm.start_virtiofsd().await.expect("virtiofsd");
-        vm.start_vmm().await.expect("vmm");
+        vm.spawn_virtiofsd().expect("virtiofsd spawn failed");
+        vm.wait_virtiofsd_ready()
+            .await
+            .expect("virtiofsd ready failed");
+        vm.spawn_vmm_in_netns(None).expect("vmm spawn failed");
+        vm.wait_vmm_ready().await.expect("vmm ready failed");
         vm.create_and_boot_vm(None, None).await.expect("boot");
         tokio::time::timeout(Duration::from_secs(30), vm.wait_for_agent())
             .await

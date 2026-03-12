@@ -74,8 +74,11 @@ impl VsockClient {
 
         let stream = self.vsock_connect().await?;
 
-        let socket = ttrpc::r#async::transport::Socket::new(stream);
-        let ttrpc_client = ttrpc::r#async::Client::new(socket);
+        // Convert tokio UnixStream → raw fd for ttrpc 0.8 Client::new(fd)
+        let std_stream = stream.into_std()?;
+        use std::os::unix::io::IntoRawFd;
+        let fd = std_stream.into_raw_fd();
+        let ttrpc_client = ttrpc::r#async::Client::new(fd);
         let agent_client = AgentServiceClient::new(ttrpc_client.clone());
         let health_client = HealthServiceClient::new(ttrpc_client);
 

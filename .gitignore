@@ -31,3 +31,6 @@ bzImage
 guest/kernel/linux-*/
 guest/rootfs/*.img
 guest/rootfs/rootfs/
+__.SYMDEF
+lib.rmeta
+*.rcgu.o

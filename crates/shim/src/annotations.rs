@@ -287,7 +287,6 @@ mod tests {
             agent_startup_timeout_secs: 10,
             kernel_args: "console=hvc0".to_string(),
             debug: false,
-            pool_size: 0,
             max_containers_per_vm: 1,
             hotplug_memory_mb: 0,
             hotplug_method: "acpi".to_string(),

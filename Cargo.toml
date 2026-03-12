@@ -1,9 +1,11 @@
 [workspace]
 members = [
     "crates/shim",
-    "crates/agent",
     "crates/proto",
     "crates/common",
+]
+exclude = [
+    "crates/agent",
 ]
 resolver = "2"
 
@@ -18,7 +20,7 @@ repository = "https://github.com/devigned/containerd-cloudhypervisor"
 tokio = { version = "1", features = ["rt", "net", "time", "io-util", "sync", "macros", "signal", "process", "fs"] }
 
 # RPC
-ttrpc = { version = "0.9", features = ["async"] }
+ttrpc = { version = "0.8", features = ["async"] }
 protobuf = "3"
 
 # Error handling
@@ -44,7 +46,6 @@ cloudhv-proto = { path = "crates/proto" }
 cloudhv-common = { path = "crates/common" }
 
 [profile.release]
-panic = "abort"
 lto = true
 codegen-units = 1
 strip = true

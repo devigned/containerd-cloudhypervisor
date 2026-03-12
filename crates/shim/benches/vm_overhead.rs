@@ -136,7 +136,6 @@ fn bench_vm_config_serialization(c: &mut Criterion) {
             agent_startup_timeout_secs: 10,
             kernel_args: "console=hvc0 root=/dev/vda rw quiet".into(),
             debug: false,
-            pool_size: 3,
             max_containers_per_vm: 4,
             hotplug_memory_mb: 512,
             hotplug_method: "virtio-mem".into(),
@@ -166,7 +165,6 @@ fn bench_cid_allocation(c: &mut Criterion) {
             agent_startup_timeout_secs: 10,
             kernel_args: "console=hvc0".into(),
             debug: false,
-            pool_size: 0,
             max_containers_per_vm: 1,
             hotplug_memory_mb: 0,
             hotplug_method: "acpi".into(),
@@ -204,43 +202,11 @@ fn bench_hypervisor_detection(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark pool operations (in-memory, no actual VM creation).
-fn bench_pool_operations(c: &mut Criterion) {
-    let mut group = c.benchmark_group("vm_pool");
-
-    group.bench_function("pool_new", |b| {
-        let config = RuntimeConfig {
-            cloud_hypervisor_binary: "/usr/local/bin/cloud-hypervisor".into(),
-            virtiofsd_binary: "/usr/libexec/virtiofsd".into(),
-            kernel_path: "/opt/vmlinux".into(),
-            rootfs_path: "/opt/rootfs.ext4".into(),
-            default_vcpus: 1,
-            default_memory_mb: 128,
-            vsock_port: 10789,
-            agent_startup_timeout_secs: 10,
-            kernel_args: "console=hvc0".into(),
-            debug: false,
-            pool_size: 10,
-            max_containers_per_vm: 4,
-            hotplug_memory_mb: 256,
-            hotplug_method: "virtio-mem".into(),
-            tpm_enabled: false,
-        };
-        b.iter(|| {
-            let pool = containerd_shim_cloudhv::pool::VmPool::new(config.clone());
-            black_box(pool.is_enabled());
-        });
-    });
-
-    group.finish();
-}
-
 criterion_group!(
     benches,
     bench_image_cache,
     bench_vm_config_serialization,
     bench_cid_allocation,
     bench_hypervisor_detection,
-    bench_pool_operations,
 );
 criterion_main!(benches);
