@@ -43,7 +43,6 @@ pub fn detect_hypervisor() -> HypervisorBackend {
 }
 
 /// Check if the host supports nested virtualization (required for our use case).
-#[allow(dead_code)]
 pub fn check_virtualization_support() -> bool {
     let backend = detect_hypervisor();
     match backend {

@@ -12,14 +12,17 @@ MUSL_TARGET = x86_64-unknown-linux-musl
 REMOTE_HOST ?=
 REMOTE_DIR  ?= ~/containerd-cloudhypervisor
 
+# Agent target dir is under crates/agent/
 ifeq ($(RELEASE),1)
   CARGO_FLAGS = --release
   TARGET_DIR  = target/release
   MUSL_DIR    = target/$(MUSL_TARGET)/release
+  AGENT_MUSL_DIR = crates/agent/target/$(MUSL_TARGET)/release
 else
   CARGO_FLAGS =
   TARGET_DIR  = target/debug
   MUSL_DIR    = target/$(MUSL_TARGET)/debug
+  AGENT_MUSL_DIR = crates/agent/target/$(MUSL_TARGET)/debug
 endif
 
 ## Build targets
@@ -30,24 +33,29 @@ build-shim:  ## Build the containerd shim (native)
 	cargo build $(CARGO_FLAGS) -p containerd-shim-cloudhv
 
 build-agent:  ## Build the guest agent (static musl)
-	cargo build $(CARGO_FLAGS) -p cloudhv-agent --target $(MUSL_TARGET)
+	cd crates/agent && cargo build $(CARGO_FLAGS) --target $(MUSL_TARGET)
 
 clean:  ## Clean build artifacts
 	cargo clean
+	cd crates/agent && cargo clean
 
 ## Quality
 
 fmt:  ## Format code
 	cargo fmt --all
+	cd crates/agent && cargo fmt
 
 fmt-check:  ## Check formatting
 	cargo fmt --all -- --check
+	cd crates/agent && cargo fmt -- --check
 
 clippy:  ## Run clippy
-	cargo clippy --all-targets --all-features -- -D warnings
+	cargo clippy --workspace --lib -- -D warnings
+	cd crates/agent && cargo clippy --all-targets -- -D warnings
 
 test:  ## Run unit tests
-	cargo test --all
+	cargo test --workspace
+	cd crates/agent && cargo test
 
 ## Install
 
@@ -55,7 +63,7 @@ install: build  ## Install binaries
 	install -d $(BINDIR)
 	install -m 755 $(TARGET_DIR)/containerd-shim-cloudhv-v1 $(BINDIR)/
 	@echo "Shim installed to $(BINDIR)/containerd-shim-cloudhv-v1"
-	@echo "Agent binary at $(MUSL_DIR)/cloudhv-agent (copy into guest rootfs)"
+	@echo "Agent binary at $(AGENT_MUSL_DIR)/cloudhv-agent (copy into guest rootfs)"
 
 ## Guest artifacts
 
@@ -65,7 +73,7 @@ build-kernel:  ## Build minimal guest kernel
 
 build-rootfs: build-agent  ## Build minimal guest rootfs
 	@echo "Building minimal guest rootfs..."
-	cd guest/rootfs && bash build-rootfs.sh ../../$(MUSL_DIR)/cloudhv-agent
+	cd guest/rootfs && bash build-rootfs.sh ../../$(AGENT_MUSL_DIR)/cloudhv-agent
 
 ## Remote dev workflow (macOS → Azure VM)
 ## Set REMOTE_HOST to use: make sync REMOTE_HOST=user@host

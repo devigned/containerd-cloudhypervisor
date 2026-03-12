@@ -79,7 +79,6 @@ impl TestFixtures {
                 format!("console={console} root=/dev/vda rw init=/init net.ifnames=0")
             },
             debug: true,
-            pool_size: 0,
             max_containers_per_vm: 1,
             hotplug_memory_mb: 0,
             hotplug_method: "acpi".to_string(),

@@ -86,52 +86,6 @@ impl VmManager {
         })
     }
 
-    /// Create a VmManager from a snapshot-restored VM.
-    ///
-    /// Wraps an already-running Cloud Hypervisor process (restored from
-    /// a golden snapshot) into a VmManager. The VM is already booted and
-    /// the agent is reachable — no boot sequence needed.
-    ///
-    /// Note: restored VMs have no virtiofs (snapshot excludes it), so
-    /// `shared_dir()` exists but virtiofs is not mounted inside the guest.
-    #[allow(dead_code)]
-    pub fn from_restored(restored: crate::snapshot::RestoredVm, config: RuntimeConfig) -> Self {
-        let vm_id = restored
-            .state_dir
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let cid = allocate_cid();
-        let state_dir = restored.state_dir;
-        let shared_dir = state_dir.join("shared");
-        let virtiofsd_socket = state_dir.join("virtiofsd.sock");
-        let tpm_socket = state_dir.join("tpm.sock");
-
-        info!(
-            "VmManager from restored snapshot: vm_id={}, state_dir={}",
-            vm_id,
-            state_dir.display()
-        );
-
-        Self {
-            vm_id,
-            cid,
-            state_dir,
-            api_socket: restored.api_socket,
-            vsock_socket: restored.vsock_socket,
-            virtiofsd_socket,
-            shared_dir,
-            tpm_socket,
-            ch_process: Some(restored.ch_process),
-            virtiofsd_process: None,
-            #[cfg(all(target_os = "linux", feature = "embedded-virtiofsd"))]
-            virtiofsd_backend: None,
-            swtpm_process: None,
-            config,
-        }
-    }
-
     /// Prepare the state directory and shared filesystem.
     pub async fn prepare(&self) -> Result<()> {
         tokio::fs::create_dir_all(&self.shared_dir)
@@ -263,11 +217,6 @@ impl VmManager {
         Ok(())
     }
 
-    /// Start CH without a network namespace.
-    pub fn spawn_vmm(&mut self) -> Result<()> {
-        self.spawn_vmm_in_netns(None)
-    }
-
     /// Wait for CH API socket to appear.
     pub async fn wait_vmm_ready(&self) -> Result<()> {
         for _ in 0..500 {
@@ -277,18 +226,6 @@ impl VmManager {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         anyhow::bail!("cloud-hypervisor API socket did not appear");
-    }
-
-    #[allow(dead_code)]
-    pub async fn start_virtiofsd(&mut self) -> Result<()> {
-        self.spawn_virtiofsd()?;
-        self.wait_virtiofsd_ready().await
-    }
-
-    #[allow(dead_code)]
-    pub async fn start_vmm(&mut self) -> Result<()> {
-        self.spawn_vmm()?;
-        self.wait_vmm_ready().await
     }
 
     /// Create and boot the VM via the Cloud Hypervisor HTTP API.
@@ -392,73 +329,6 @@ impl VmManager {
             .context("failed to boot VM")?;
 
         info!("VM {} created and booted (cid={})", self.vm_id, self.cid);
-        Ok(())
-    }
-
-    /// Create and boot a minimal VM suitable for snapshotting.
-    ///
-    /// This boots without virtiofs (which blocks snapshot/restore due to
-    /// vhost-user protocol state). The VM has only: kernel, rootfs disk,
-    /// and vsock — enough for the agent to boot and be reachable.
-    ///
-    /// After restoring from a snapshot of this VM, virtiofs is not available.
-    /// Container operations that need the shared directory should use a full
-    /// VM boot via `create_and_boot_vm()` instead.
-    #[allow(dead_code)]
-    pub async fn create_and_boot_vm_for_snapshot(&self) -> Result<()> {
-        let vm_config = VmConfig {
-            payload: VmPayload {
-                kernel: self.config.kernel_path.clone(),
-                cmdline: Some(self.config.kernel_args.clone()),
-                initramfs: None,
-            },
-            cpus: VmCpus {
-                boot_vcpus: self.config.default_vcpus,
-                max_vcpus: std::cmp::max(
-                    self.config.default_vcpus,
-                    std::thread::available_parallelism()
-                        .map(|n| n.get() as u32)
-                        .unwrap_or(self.config.default_vcpus),
-                ),
-            },
-            memory: VmMemory {
-                size: self.config.default_memory_mb * 1024 * 1024,
-                shared: false,
-                hotplug_size: None,
-                hotplug_method: None,
-            },
-            disks: vec![VmDisk {
-                path: self.config.rootfs_path.clone(),
-                readonly: false,
-                id: None,
-            }],
-            net: vec![],
-            fs: vec![],
-            vsock: Some(VmVsock {
-                cid: self.cid,
-                socket: self.vsock_socket.to_string_lossy().to_string(),
-            }),
-            serial: Some(VmConsoleConfig::off()),
-            console: Some(VmConsoleConfig::off()),
-            balloon: None,
-            tpm: None,
-        };
-
-        let config_json = serde_json::to_string(&vm_config)?;
-        debug!("VM snapshot config: {}", config_json);
-
-        self.api_request("PUT", "/api/v1/vm.create", Some(&config_json))
-            .await
-            .context("failed to create VM for snapshot")?;
-
-        self.api_request("PUT", "/api/v1/vm.boot", None)
-            .await
-            .context("failed to boot VM for snapshot")?;
-
-        info!(
-            "VM {} created for snapshot (cid={}, no virtiofs)",
-            self.vm_id, self.cid
-        );
         Ok(())
     }
 
@@ -598,160 +468,6 @@ impl VmManager {
         Self::api_request_to_socket(&self.api_socket, method, path, body).await
     }
 
-    /// Resize VM resources (vCPUs and/or memory) via the CH API.
-    ///
-    /// Uses PUT /api/v1/vm.resize to dynamically adjust resources.
-    /// Only works if the VM was created with hotplug_size > 0.
-    #[allow(dead_code)]
-    pub async fn resize(
-        &self,
-        desired_vcpus: Option<u32>,
-        desired_memory_bytes: Option<u64>,
-    ) -> Result<()> {
-        let mut resize_body = serde_json::Map::new();
-        if let Some(vcpus) = desired_vcpus {
-            resize_body.insert(
-                "desired_vcpus".to_string(),
-                serde_json::Value::Number(vcpus.into()),
-            );
-        }
-        if let Some(mem) = desired_memory_bytes {
-            resize_body.insert(
-                "desired_ram".to_string(),
-                serde_json::Value::Number(mem.into()),
-            );
-        }
-
-        if resize_body.is_empty() {
-            return Ok(());
-        }
-
-        let body = serde_json::to_string(&serde_json::Value::Object(resize_body))?;
-        info!("resizing VM {}: {}", self.vm_id, body);
-
-        self.api_request("PUT", "/api/v1/vm.resize", Some(&body))
-            .await
-            .context("failed to resize VM")?;
-
-        info!("VM {} resized successfully", self.vm_id);
-        Ok(())
-    }
-
-    /// Hot-plug a virtio-blk disk into the running VM.
-    ///
-    /// Used to deliver container rootfs as block devices. The guest kernel
-    /// detects the new disk via ACPI hot-plug and it appears as /dev/vdX.
-    /// Returns the disk ID for later removal.
-    #[allow(dead_code)]
-    pub async fn add_disk(&self, path: &str, disk_id: &str, readonly: bool) -> Result<()> {
-        let disk = VmDisk {
-            path: path.to_string(),
-            readonly,
-            id: Some(disk_id.to_string()),
-        };
-        let body = serde_json::to_string(&disk)?;
-        info!(
-            "hot-plugging disk to VM {}: id={} path={}",
-            self.vm_id, disk_id, path
-        );
-
-        self.api_request("PUT", "/api/v1/vm.add-disk", Some(&body))
-            .await
-            .context("failed to hot-plug disk")?;
-
-        info!("disk {} hot-plugged to VM {}", disk_id, self.vm_id);
-        Ok(())
-    }
-
-    /// Hot-add a virtio-net device to a VM via its API socket.
-    ///
-    /// Used for snapshot-restored VMs that don't have a VmManager.
-    /// The TAP device must already exist in the appropriate network namespace.
-    #[allow(dead_code)]
-    pub async fn add_net_to_socket(
-        api_socket: &Path,
-        tap_name: &str,
-        mac: Option<&str>,
-    ) -> Result<()> {
-        let mut net_config = serde_json::json!({
-            "tap": tap_name,
-        });
-        if let Some(m) = mac {
-            net_config["mac"] = serde_json::Value::String(m.to_string());
-        }
-        let body = serde_json::to_string(&net_config)?;
-
-        Self::api_request_to_socket(api_socket, "PUT", "/api/v1/vm.add-net", Some(&body))
-            .await
-            .context("failed to hot-add net device")?;
-        Ok(())
-    }
-
-    /// Snapshot the VM state to a directory.
-    ///
-    /// The VM must be paused first. Creates config.json, memory-ranges,
-    /// and state.json in the destination directory.
-    #[allow(dead_code)]
-    pub async fn snapshot(&self, destination_dir: &Path) -> Result<()> {
-        info!(
-            "snapshotting VM {} to {}",
-            self.vm_id,
-            destination_dir.display()
-        );
-
-        // Pause the VM first
-        self.api_request("PUT", "/api/v1/vm.pause", None)
-            .await
-            .context("failed to pause VM for snapshot")?;
-
-        // Take snapshot
-        let url = format!("file://{}", destination_dir.display());
-        let body = serde_json::to_string(&serde_json::json!({
-            "destination_url": url
-        }))?;
-        self.api_request("PUT", "/api/v1/vm.snapshot", Some(&body))
-            .await
-            .context("failed to snapshot VM")?;
-
-        info!(
-            "VM {} snapshot saved to {}",
-            self.vm_id,
-            destination_dir.display()
-        );
-        Ok(())
-    }
-
-    /// Restore a VM from a snapshot directory.
-    ///
-    /// Creates a new VM from the saved state. The VM starts in a paused
-    /// state and must be resumed with resume().
-    #[allow(dead_code)]
-    pub async fn restore(api_socket: &Path, source_dir: &Path) -> Result<()> {
-        info!("restoring VM from {}", source_dir.display());
-
-        let url = format!("file://{}", source_dir.display());
-        let body = serde_json::to_string(&serde_json::json!({
-            "source_url": url
-        }))?;
-
-        Self::api_request_to_socket(api_socket, "PUT", "/api/v1/vm.restore", Some(&body))
-            .await
-            .context("failed to restore VM")?;
-
-        info!("VM restored from {}", source_dir.display());
-        Ok(())
-    }
-
-    /// Resume a paused VM (used after snapshot or restore).
-    #[allow(dead_code)]
-    pub async fn resume(&self) -> Result<()> {
-        self.api_request("PUT", "/api/v1/vm.resume", None)
-            .await
-            .context("failed to resume VM")?;
-        info!("VM {} resumed", self.vm_id);
-        Ok(())
-    }
-
     /// Shutdown the VM gracefully.
     pub async fn shutdown(&mut self) -> Result<()> {
         info!("shutting down VM {}", self.vm_id);
@@ -825,11 +541,6 @@ impl VmManager {
         &self.vm_id
     }
 
-    #[allow(dead_code)]
-    pub fn cid(&self) -> u64 {
-        self.cid
-    }
-
     pub fn vsock_socket(&self) -> &Path {
         &self.vsock_socket
     }
@@ -838,8 +549,16 @@ impl VmManager {
         &self.shared_dir
     }
 
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
     pub fn api_socket_path(&self) -> &Path {
         &self.api_socket
+    }
+
+    pub fn cid(&self) -> u64 {
+        self.cid
     }
 
     /// Append extra parameters to the kernel command line.
@@ -847,21 +566,59 @@ impl VmManager {
         self.config.kernel_args.push_str(args);
     }
 
-    /// Get the PIDs of child processes for debugging.
-    #[allow(dead_code)]
-    pub fn virtiofsd_pid(&self) -> Option<u32> {
-        self.virtiofsd_process.as_ref().and_then(|c| c.id())
-    }
-
     /// Get the Cloud Hypervisor process PID.
-    #[allow(dead_code)]
     pub fn ch_pid(&self) -> Option<u32> {
         self.ch_process.as_ref().and_then(|c| c.id())
     }
 
-    #[allow(dead_code)]
-    pub fn state_dir(&self) -> &Path {
-        &self.state_dir
+    /// Hot-plug a block device into the VM.
+    pub async fn add_disk(&self, path: &str, disk_id: &str, readonly: bool) -> Result<()> {
+        let disk = VmDisk {
+            path: path.to_string(),
+            readonly,
+            id: Some(disk_id.to_string()),
+        };
+        let body = serde_json::to_string(&disk)?;
+        info!(
+            "hot-plugging disk to VM {}: id={} path={}",
+            self.vm_id, disk_id, path
+        );
+        self.api_request("PUT", "/api/v1/vm.add-disk", Some(&body))
+            .await
+            .context("failed to hot-plug disk")?;
+        info!("disk {} hot-plugged to VM {}", disk_id, self.vm_id);
+        Ok(())
+    }
+
+    /// Resize the VM's vCPUs and/or memory.
+    pub async fn resize(
+        &self,
+        desired_vcpus: Option<u32>,
+        desired_memory_bytes: Option<u64>,
+    ) -> Result<()> {
+        let mut resize_body = serde_json::Map::new();
+        if let Some(vcpus) = desired_vcpus {
+            resize_body.insert(
+                "desired_vcpus".to_string(),
+                serde_json::Value::Number(vcpus.into()),
+            );
+        }
+        if let Some(mem) = desired_memory_bytes {
+            resize_body.insert(
+                "desired_ram".to_string(),
+                serde_json::Value::Number(mem.into()),
+            );
+        }
+        if resize_body.is_empty() {
+            return Ok(());
+        }
+        let body = serde_json::to_string(&serde_json::Value::Object(resize_body))?;
+        info!("resizing VM {}: {}", self.vm_id, body);
+        self.api_request("PUT", "/api/v1/vm.resize", Some(&body))
+            .await
+            .context("failed to resize VM")?;
+        info!("VM {} resized successfully", self.vm_id);
+        Ok(())
     }
 }
 

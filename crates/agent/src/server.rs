@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
+use crate::proto::agent::*;
+use crate::proto::agent_ttrpc::{self, AgentService, HealthService};
 use anyhow::Result;
 use async_trait::async_trait;
-use cloudhv_proto::generated::agent::*;
-use cloudhv_proto::generated::agent_ttrpc::{self, AgentService, HealthService};
 use log::{debug, info};
 use tokio::signal::unix::{signal, SignalKind};
 use ttrpc::r#async::TtrpcContext;
@@ -44,8 +44,7 @@ impl AgentService for AgentServiceHandler {
                 destination: v.destination.clone(),
                 source: v.source.clone(),
                 readonly: v.readonly,
-                is_block: v.volume_type
-                    == cloudhv_proto::generated::agent::VolumeType::BLOCK.into(),
+                is_block: v.volume_type == crate::proto::agent::VolumeType::BLOCK.into(),
                 fs_type: v.fs_type.clone(),
             })
             .collect();
@@ -119,11 +118,53 @@ impl AgentService for AgentServiceHandler {
         req: WaitContainerRequest,
     ) -> ttrpc::Result<WaitContainerResponse> {
         info!("RPC: wait_container id={}", req.container_id);
-        let mut mgr = self.container_manager.lock().await;
-        let (exit_code, exited_at) = mgr
-            .wait(&req.container_id)
-            .await
-            .map_err(|e| ttrpc::Error::Others(format!("wait_container failed: {e}")))?;
+
+        // Briefly lock to get the exit receiver, then drop the lock.
+        let mut rx = {
+            let mgr = self.container_manager.lock().await;
+            mgr.get_exit_receiver(&req.container_id).ok_or_else(|| {
+                ttrpc::Error::Others(format!(
+                    "wait_container: unknown container {}",
+                    req.container_id
+                ))
+            })?
+        };
+
+        // Clone data out of the Ref guard so we never hold a non-Send borrow across .await.
+        let already_exited = { rx.borrow().clone() };
+
+        let (exit_code, exited_at) = if let Some(status) = already_exited {
+            (status.code, status.exited_at)
+        } else {
+            // Wait for the container to exit without holding the container_manager lock.
+            let timeout = tokio::time::Duration::from_secs(600);
+            let result = tokio::select! {
+                changed = rx.changed() => {
+                    match changed {
+                        Ok(()) => {
+                            let status = { rx.borrow().clone() };
+                            match status {
+                                Some(s) => (s.code, s.exited_at),
+                                None => (137, chrono::Utc::now().to_rfc3339()),
+                            }
+                        }
+                        Err(_) => (137, chrono::Utc::now().to_rfc3339()),
+                    }
+                }
+                _ = tokio::time::sleep(timeout) => {
+                    info!("wait_container: timeout after 600s for {}", req.container_id);
+                    (137, chrono::Utc::now().to_rfc3339())
+                }
+            };
+            result
+        };
+
+        // Briefly re-lock to mark the container as stopped.
+        {
+            let mut mgr = self.container_manager.lock().await;
+            mgr.mark_stopped(&req.container_id, exit_code);
+        }
+
         let mut resp = WaitContainerResponse::new();
         resp.exit_status = exit_code as u32;
         resp.exited_at = exited_at;

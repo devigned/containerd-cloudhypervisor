@@ -59,13 +59,26 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler musl-tools
 
       - name: Build release binary
-        run: cargo build --release -p ${{ matrix.package }} --target ${{ matrix.target }}
+        run: |
+          if [ "${{ matrix.package }}" = "cloudhv-agent" ]; then
+            cd crates/agent && cargo build --release --target ${{ matrix.target }}
+          else
+            cargo build --release -p ${{ matrix.package }} --target ${{ matrix.target }}
+          fi
+
+      - name: Stage binary for upload
+        run: |
+          if [ "${{ matrix.package }}" = "cloudhv-agent" ]; then
+            cp crates/agent/target/${{ matrix.target }}/release/${{ matrix.artifact }} /tmp/${{ matrix.artifact }}
+          else
+            cp target/${{ matrix.target }}/release/${{ matrix.artifact }} /tmp/${{ matrix.artifact }}
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/${{ matrix.artifact }}
+          path: /tmp/${{ matrix.artifact }}
 
   build-kernel:
     name: Build Guest Kernel (${{ matrix.arch }})

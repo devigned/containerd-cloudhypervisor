@@ -25,8 +25,11 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY proto/ proto/
 
-RUN cargo build --release -p containerd-shim-cloudhv && \
-    cargo build --release -p cloudhv-agent --target x86_64-unknown-linux-musl
+# Build shim (root workspace)
+RUN cargo build --release -p containerd-shim-cloudhv
+
+# Build agent (separate workspace)
+RUN cd crates/agent && cargo build --release --target x86_64-unknown-linux-musl
 
 # Build virtiofsd (virtio-fs daemon needed by the shim for host↔guest fs sharing)
 RUN cargo install virtiofsd --root /virtiofsd-out
@@ -52,7 +55,7 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /rootfs
 COPY guest/rootfs/ ./
-COPY --from=builder /src/target/x86_64-unknown-linux-musl/release/cloudhv-agent /tmp/cloudhv-agent
+COPY --from=builder /src/crates/agent/target/x86_64-unknown-linux-musl/release/cloudhv-agent /tmp/cloudhv-agent
 
 # Build rootfs without mount (Docker doesn't allow loopback mounts).
 # Use genext2fs to create an ext2 image directly from a directory tree.

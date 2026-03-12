@@ -1,11 +1,8 @@
 pub mod annotations;
 pub mod config;
 pub mod hypervisor;
-pub mod image_cache;
 pub mod instance;
 pub mod memory;
-pub mod pool;
-pub mod snapshot;
 pub mod virtfs;
 pub mod vm;
 pub mod vsock;

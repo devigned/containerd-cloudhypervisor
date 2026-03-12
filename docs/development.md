@@ -15,6 +15,20 @@ cargo build --release -p containerd-shim-cloudhv --features embedded-virtiofsd
 # Requires libseccomp-dev and libcap-ng-dev on Linux
 ```
 
+### Project Structure
+
+The project uses two Cargo workspaces:
+
+- **Root workspace** (`Cargo.toml`): shim, proto, and common crates.
+  Uses ttrpc 0.8 via [shimkit](https://github.com/containerd/runwasi).
+- **Agent workspace** (`crates/agent/Cargo.toml`): standalone guest agent binary.
+  Uses ttrpc 0.9 for vsock server support.
+
+The split is required because the shim (via shimkit/containerd-shim 0.8) needs
+protobuf 3.2, while the agent needs protobuf 3.7+ for ttrpc 0.9's vsock API.
+Both binaries are protocol-compatible — the shim's ttrpc 0.8 client communicates
+with the agent's ttrpc 0.9 server over vsock.
+
 ## Prerequisites
 
 - **Rust** (stable toolchain)
@@ -55,7 +69,8 @@ No shell, no busybox, no package manager — absolute minimum for running contai
 ### Unit Tests
 
 ```bash
-cargo test --workspace
+cargo test --workspace           # shim, proto, common
+cd crates/agent && cargo test    # agent
 ```
 
 ### Integration Tests

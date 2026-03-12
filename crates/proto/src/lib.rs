@@ -1,3 +1,7 @@
+// Suppress removed lints from ttrpc-codegen generated code
+#![allow(unknown_lints)]
+#![allow(renamed_and_removed_lints)]
+
 // Generated code is placed in src/generated/ by build.rs.
 #[allow(clippy::all)]
 #[allow(non_snake_case)]

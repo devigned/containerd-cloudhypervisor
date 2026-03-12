@@ -1,8 +1,8 @@
 [package]
 name = "cloudhv-agent"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
 description = "In-VM guest agent for containerd-cloudhypervisor"
 
 [[bin]]
@@ -10,31 +10,35 @@ name = "cloudhv-agent"
 path = "src/main.rs"
 
 [dependencies]
-cloudhv-proto = { workspace = true }
-cloudhv-common = { workspace = true }
+cloudhv-common = { path = "../common" }
 
 # Async runtime (single-threaded for minimal memory)
-tokio = { workspace = true }
+tokio = { version = "1", features = ["rt", "net", "time", "io-util", "sync", "macros", "signal", "process", "fs"] }
 
-# RPC
-ttrpc = { workspace = true }
-protobuf = { workspace = true }
+# RPC — agent uses ttrpc 0.9 for vsock server support
+ttrpc = { version = "0.9", features = ["async"] }
+protobuf = "3"
 async-trait = "0.1"
 
 # Error handling
-anyhow = { workspace = true }
+anyhow = "1"
 
 # Serialization
-serde = { workspace = true }
-serde_json = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # Logging
-log = { workspace = true }
-env_logger = { workspace = true }
+log = "0.4"
+env_logger = "0.11"
 
 # System
-nix = { workspace = true }
-libc = { workspace = true }
+nix = { version = "0.29", features = ["signal", "mount", "sched", "process", "fs", "poll"] }
+libc = "0.2"
 
 # Time
-chrono = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+
+[build-dependencies]
+ttrpc-codegen = "0.6"
+
+[workspace]

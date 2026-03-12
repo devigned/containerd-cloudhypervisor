@@ -1,5 +1,18 @@
+// Suppress removed lints from ttrpc-codegen generated code
+#![allow(unknown_lints)]
+
 use log::{error, info, warn};
 use nix::unistd::getpid;
+
+// Generated ttrpc/protobuf code from agent.proto
+#[allow(clippy::all)]
+#[allow(non_snake_case)]
+#[allow(non_camel_case_types)]
+#[path = "generated"]
+mod proto {
+    pub mod agent;
+    pub mod agent_ttrpc;
+}
 
 mod container;
 mod mount;

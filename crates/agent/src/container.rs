@@ -7,6 +7,14 @@ use anyhow::{Context, Result};
 use log::debug;
 use log::{error, info, warn};
 use tokio::process::Command;
+use tokio::sync::watch;
+
+/// Exit status reported through the watch channel when a container stops.
+#[derive(Debug, Clone)]
+pub struct ExitStatus {
+    pub code: i32,
+    pub exited_at: String,
+}
 
 /// Volume information passed from the shim to the agent.
 pub struct VolumeInfo {
@@ -20,13 +28,11 @@ pub struct VolumeInfo {
 /// Tracks the state of a container managed by the agent.
 #[derive(Debug)]
 struct Container {
-    _id: String,
-    _bundle_path: PathBuf,
     pid: Option<u32>,
     exit_code: Option<i32>,
     state: ContainerState,
-    _stdout_path: Option<PathBuf>,
-    _stderr_path: Option<PathBuf>,
+    stdout_path: Option<String>,
+    stderr_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -41,6 +47,8 @@ pub struct ContainerManager {
     containers: HashMap<String, Container>,
     /// Block devices already known (to detect newly hot-plugged ones).
     known_disks: std::collections::HashSet<String>,
+    /// Watch receivers for container exit notifications.
+    exit_receivers: HashMap<String, watch::Receiver<Option<ExitStatus>>>,
 }
 
 impl Default for ContainerManager {
@@ -55,6 +63,7 @@ impl ContainerManager {
         Self {
             containers: HashMap::new(),
             known_disks,
+            exit_receivers: HashMap::new(),
         }
     }
 
@@ -128,7 +137,7 @@ impl ContainerManager {
 
     /// Discover a newly hot-plugged block device by scanning /sys/block.
     /// Returns the device path (e.g., "/dev/vdc") if a new device is found.
-    fn discover_block_device(&mut self, _disk_id: &str) -> Option<String> {
+    fn discover_block_device(&mut self) -> Option<String> {
         let current = Self::scan_block_devices();
         let new_devices: Vec<_> = current.difference(&self.known_disks).cloned().collect();
         if let Some(dev) = new_devices.first() {
@@ -195,7 +204,7 @@ impl ContainerManager {
             if vol.is_block {
                 // Block volumes: discover the hot-plugged device by scanning
                 // /sys/block for new vdX devices not already known.
-                let dev_path = match self.discover_block_device(&vol.source) {
+                let dev_path = match self.discover_block_device() {
                     Some(p) => p,
                     None => {
                         warn!(
@@ -269,8 +278,8 @@ impl ContainerManager {
         &mut self,
         container_id: &str,
         bundle_path: &str,
-        _stdout_path: Option<&str>,
-        _stderr_path: Option<&str>,
+        stdout_path: Option<&str>,
+        stderr_path: Option<&str>,
         volumes: &[VolumeInfo],
     ) -> Result<u32> {
         info!("creating container: id={}", container_id);
@@ -306,13 +315,11 @@ impl ContainerManager {
         self.containers.insert(
             container_id.to_string(),
             Container {
-                _id: container_id.to_string(),
-                _bundle_path: local_bundle,
                 pid: Some(pid),
                 exit_code: None,
                 state: ContainerState::Created,
-                _stdout_path: _stdout_path.map(PathBuf::from),
-                _stderr_path: _stderr_path.map(PathBuf::from),
+                stdout_path: stdout_path.map(String::from),
+                stderr_path: stderr_path.map(String::from),
             },
         );
         info!("container created: id={}", container_id);
@@ -327,22 +334,26 @@ impl ContainerManager {
             .containers
             .get(container_id)
             .ok_or_else(|| anyhow::anyhow!("container not found: {}", container_id))?;
-        let bundle = container._bundle_path.clone();
-        let stdout_path = container._stdout_path.clone();
-        let stderr_path = container._stderr_path.clone();
 
-        // Open output files for crun's stdout/stderr.
-        // These are in the virtio-fs shared dir so the host shim can read them.
-        let stdout_file = stdout_path
-            .as_ref()
-            .and_then(|p| std::fs::File::create(p).ok())
-            .map(Stdio::from)
-            .unwrap_or_else(Stdio::null);
-        let stderr_file = stderr_path
-            .as_ref()
-            .and_then(|p| std::fs::File::create(p).ok())
-            .map(Stdio::from)
-            .unwrap_or_else(Stdio::null);
+        // Open stdout/stderr files for crun output (shared dir → host via virtio-fs).
+        // The shim tails these files and forwards to containerd FIFOs (kubectl logs).
+        let stdout_file = match &container.stdout_path {
+            Some(path) => Stdio::from(
+                std::fs::File::create(path)
+                    .with_context(|| format!("create stdout file: {path}"))?,
+            ),
+            None => Stdio::null(),
+        };
+        let stderr_file = match &container.stderr_path {
+            Some(path) => Stdio::from(
+                std::fs::File::create(path)
+                    .with_context(|| format!("create stderr file: {path}"))?,
+            ),
+            None => Stdio::null(),
+        };
+
+        // Bundle path matches the mount point created in create().
+        let bundle = PathBuf::from("/run/containers").join(container_id);
 
         let child = Command::new("/bin/crun")
             .arg("run")
@@ -363,21 +374,36 @@ impl ContainerManager {
         }
         info!("container started: id={}, pid={}", container_id, pid);
 
-        // Wait for exit in background
+        // Create a watch channel for exit notification.
+        // Insert the receiver AFTER the spawn succeeds so we never orphan it.
+        let (tx, rx) = watch::channel::<Option<ExitStatus>>(None);
+
+        // Wait for exit in background and send status through the watch channel
         let container_id_owned = container_id.to_string();
         tokio::spawn(async move {
             match child.wait_with_output().await {
                 Ok(output) => {
+                    let code = output.status.code().unwrap_or(137);
                     info!(
                         "container exited: id={} status={}",
                         container_id_owned, output.status,
                     );
+                    let _ = tx.send(Some(ExitStatus {
+                        code,
+                        exited_at: chrono::Utc::now().to_rfc3339(),
+                    }));
                 }
                 Err(e) => {
                     error!("container wait error: id={} err={}", container_id_owned, e);
+                    let _ = tx.send(Some(ExitStatus {
+                        code: 137,
+                        exited_at: chrono::Utc::now().to_rfc3339(),
+                    }));
                 }
             }
         });
+
+        self.exit_receivers.insert(container_id.to_string(), rx);
 
         Ok(pid)
     }
@@ -455,90 +481,26 @@ impl ContainerManager {
         Ok((pid, exit_code))
     }
 
-    /// Wait for a container to exit, returning (exit_code, exited_at).
-    pub async fn wait(&mut self, container_id: &str) -> Result<(i32, String)> {
-        info!("waiting for container: {}", container_id);
-
-        // Check if already stopped (from our tracking)
-        if let Some(container) = self.containers.get(container_id) {
-            if container.state == ContainerState::Stopped {
-                let exit_code = container.exit_code.unwrap_or(0);
-                return Ok((exit_code, chrono::Utc::now().to_rfc3339()));
-            }
-        }
-
-        // Poll crun state until the container is stopped
-        for _ in 0..3000 {
-            // 10 min max
-            match self.get_crun_state(container_id).await {
-                Ok(state) => {
-                    if let Some(status) = state.get("status").and_then(|s| s.as_str()) {
-                        if status == "stopped" {
-                            let exit_code = 0;
-                            let exited_at = chrono::Utc::now().to_rfc3339();
-                            if let Some(c) = self.containers.get_mut(container_id) {
-                                c.state = ContainerState::Stopped;
-                                c.exit_code = Some(exit_code);
-                            }
-                            return Ok((exit_code, exited_at));
-                        }
-                    }
-                }
-                Err(_) => {
-                    // crun state failed — container likely already cleaned up
-                    let exit_code = if let Some(c) = self.containers.get(container_id) {
-                        c.exit_code.unwrap_or(0)
-                    } else {
-                        0
-                    };
-                    if let Some(c) = self.containers.get_mut(container_id) {
-                        c.state = ContainerState::Stopped;
-                    }
-                    return Ok((exit_code, chrono::Utc::now().to_rfc3339()));
-                }
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-        }
-        anyhow::bail!("wait timed out for container {container_id}")
+    /// Get a clone of the exit receiver for a container.
+    pub fn get_exit_receiver(&self, id: &str) -> Option<watch::Receiver<Option<ExitStatus>>> {
+        self.exit_receivers.get(id).cloned()
     }
 
-    /// Query crun for container state (JSON).
-    async fn get_crun_state(
-        &self,
-        container_id: &str,
-    ) -> Result<serde_json::Map<String, serde_json::Value>> {
-        let output = Command::new("/bin/crun")
-            .arg("state")
-            .arg(container_id)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .context("failed to execute crun state")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("crun state failed: {}", stderr);
+    /// Mark a container as stopped with the given exit code.
+    pub fn mark_stopped(&mut self, id: &str, code: i32) {
+        if let Some(c) = self.containers.get_mut(id) {
+            c.state = ContainerState::Stopped;
+            c.exit_code = Some(code);
         }
-
-        let state: serde_json::Value =
-            serde_json::from_slice(&output.stdout).context("failed to parse crun state output")?;
-
-        state
-            .as_object()
-            .cloned()
-            .context("crun state is not a JSON object")
     }
 
     /// Get the state of a container as a proto response.
     pub async fn state(
         &self,
         container_id: &str,
-    ) -> Result<cloudhv_proto::generated::agent::StateContainerResponse> {
+    ) -> Result<crate::proto::agent::StateContainerResponse> {
+        use crate::proto::agent::{ContainerState as ProtoState, StateContainerResponse};
         use ::protobuf::EnumOrUnknown;
-        use cloudhv_proto::generated::agent::{
-            ContainerState as ProtoState, StateContainerResponse,
-        };
 
         let mut resp = StateContainerResponse::new();
         resp.container_id = container_id.to_string();

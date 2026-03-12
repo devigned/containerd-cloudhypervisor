@@ -70,12 +70,6 @@ mod inner {
                 thread: Some(thread),
             })
         }
-
-        /// Path to the vhost-user socket.
-        #[allow(dead_code)]
-        pub fn socket_path(&self) -> &Path {
-            &self.socket_path
-        }
     }
 
     impl Drop for VirtiofsBackend {

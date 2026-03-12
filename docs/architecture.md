@@ -34,7 +34,7 @@ containerd           │                                                        
 - **Host shim** (`containerd-shim-cloudhv-v1`): containerd shim v2, manages VM lifecycle,
   creates disk images, hot-plugs block devices, sets up networking, forwards logs.
 - **Guest agent** (`cloudhv-agent`): PID 1 in the VM, discovers hot-plugged disks, adapts
-  OCI specs, delegates to crun.
+  OCI specs, delegates to crun. Built as a separate workspace with its own ttrpc 0.9 dependency.
 - **Communication**: vsock + ttrpc — no network stack for the control plane.
 - **Container runtime**: crun (1.8 MB static) — lighter than runc (10 MB).
 - **Kernel**: Custom kernel (~27 MB) with virtio, vsock, BPF, ACPI hot-plug,

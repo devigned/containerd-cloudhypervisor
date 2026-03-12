@@ -41,10 +41,6 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub debug: bool,
 
-    /// Number of pre-warmed VMs in the pool (0 = no pooling)
-    #[serde(default = "default_pool_size")]
-    pub pool_size: usize,
-
     /// Maximum containers per VM (1 = one container per VM)
     #[serde(default = "default_max_containers_per_vm")]
     pub max_containers_per_vm: usize,
@@ -88,9 +84,6 @@ fn default_kernel_args() -> String {
         "hvc0"
     };
     format!("console={console} root=/dev/vda rw quiet init=/init")
-}
-fn default_pool_size() -> usize {
-    crate::DEFAULT_POOL_SIZE
 }
 fn default_max_containers_per_vm() -> usize {
     crate::DEFAULT_MAX_CONTAINERS_PER_VM
