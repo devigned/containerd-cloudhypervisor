@@ -392,6 +392,16 @@ impl ContainerManager {
                         code,
                         exited_at: chrono::Utc::now().to_rfc3339(),
                     }));
+
+                    // Write exit file to virtio-fs for fast host-side detection
+                    let exit_path = format!(
+                        "{}/io/{}/exit",
+                        cloudhv_common::VIRTIOFS_GUEST_MOUNT,
+                        container_id_owned
+                    );
+                    if let Err(e) = std::fs::write(&exit_path, code.to_string()) {
+                        warn!("failed to write exit file {}: {}", exit_path, e);
+                    }
                 }
                 Err(e) => {
                     error!("container wait error: id={} err={}", container_id_owned, e);
@@ -399,6 +409,16 @@ impl ContainerManager {
                         code: 137,
                         exited_at: chrono::Utc::now().to_rfc3339(),
                     }));
+
+                    // Write exit file with error code for host-side detection
+                    let exit_path = format!(
+                        "{}/io/{}/exit",
+                        cloudhv_common::VIRTIOFS_GUEST_MOUNT,
+                        container_id_owned
+                    );
+                    if let Err(e) = std::fs::write(&exit_path, "137") {
+                        warn!("failed to write exit file {}: {}", exit_path, e);
+                    }
                 }
             }
         });

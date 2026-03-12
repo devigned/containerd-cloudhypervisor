@@ -8,6 +8,7 @@ use containerd_shimkit::sandbox::instance::{Instance, InstanceConfig};
 use containerd_shimkit::sandbox::sync::WaitableCell;
 use containerd_shimkit::sandbox::Error;
 use log::info;
+use tokio::sync::OnceCell;
 
 use crate::config::load_config;
 use crate::vm::VmManager;
@@ -46,10 +47,39 @@ fn get_vm(sandbox_id: &str) -> Option<Arc<SharedVmState>> {
 /// Shared state for a running VM (one per pod).
 struct SharedVmState {
     vm: VmManager,
-    agent: cloudhv_proto::AgentServiceClient,
+    agent: OnceCell<cloudhv_proto::AgentServiceClient>,
+    vsock_socket: PathBuf,
     shared_dir: PathBuf,
     container_count: AtomicUsize,
     api_socket: PathBuf,
+}
+
+/// Lazily connect to the guest agent over vsock, caching the client in the
+/// `OnceCell`. The first caller pays the connection cost; subsequent callers
+/// get the cached client.
+async fn get_or_connect_agent(
+    vm_state: &SharedVmState,
+) -> Result<cloudhv_proto::AgentServiceClient, Error> {
+    vm_state
+        .agent
+        .get_or_try_init(|| async {
+            let vsock_client = crate::vsock::VsockClient::new(&vm_state.vsock_socket);
+            // Poll for agent readiness
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while tokio::time::Instant::now() < deadline {
+                if vsock_client.health_check().await.unwrap_or(false) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let (agent, _health) = vsock_client
+                .connect_ttrpc()
+                .await
+                .map_err(|e| Error::Any(anyhow::anyhow!("agent connect: {e}")))?;
+            Ok(agent)
+        })
+        .await
+        .cloned()
 }
 
 // ---------------------------------------------------------------------------
@@ -100,18 +130,20 @@ impl Instance for CloudHvInstance {
     async fn kill(&self, signal: u32) -> Result<(), Error> {
         info!("CloudHvInstance::kill id={} signal={}", self.id, signal);
 
-        // Best-effort agent RPC — fire and forget
+        // Best-effort agent RPC — fire and forget (skip if agent never connected)
         if let Some(vm_state) = get_vm(&self.sandbox_id) {
-            let cid = self.id.clone();
-            let agent = vm_state.agent.clone();
-            tokio::spawn(async move {
-                let mut kreq = cloudhv_proto::KillContainerRequest::new();
-                kreq.container_id = cid;
-                kreq.signal = signal;
-                kreq.all = true;
-                let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(5));
-                let _ = agent.kill_container(ctx, &kreq).await;
-            });
+            if let Some(agent) = vm_state.agent.get() {
+                let cid = self.id.clone();
+                let agent = agent.clone();
+                tokio::spawn(async move {
+                    let mut kreq = cloudhv_proto::KillContainerRequest::new();
+                    kreq.container_id = cid;
+                    kreq.signal = signal;
+                    kreq.all = true;
+                    let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(5));
+                    let _ = agent.kill_container(ctx, &kreq).await;
+                });
+            }
         }
 
         let _ = self.exit.set((137, Utc::now()));
@@ -124,13 +156,14 @@ impl Instance for CloudHvInstance {
         let vm_state = get_vm(&self.sandbox_id);
 
         if let Some(vm_state) = vm_state {
-            // Best-effort delete RPC
-            let agent = vm_state.agent.clone();
-            let cid = self.id.clone();
-            let mut del_req = cloudhv_proto::DeleteContainerRequest::new();
-            del_req.container_id = cid;
-            let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(10));
-            let _ = agent.delete_container(ctx, &del_req).await;
+            // Best-effort delete RPC (skip if agent never connected)
+            if let Some(agent) = vm_state.agent.get() {
+                let cid = self.id.clone();
+                let mut del_req = cloudhv_proto::DeleteContainerRequest::new();
+                del_req.container_id = cid;
+                let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(10));
+                let _ = agent.delete_container(ctx, &del_req).await;
+            }
 
             // Clean up disk image
             if !self.is_sandbox {
@@ -251,11 +284,11 @@ impl CloudHvInstance {
             .await
             .ctx("boot")?;
 
-        vm.wait_for_agent().await.ctx("agent")?;
+        // Agent connection is deferred until the first container needs it
+        // (see get_or_connect_agent). This removes wait_for_agent and
+        // connect_ttrpc from the critical sandbox-start path.
 
-        let vsock_client = crate::vsock::VsockClient::new(vm.vsock_socket());
-        let (agent, _health) = vsock_client.connect_ttrpc().await.ctx("ttrpc")?;
-
+        let vsock_socket = vm.vsock_socket().to_path_buf();
         let shared_dir = vm.shared_dir().to_path_buf();
         let api_socket = vm.api_socket_path().to_path_buf();
         let ch_pid = vm.ch_pid().unwrap_or(std::process::id());
@@ -269,7 +302,7 @@ impl CloudHvInstance {
                 boot_memory_bytes: boot_bytes,
                 max_memory_bytes: max_bytes,
                 api_socket: api_socket.clone(),
-                vsock_socket: vm.vsock_socket().to_path_buf(),
+                vsock_socket: vsock_socket.clone(),
                 shared_dir: shared_dir.clone(),
             };
             let _monitor = crate::memory::spawn_memory_monitor(monitor_config, shutdown_rx);
@@ -283,7 +316,8 @@ impl CloudHvInstance {
 
         let vm_state = Arc::new(SharedVmState {
             vm,
-            agent,
+            agent: OnceCell::new(),
+            vsock_socket,
             shared_dir,
             container_count: AtomicUsize::new(1), // sandbox itself counts
             api_socket,
@@ -306,7 +340,7 @@ impl CloudHvInstance {
             Error::Any(anyhow::anyhow!("sandbox VM not found: {}", self.sandbox_id))
         })?;
 
-        let agent = vm_state.agent.clone();
+        let agent = get_or_connect_agent(&vm_state).await?;
         let shared_dir = &vm_state.shared_dir;
 
         // Set up I/O files in the shared directory
@@ -399,48 +433,81 @@ impl CloudHvInstance {
         vm_state.container_count.fetch_add(1, Ordering::SeqCst);
 
         // Forward container stdout/stderr from virtio-fs files to containerd FIFOs.
-        // This makes `kubectl logs` and `crictl logs` work.
         // We open the FIFOs synchronously here (before start returns) so containerd's
         // reader sees an active writer and doesn't get EOF.
         let stdout_src = io_dir.join("stdout");
         let stderr_src = io_dir.join("stderr");
         let stdout_dst = self.stdout.to_string_lossy().to_string();
         let stderr_dst = self.stderr.to_string_lossy().to_string();
-        if !stdout_dst.is_empty() {
-            let fifo = std::fs::OpenOptions::new()
+        let stdout_handle = if !stdout_dst.is_empty() {
+            std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(&stdout_dst);
-            if let Ok(fifo) = fifo {
-                tokio::spawn(forward_output(stdout_src, fifo));
-            }
-        }
-        if !stderr_dst.is_empty() {
-            let fifo = std::fs::OpenOptions::new()
+                .open(&stdout_dst)
+                .ok()
+                .map(|fifo| tokio::spawn(forward_output(stdout_src, fifo)))
+        } else {
+            None
+        };
+        let stderr_handle = if !stderr_dst.is_empty() {
+            std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(&stderr_dst);
-            if let Ok(fifo) = fifo {
-                tokio::spawn(forward_output(stderr_src, fifo));
-            }
-        }
+                .open(&stderr_dst)
+                .ok()
+                .map(|fifo| tokio::spawn(forward_output(stderr_src, fifo)))
+        } else {
+            None
+        };
 
-        // Background task monitors container exit via agent WaitContainer RPC
+        // Watch for exit file in virtio-fs shared directory (fast path),
+        // with WaitContainer RPC as fallback if the exit file never appears.
         let exit = self.exit.clone();
         let cid = container_id.to_string();
-        let agent_clone = vm_state.agent.clone();
+        let exit_file = io_dir.join("exit");
+        let fallback_agent = agent.clone();
         tokio::spawn(async move {
-            let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
-            wait_req.container_id = cid.clone();
-            let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(86400));
-            let exit_code = match agent_clone.wait_container(ctx, &wait_req).await {
-                Ok(resp) => resp.exit_status,
-                Err(e) => {
-                    info!("wait_container RPC error for {}: {e}", cid);
-                    137
+            // Fast path: poll for exit file (10ms resolution, near-instant via virtio-fs)
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            let exit_code = loop {
+                if exit_file.exists() {
+                    let code = std::fs::read_to_string(&exit_file)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                        .unwrap_or(137);
+                    info!("container {} exited with code {} (exit file)", cid, code);
+                    break code;
                 }
+                if tokio::time::Instant::now() >= deadline {
+                    // Fallback: WaitContainer RPC (handles agent panic / missing exit file)
+                    info!(
+                        "container {}: exit file not found after 30s, falling back to RPC",
+                        cid
+                    );
+                    let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
+                    wait_req.container_id = cid.clone();
+                    let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(600));
+                    let code = match fallback_agent.wait_container(ctx, &wait_req).await {
+                        Ok(resp) => resp.exit_status,
+                        Err(e) => {
+                            info!("wait_container RPC fallback error for {}: {e}", cid);
+                            137
+                        }
+                    };
+                    info!("container {} exited with code {} (RPC fallback)", cid, code);
+                    break code;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             };
-            info!("container {} exited with code {}", cid, exit_code);
+
+            // Abort I/O forwarding to close FIFOs
+            if let Some(h) = stdout_handle {
+                h.abort();
+            }
+            if let Some(h) = stderr_handle {
+                h.abort();
+            }
+
             let _ = exit.set((exit_code, Utc::now()));
         });
 
@@ -570,8 +637,8 @@ fn parse_sandbox_spec(
 
 /// Create an ext4 disk image containing the OCI bundle (config.json + rootfs).
 ///
-/// The image is sized to fit the rootfs content plus headroom. The guest agent
-/// mounts this block device and runs crun from it — no FUSE involved.
+/// Uses `mkfs.ext4 -d` to populate the image directly from a staging directory,
+/// avoiding loopback mount/umount and kernel VFS lock contention.
 fn create_rootfs_disk_image(
     bundle_path: &str,
     rootfs_path: &std::path::Path,
@@ -597,57 +664,38 @@ fn create_rootfs_disk_image(
     f.set_len(image_size_mb * 1024 * 1024)?;
     drop(f);
 
-    // Format as ext4
-    let status = Command::new("mkfs.ext4")
-        .args(["-q", "-F"])
-        .arg(disk_path)
-        .status()
-        .context("mkfs.ext4")?;
-    if !status.success() {
-        anyhow::bail!("mkfs.ext4 failed: {status}");
-    }
+    // Stage the directory layout that mkfs.ext4 -d will embed into the image
+    let staging = disk_path.with_extension("staging");
+    std::fs::create_dir_all(staging.join("rootfs"))?;
 
-    // Mount, copy content, unmount
-    let mount_dir = disk_path.with_extension("mnt");
-    std::fs::create_dir_all(&mount_dir)?;
-
-    let status = Command::new("mount")
-        .args(["-o", "loop"])
-        .arg(disk_path)
-        .arg(&mount_dir)
-        .status()
-        .context("mount disk image")?;
-    if !status.success() {
-        anyhow::bail!("mount disk image failed: {status}");
-    }
-
-    // Copy rootfs content into the image
-    let rootfs_dest = mount_dir.join("rootfs");
-    std::fs::create_dir_all(&rootfs_dest)?;
     let status = Command::new("cp")
         .args(["-a", "--"])
         .arg(format!("{}/.", rootfs_path.display()))
-        .arg(&rootfs_dest)
+        .arg(staging.join("rootfs"))
         .status()
-        .context("cp rootfs to disk image")?;
-
-    // Copy config.json
-    let config_src = std::path::Path::new(bundle_path).join("config.json");
-    if config_src.exists() {
-        std::fs::copy(&config_src, mount_dir.join("config.json"))?;
-    }
-
-    // Unmount
-    let umount_status = Command::new("umount").arg(&mount_dir).status();
-    std::fs::remove_dir(&mount_dir).ok();
-
+        .context("cp rootfs to staging dir")?;
     if !status.success() {
+        std::fs::remove_dir_all(&staging).ok();
         anyhow::bail!("cp rootfs failed: {status}");
     }
-    if let Ok(s) = umount_status {
-        if !s.success() {
-            anyhow::bail!("umount failed: {s}");
-        }
+
+    let config_src = std::path::Path::new(bundle_path).join("config.json");
+    if config_src.exists() {
+        std::fs::copy(&config_src, staging.join("config.json"))?;
+    }
+
+    // Create and populate ext4 image in one step (no loopback mount needed)
+    let status = Command::new("mkfs.ext4")
+        .args(["-q", "-F", "-d"])
+        .arg(&staging)
+        .arg(disk_path)
+        .status()
+        .context("mkfs.ext4 -d")?;
+
+    std::fs::remove_dir_all(&staging).ok();
+
+    if !status.success() {
+        anyhow::bail!("mkfs.ext4 -d failed: {status}");
     }
 
     log::info!("disk image created: {}", disk_path.display());
