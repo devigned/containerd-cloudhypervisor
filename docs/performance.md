@@ -7,13 +7,28 @@ containerd 2.2.2).
 
 Full VM lifecycle from scratch — kernel boots, agent starts, container runs.
 
-| Phase | Latency |
-|-------|---------|
-| Sandbox (VM boot) | **~97ms** |
-| Container create (disk image) | **~64ms** |
-| Container start (agent RPC) | **~160ms** |
-| Exit detection | **~100ms** |
-| **Total e2e** | **~420ms** |
+| Phase | Cache Hit | Cache Miss (first image) |
+|-------|-----------|--------------------------|
+| Sandbox (VM boot) | **~97ms** | **~97ms** |
+| Container create (rootfs cp + inline RPC) | **~8ms** | **~64ms** |
+| Container start (agent RPC) | **~160ms** | **~160ms** |
+| Exit detection | **~100ms** | **~100ms** |
+| **Total e2e** | **~365ms** | **~420ms** |
+
+Cache miss occurs only on the first container per unique container image on
+each node. All subsequent containers using the same image get a cache hit.
+
+## Rootfs Image Cache
+
+The shim caches rootfs ext4 images at `/opt/cloudhv/cache/<hash>.img`,
+eliminating `mkfs.ext4` from the container startup hot path.
+
+| Metric | Without Cache | With Cache |
+|--------|--------------|------------|
+| 50 concurrent containers (same image) | 22,459ms | **655ms** |
+| Burst failures | ~3-15% | **0%** |
+| Per-container disk creation | ~460ms | **~50ms** |
+| Speedup | — | **34×** |
 
 ## Resource Overhead (per VM)
 

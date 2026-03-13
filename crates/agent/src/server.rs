@@ -36,10 +36,24 @@ impl AgentService for AgentServiceHandler {
                 readonly: v.readonly,
                 is_block: v.volume_type == crate::proto::agent::VolumeType::BLOCK.into(),
                 fs_type: v.fs_type.clone(),
+                inline_files: v
+                    .files
+                    .iter()
+                    .map(|f| crate::container::InlineFileInfo {
+                        path: f.path.clone(),
+                        content: f.content.clone(),
+                        mode: f.mode,
+                    })
+                    .collect(),
             })
             .collect();
         let pid = mgr
-            .create(&req.container_id, &req.bundle_path, &volumes)
+            .create(
+                &req.container_id,
+                &req.bundle_path,
+                &volumes,
+                &req.config_json,
+            )
             .await
             .map_err(|e| ttrpc::Error::Others(format!("create_container failed: {e:#}")))?;
         let mut resp = CreateContainerResponse::new();

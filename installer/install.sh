@@ -36,6 +36,7 @@ install -D -m 755 "$ARTIFACTS/containerd-shim-cloudhv-v1" "$HOST/usr/local/bin/c
 # 2. Copy guest artifacts
 echo "[cloudhv] Copying guest kernel and rootfs..."
 mkdir -p "$HOST/opt/cloudhv"
+mkdir -p "$HOST/opt/cloudhv/cache"
 install -m 644 "$ARTIFACTS/vmlinux" "$HOST/opt/cloudhv/vmlinux"
 install -m 644 "$ARTIFACTS/rootfs.ext4" "$HOST/opt/cloudhv/rootfs.ext4"
 

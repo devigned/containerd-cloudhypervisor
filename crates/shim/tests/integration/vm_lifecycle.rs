@@ -2011,3 +2011,219 @@ fn test_volume_mounts() {
         eprintln!("╚══════════════════════════════════════════════════════════╝\n");
     });
 }
+
+/// End-to-end test for the rootfs image cache + inline RPC metadata flow.
+///
+/// This tests the production path where:
+/// 1. Rootfs disk contains ONLY rootfs/ (no config.json, no volumes)
+/// 2. config.json is sent inline via CreateContainerRequest.config_json
+/// 3. Volume files are sent inline via VolumeMount.files (InlineFile)
+/// 4. Agent writes metadata to tmpfs and runs the container
+///
+/// The container reads a ConfigMap file delivered inline and prints it,
+/// proving the full cache + inline pipeline works end-to-end.
+#[test]
+fn test_inline_metadata_delivery() {
+    let fixtures = TestFixtures::resolve().expect("failed to resolve test fixtures");
+    skip_if_missing!(fixtures);
+
+    let shell_src = if std::path::Path::new("/bin/busybox").exists() {
+        std::path::PathBuf::from("/bin/busybox")
+    } else if std::path::Path::new("/bin/sh").exists() {
+        std::path::PathBuf::from("/bin/sh")
+    } else {
+        eprintln!("SKIPPING: neither /bin/busybox nor /bin/sh found");
+        return;
+    };
+
+    for tool in ["mkfs.ext4", "cp"] {
+        if !run_cmd_status("which", &[tool]) {
+            eprintln!("SKIPPING: {tool} not found");
+            return;
+        }
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let config = fixtures.runtime_config();
+        let vm_id = format!("inline-test-{}", std::process::id());
+        let container_id = format!("inline-ctr-{}", std::process::id());
+
+        eprintln!("\n╔══════════════════════════════════════════════════════════╗");
+        eprintln!("║  Inline RPC Metadata — Integration Test                 ║");
+        eprintln!("╠══════════════════════════════════════════════════════════╣");
+
+        // ── Phase 1: Boot VM ──────────────────────────────────────────
+        eprintln!("  Phase 1 │ Booting VM");
+        let mut vm =
+            containerd_shim_cloudhv::vm::VmManager::new(vm_id.clone(), config).expect("VmManager");
+        vm.prepare().await.expect("prepare");
+        vm.spawn_vmm_in_netns(None).expect("vmm spawn failed");
+        vm.wait_vmm_ready().await.expect("vmm ready failed");
+        vm.create_and_boot_vm(None, None).await.expect("boot");
+        tokio::time::timeout(Duration::from_secs(30), vm.wait_for_agent())
+            .await
+            .expect("agent timeout")
+            .expect("agent");
+        eprintln!("           │ VM booted");
+
+        // ── Phase 2: Create rootfs-only disk (simulating cache) ───────
+        eprintln!("  Phase 2 │ Creating rootfs-only disk (no config.json)");
+
+        let bundle_dir = vm.state_dir().join(format!("{container_id}-bundle"));
+        let rootfs = bundle_dir.join("rootfs");
+        let bin_dir = rootfs.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("mkdir bin");
+        std::fs::copy(&shell_src, bin_dir.join("sh")).expect("cp shell");
+        std::process::Command::new("chmod")
+            .args(["755", &bin_dir.join("sh").to_string_lossy()])
+            .status()
+            .expect("chmod");
+        if shell_src.to_string_lossy().contains("busybox") {
+            for applet in &["cat", "echo", "ls"] {
+                let _ = std::os::unix::fs::symlink("sh", bin_dir.join(applet));
+            }
+        }
+
+        // Rootfs-only disk — NO config.json, NO volumes baked in
+        let disk_path = vm.state_dir().join(format!("{container_id}.img"));
+        let staging = disk_path.with_extension("staging");
+        std::fs::create_dir_all(staging.join("rootfs")).expect("mkdir staging/rootfs");
+        assert!(run_cmd_status(
+            "cp",
+            &[
+                "-a",
+                "--",
+                &format!("{}/.", rootfs.display()),
+                &staging.join("rootfs").to_string_lossy()
+            ]
+        ));
+        let f = std::fs::File::create(&disk_path).expect("create disk");
+        f.set_len(64 * 1024 * 1024).expect("set_len");
+        drop(f);
+        assert!(run_cmd_status(
+            "mkfs.ext4",
+            &[
+                "-q",
+                "-F",
+                "-d",
+                &staging.to_string_lossy(),
+                &disk_path.to_string_lossy()
+            ]
+        ));
+        std::fs::remove_dir_all(&staging).ok();
+        eprintln!("           │ Rootfs-only disk created (no config.json baked in)");
+
+        // ── Phase 3: Hot-plug + inline RPC ────────────────────────────
+        eprintln!("  Phase 3 │ Hot-plugging disk and sending inline metadata");
+
+        let disk_id = format!("ctr-{}", &container_id[..12.min(container_id.len())]);
+        vm.add_disk(&disk_path.to_string_lossy(), &disk_id, false)
+            .await
+            .expect("add_disk");
+
+        let vsock = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
+        let (agent, _health) = vsock.connect_ttrpc().await.expect("ttrpc");
+
+        // config.json sent inline (not on disk)
+        let config_json = serde_json::json!({
+            "ociVersion": "1.0.2",
+            "process": {
+                "terminal": false,
+                "user": { "uid": 0, "gid": 0 },
+                "args": ["sh", "-c", "cat /etc/config/app.conf"],
+                "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+                "cwd": "/"
+            },
+            "root": { "path": "rootfs", "readonly": false },
+            "linux": { "namespaces": [{"type": "pid"}, {"type": "mount"}] }
+        });
+        let config_json_bytes = serde_json::to_vec_pretty(&config_json).unwrap();
+
+        let bundle_guest = format!("/run/containers/{}", container_id);
+        let mut create_req = cloudhv_proto::CreateContainerRequest::new();
+        create_req.container_id = container_id.clone();
+        create_req.bundle_path = bundle_guest.clone();
+        create_req.config_json = config_json_bytes;
+
+        // Inline ConfigMap volume (files delivered via RPC, not on disk)
+        let mut vol_mount = cloudhv_proto::VolumeMount::new();
+        vol_mount.destination = "/etc/config".to_string();
+        vol_mount.source = format!("{}/volumes/inline-cm", bundle_guest);
+        vol_mount.volume_type = cloudhv_proto::VolumeType::FILESYSTEM.into();
+        vol_mount.readonly = true;
+
+        let mut inline_file = cloudhv_proto::InlineFile::new();
+        inline_file.path = "app.conf".to_string();
+        inline_file.content = b"INLINE_DELIVERY_WORKS=true\n".to_vec();
+        inline_file.mode = 0o644;
+        vol_mount.files.push(inline_file);
+        create_req.volumes.push(vol_mount);
+
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(30));
+        agent
+            .create_container(ctx, &create_req)
+            .await
+            .expect("CreateContainer with inline metadata");
+
+        let mut start_req = cloudhv_proto::StartContainerRequest::new();
+        start_req.container_id = container_id.clone();
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(30));
+        agent
+            .start_container(ctx, &start_req)
+            .await
+            .expect("StartContainer");
+
+        let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
+        wait_req.container_id = container_id.clone();
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(60));
+        let wait_resp = agent
+            .wait_container(ctx, &wait_req)
+            .await
+            .expect("WaitContainer");
+        assert_eq!(
+            wait_resp.exit_status, 0,
+            "container should exit 0, got {}",
+            wait_resp.exit_status
+        );
+        eprintln!("           │ Container exited with status 0");
+
+        // ── Phase 4: Verify inline data via logs ──────────────────────
+        eprintln!("  Phase 4 │ Verifying inline ConfigMap data in output");
+
+        let mut log_req = cloudhv_proto::GetContainerLogsRequest::new();
+        log_req.container_id = container_id.clone();
+        log_req.offset = 0;
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(5));
+        let log_resp = agent
+            .get_container_logs(ctx, &log_req)
+            .await
+            .expect("GetContainerLogs");
+
+        let stdout = String::from_utf8_lossy(&log_resp.stdout);
+        assert!(
+            stdout.contains("INLINE_DELIVERY_WORKS=true"),
+            "stdout should contain inline ConfigMap data, got: {stdout:?}"
+        );
+        eprintln!("           │ ✅ Inline ConfigMap data verified in container output");
+
+        // ── Phase 5: Cleanup ──────────────────────────────────────────
+        eprintln!("  Phase 5 │ Cleaning up");
+        let mut del_req = cloudhv_proto::DeleteContainerRequest::new();
+        del_req.container_id = container_id.clone();
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(10));
+        let _ = agent.delete_container(ctx, &del_req).await;
+
+        drop(agent);
+        drop(_health);
+        vm.cleanup().await.expect("cleanup");
+        let _ = std::fs::remove_file(&disk_path);
+        let _ = std::fs::remove_dir_all(&bundle_dir);
+
+        eprintln!("╚══════════════════════════════════════════════════════════╝\n");
+    });
+}

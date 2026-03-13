@@ -4,9 +4,9 @@
 
 | Document | Description |
 |----------|-------------|
-| [Architecture](architecture.md) | System design, networking, container rootfs, logging, block-device-only architecture, vsock logs |
-| [Configuration](configuration.md) | Runtime config reference and pod annotation overrides |
-| [Performance](performance.md) | Benchmarks, cold boot, resource overhead, vsock logs |
+| [Architecture](architecture.md) | System design, rootfs caching, inline metadata delivery, networking, logging |
+| [Configuration](configuration.md) | Runtime config reference, cache management, pod annotations |
+| [Performance](performance.md) | Benchmarks, cache hit/miss latencies, resource overhead |
 | [Development](development.md) | Building, testing, contributing, code quality standards |
 | [Releasing](releasing.md) | Release process, Helm chart, GHCR artifacts |
 
@@ -22,7 +22,8 @@ without the overhead of a full-featured VMM stack.
 - **Minimal trusted computing base** — the guest contains only the agent binary (1.5 MB)
   and crun (1.8 MB). No shell, no package manager, no libc.
 - **Block device rootfs** — container images are delivered as hot-plugged virtio-blk disks,
-  avoiding FUSE in the data path.
+  avoiding FUSE in the data path. Rootfs images are cached per unique container image
+  at `/opt/cloudhv/cache/` to eliminate `mkfs.ext4` from the hot path.
 - **Kernel-level networking** — the guest kernel configures its own IP via boot parameters
   (IP_PNP). No agent-side networking code.
 - **Infrastructure logs separate from workload logs** — shim errors go to containerd's log
