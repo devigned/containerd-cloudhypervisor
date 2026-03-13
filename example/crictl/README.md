@@ -126,7 +126,6 @@ sudo tee /opt/cloudhv/config.json > /dev/null <<EOF
   "kernel_args": "console=hvc0 root=/dev/vda rw init=/init net.ifnames=0",
   "default_vcpus": 1,
   "default_memory_mb": 512,
-  "pool_size": 2,
   "max_containers_per_vm": 5,
   "tpm_enabled": false
 }

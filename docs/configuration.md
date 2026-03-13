@@ -12,7 +12,6 @@ The shim loads its configuration from `/opt/cloudhv/config.json` at startup.
 | `kernel_args` | `console=hvc0 root=/dev/vda rw quiet init=/init net.ifnames=0` | Guest kernel cmdline (see [Architecture Notes](#architecture-notes)) |
 | `default_vcpus` | `1` | Boot vCPUs per VM |
 | `default_memory_mb` | `128` | Boot memory in MiB |
-| `pool_size` | `2` | Pre-warmed VM pool size (0 = disabled) |
 | `max_containers_per_vm` | `5` | Max containers sharing a VM |
 | `hotplug_memory_mb` | `0` | Hotpluggable memory (0 = disabled) |
 | `hotplug_method` | `acpi` | `acpi` or `virtio-mem` |
@@ -28,7 +27,6 @@ The shim loads its configuration from `/opt/cloudhv/config.json` at startup.
   "kernel_args": "console=hvc0 root=/dev/vda rw quiet init=/init net.ifnames=0",
   "default_vcpus": 1,
   "default_memory_mb": 512,
-  "pool_size": 2,
   "max_containers_per_vm": 5,
   "tpm_enabled": false
 }
@@ -49,8 +47,6 @@ The shim loads its configuration from `/opt/cloudhv/config.json` at startup.
 - The kernel config used to build the guest kernel also differs per architecture:
   `guest/kernel/configs/microvm.config` for x86_64 and
   `guest/kernel/configs/microvm-aarch64.config` for ARM64.
-- `pool_size` controls how many VMs are pre-booted and kept ready. Set to `0` to
-  disable pooling (every pod gets a cold-booted VM).
 - `max_containers_per_vm` limits density. Each container gets its own hot-plugged
   disk and mount + PID namespace isolation within the shared VM.
 
