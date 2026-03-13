@@ -1763,14 +1763,17 @@ fn test_volume_mounts() {
     let fixtures = TestFixtures::resolve().expect("failed to resolve test fixtures");
     skip_if_missing!(fixtures);
 
-    let http_echo_path = std::env::var("CLOUDHV_TEST_HTTP_ECHO")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("/usr/local/bin/http-echo"));
-    if !http_echo_path.exists() {
-        eprintln!("SKIPPING: http-echo not found (set CLOUDHV_TEST_HTTP_ECHO)");
+    // Need busybox/sh to build a container that reads volume data
+    let shell_src = if std::path::Path::new("/bin/busybox").exists() {
+        std::path::PathBuf::from("/bin/busybox")
+    } else if std::path::Path::new("/bin/sh").exists() {
+        std::path::PathBuf::from("/bin/sh")
+    } else {
+        eprintln!("SKIPPING: neither /bin/busybox nor /bin/sh found");
         return;
-    }
-    for tool in ["mkfs.ext4", "mount", "umount"] {
+    };
+
+    for tool in ["mkfs.ext4", "cp"] {
         if !run_cmd_status("which", &[tool]) {
             eprintln!("SKIPPING: {tool} not found");
             return;
@@ -1785,9 +1788,10 @@ fn test_volume_mounts() {
     rt.block_on(async {
         let config = fixtures.runtime_config();
         let vm_id = format!("vol-test-{}", std::process::id());
+        let container_id = format!("vol-ctr-{}", std::process::id());
 
         eprintln!("\n╔══════════════════════════════════════════════════════════╗");
-        eprintln!("║  Volume Mounts (FS + Block) — Integration Test          ║");
+        eprintln!("║  Baked-in Volume Mounts — Integration Test              ║");
         eprintln!("╠══════════════════════════════════════════════════════════╣");
 
         // ── Phase 1: Boot VM ──────────────────────────────────────────
@@ -1804,96 +1808,205 @@ fn test_volume_mounts() {
             .expect("agent");
         eprintln!("           │ VM booted");
 
-        // ── Phase 2: Test filesystem volume via shared dir ────────────
-        eprintln!("  Phase 2 │ Testing filesystem volume");
+        // ── Phase 2: Create disk with baked-in ConfigMap volume ───────
+        eprintln!("  Phase 2 │ Creating disk image with baked-in ConfigMap");
 
-        // Write test data to the shared dir (simulates bind-mount staging)
-        let vol_dir = vm.shared_dir().join("volumes").join("fs-test");
-        std::fs::create_dir_all(&vol_dir).expect("mkdir vol");
-        let test_content = "hello from filesystem volume";
-        std::fs::write(vol_dir.join("data.txt"), test_content).expect("write vol");
+        // Simulate kubelet ConfigMap volume data directory
+        let cm_src = vm.state_dir().join("configmap-data");
+        std::fs::create_dir_all(&cm_src).expect("mkdir configmap");
+        std::fs::write(cm_src.join("app.conf"), "setting=BAKED_VALUE\n").expect("write cm");
+        std::fs::write(cm_src.join("extra.yaml"), "env: production\n").expect("write cm2");
 
-        // Verify via agent health check that shared dir is working
-        let vsock = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
-        let (_agent, health) = vsock.connect_ttrpc().await.expect("ttrpc");
-        let ctx = ttrpc::context::with_duration(Duration::from_secs(5));
-        let resp = health
-            .check(ctx, &cloudhv_proto::CheckRequest::new())
-            .await
-            .expect("health check");
-        assert!(resp.ready, "agent must be healthy");
+        // Compute volume_id the same way the shim does (djb2 hash)
+        let vol_dest = "/etc/config";
+        let vol_id = {
+            let mut h: u64 = 5381;
+            for b in vol_dest.bytes() {
+                h = h.wrapping_mul(33).wrapping_add(b as u64);
+            }
+            format!("{:x}", h)
+        };
 
-        // Verify host-side data persists (simulates write-back)
-        let read_back = std::fs::read_to_string(vol_dir.join("data.txt")).expect("read");
-        assert_eq!(read_back, test_content);
-        eprintln!("           │ ✅ Filesystem volume data accessible via shared dir");
-        drop(_agent);
-        drop(health);
+        // Build an OCI bundle with the container command that reads volume data
+        let bundle_dir = vm.state_dir().join(format!("{container_id}-bundle"));
+        let rootfs = bundle_dir.join("rootfs");
+        let bin_dir = rootfs.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("mkdir bin");
+        std::fs::copy(&shell_src, bin_dir.join("sh")).expect("cp shell");
+        std::process::Command::new("chmod")
+            .args(["755", &bin_dir.join("sh").to_string_lossy()])
+            .status()
+            .expect("chmod");
+        if shell_src.to_string_lossy().contains("busybox") {
+            for applet in &["cat", "echo", "ls"] {
+                let _ = std::os::unix::fs::symlink("sh", bin_dir.join(applet));
+            }
+        }
 
-        // ── Phase 3: Test block volume via vm.add-disk ────────────────
-        eprintln!("  Phase 3 │ Testing block volume (vm.add-disk)");
+        // The container will cat the baked-in ConfigMap files
+        let oci_config = serde_json::json!({
+            "ociVersion": "1.0.2",
+            "process": {
+                "terminal": false,
+                "user": { "uid": 0, "gid": 0 },
+                "args": ["sh", "-c",
+                    "cat /etc/config/app.conf && cat /etc/config/extra.yaml"],
+                "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+                "cwd": "/"
+            },
+            "root": { "path": "rootfs", "readonly": false },
+            "linux": { "namespaces": [{"type": "pid"}, {"type": "mount"}] },
+            "mounts": [
+                {
+                    "destination": vol_dest,
+                    "source": cm_src.to_string_lossy(),
+                    "type": "bind",
+                    "options": ["rbind", "ro"]
+                }
+            ]
+        });
+        std::fs::write(
+            bundle_dir.join("config.json"),
+            serde_json::to_string_pretty(&oci_config).unwrap(),
+        )
+        .expect("write config.json");
 
-        // Create a small ext4 disk image with test data
-        let block_img = vm.state_dir().join("test-block-vol.img");
-        let f = std::fs::File::create(&block_img).expect("create block img");
-        f.set_len(16 * 1024 * 1024).expect("set_len");
+        // Stage the disk image: rootfs + volumes/<vol_id>/ (same as create_rootfs_disk_image)
+        let disk_path = vm.state_dir().join(format!("{container_id}.img"));
+        let staging = disk_path.with_extension("staging");
+        std::fs::create_dir_all(staging.join("rootfs")).expect("mkdir staging/rootfs");
+        assert!(run_cmd_status(
+            "cp",
+            &[
+                "-a",
+                "--",
+                &format!("{}/.", rootfs.display()),
+                &staging.join("rootfs").to_string_lossy()
+            ]
+        ));
+        std::fs::copy(bundle_dir.join("config.json"), staging.join("config.json"))
+            .expect("cp config.json");
+
+        // Bake ConfigMap data into volumes/<vol_id>/
+        let vol_staging = staging.join("volumes").join(&vol_id);
+        std::fs::create_dir_all(&vol_staging).expect("mkdir vol staging");
+        assert!(run_cmd_status(
+            "cp",
+            &[
+                "-a",
+                "--",
+                &format!("{}/.", cm_src.display()),
+                &vol_staging.to_string_lossy()
+            ]
+        ));
+
+        // Create ext4 image with mkfs.ext4 -d (no loopback mount)
+        let f = std::fs::File::create(&disk_path).expect("create disk");
+        f.set_len(64 * 1024 * 1024).expect("set_len"); // 64MB
         drop(f);
         assert!(run_cmd_status(
             "mkfs.ext4",
-            &["-q", "-F", &block_img.to_string_lossy()]
-        ));
-
-        // Mount, write data, unmount
-        let mnt = block_img.with_extension("mnt");
-        std::fs::create_dir_all(&mnt).expect("mkdir mnt");
-        assert!(run_cmd_status(
-            "mount",
             &[
-                "-o",
-                "loop",
-                &block_img.to_string_lossy(),
-                &mnt.to_string_lossy()
+                "-q",
+                "-F",
+                "-d",
+                &staging.to_string_lossy(),
+                &disk_path.to_string_lossy()
             ]
         ));
-        std::fs::write(mnt.join("block-data.txt"), "hello from block volume").expect("write");
-        assert!(run_cmd_status("umount", &[&mnt.to_string_lossy()]));
-        std::fs::remove_dir(&mnt).ok();
+        std::fs::remove_dir_all(&staging).ok();
+        eprintln!("           │ Disk image with baked ConfigMap created");
 
-        // Hot-plug the block image into the VM
-        let vol_disk_id = "vol-block-test";
-        vm.add_disk(&block_img.to_string_lossy(), vol_disk_id, false)
-            .await
-            .expect("add_disk for block volume");
+        // ── Phase 3: Hot-plug disk and run container ─────────────────
+        eprintln!("  Phase 3 │ Hot-plugging disk and running container");
 
-        // Verify the agent can still communicate (VM didn't crash from hot-plug)
-        let vsock2 = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
-        let (_agent2, health2) = vsock2.connect_ttrpc().await.expect("ttrpc2");
-        let ctx = ttrpc::context::with_duration(Duration::from_secs(5));
-        let resp2 = health2
-            .check(ctx, &cloudhv_proto::CheckRequest::new())
+        let disk_id = format!("ctr-{}", &container_id[..12.min(container_id.len())]);
+        vm.add_disk(&disk_path.to_string_lossy(), &disk_id, false)
             .await
-            .expect("health check after block hot-plug");
-        assert!(
-            resp2.ready,
-            "agent must be healthy after block volume hot-plug"
+            .expect("add_disk");
+
+        let vsock = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
+        let (agent, _health) = vsock.connect_ttrpc().await.expect("ttrpc");
+
+        // Send CreateContainer with FILESYSTEM volume mount pointing to baked-in data
+        let bundle_guest = format!("/run/containers/{}", container_id);
+        let mut create_req = cloudhv_proto::CreateContainerRequest::new();
+        create_req.container_id = container_id.clone();
+        create_req.bundle_path = bundle_guest.clone();
+
+        // Add the ConfigMap as a FILESYSTEM volume (baked into disk)
+        let mut vol_mount = cloudhv_proto::VolumeMount::new();
+        vol_mount.destination = vol_dest.to_string();
+        vol_mount.source = format!("{}/volumes/{}", bundle_guest, vol_id);
+        vol_mount.volume_type = cloudhv_proto::VolumeType::FILESYSTEM.into();
+        vol_mount.readonly = true;
+        create_req.volumes.push(vol_mount);
+
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(30));
+        agent
+            .create_container(ctx, &create_req)
+            .await
+            .expect("CreateContainer");
+
+        let mut start_req = cloudhv_proto::StartContainerRequest::new();
+        start_req.container_id = container_id.clone();
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(30));
+        agent
+            .start_container(ctx, &start_req)
+            .await
+            .expect("StartContainer");
+
+        // Wait for the container to finish
+        let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
+        wait_req.container_id = container_id.clone();
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(60));
+        let wait_resp = agent
+            .wait_container(ctx, &wait_req)
+            .await
+            .expect("WaitContainer");
+        assert_eq!(
+            wait_resp.exit_status, 0,
+            "container should exit 0, got {}",
+            wait_resp.exit_status
         );
-        eprintln!("           │ ✅ Block volume hot-plugged, agent healthy");
-        drop(_agent2);
-        drop(health2);
+        eprintln!("           │ Container exited with status 0");
 
-        // ── Phase 4: Cleanup ──────────────────────────────────────────
-        eprintln!("  Phase 4 │ Cleaning up");
-        // Remove the hot-plugged block volume before shutdown
-        let remove_body = format!(r#"{{"id":"{vol_disk_id}"}}"#);
-        let _ = containerd_shim_cloudhv::vm::VmManager::api_request_to_socket(
-            vm.api_socket_path(),
-            "PUT",
-            "/api/v1/vm.remove-device",
-            Some(&remove_body),
-        )
-        .await;
+        // ── Phase 4: Verify volume data via container logs ────────────
+        eprintln!("  Phase 4 │ Verifying ConfigMap data in container output");
+
+        let mut log_req = cloudhv_proto::GetContainerLogsRequest::new();
+        log_req.container_id = container_id.clone();
+        log_req.offset = 0;
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(5));
+        let log_resp = agent
+            .get_container_logs(ctx, &log_req)
+            .await
+            .expect("GetContainerLogs");
+
+        let stdout = String::from_utf8_lossy(&log_resp.stdout);
+        assert!(
+            stdout.contains("setting=BAKED_VALUE"),
+            "stdout should contain ConfigMap data 'setting=BAKED_VALUE', got: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("env: production"),
+            "stdout should contain ConfigMap data 'env: production', got: {stdout:?}"
+        );
+        eprintln!("           │ ✅ ConfigMap data (app.conf) verified in container output");
+        eprintln!("           │ ✅ ConfigMap data (extra.yaml) verified in container output");
+
+        // ── Phase 5: Cleanup ──────────────────────────────────────────
+        eprintln!("  Phase 5 │ Cleaning up");
+        let mut del_req = cloudhv_proto::DeleteContainerRequest::new();
+        del_req.container_id = container_id.clone();
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(10));
+        let _ = agent.delete_container(ctx, &del_req).await;
+
+        drop(agent);
+        drop(_health);
         vm.cleanup().await.expect("cleanup");
-        let _ = std::fs::remove_file(&block_img);
+        let _ = std::fs::remove_file(&disk_path);
+        let _ = std::fs::remove_dir_all(&bundle_dir);
 
         eprintln!("╚══════════════════════════════════════════════════════════╝\n");
     });

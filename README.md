@@ -5,7 +5,7 @@ that runs container workloads inside lightweight microVMs with maximum density a
 
 ## Highlights
 
-- **~300ms cold start**, or **~30ms from snapshot restore** with pre-warmed pool
+- **~420ms end-to-end container lifecycle**
 - **VM isolation** — each pod runs in its own Cloud Hypervisor microVM with dedicated kernel
 - **Block device rootfs** — container images delivered as hot-plugged virtio-blk disks (no FUSE)
 - **Dual hypervisor** — same binary runs on KVM (Linux) and MSHV (Azure/Hyper-V)
@@ -24,7 +24,7 @@ migration, consider [Kata Containers](https://katacontainers.io/) instead.
 
 | | containerd-cloudhypervisor | Kata Containers |
 | --- | --- | --- |
-| **Cold start** | ~300ms boot, ~30ms snapshot restore | ~500ms–1s |
+| **Cold start** | ~420ms total e2e | ~500ms–1s |
 | **Shim binary** | 2.4 MB | ~50 MB |
 | **Guest rootfs** | 16 MB (agent + crun) | ~150 MB |
 | **Language** | Rust | Go |
@@ -52,7 +52,6 @@ sudo tee /opt/cloudhv/config.json > /dev/null <<EOF
   "kernel_args": "console=hvc0 root=/dev/vda rw quiet init=/init net.ifnames=0",
   "default_vcpus": 1,
   "default_memory_mb": 512,
-  "pool_size": 2,
   "max_containers_per_vm": 5
 }
 EOF
@@ -65,9 +64,9 @@ sudo cargo test -p containerd-shim-cloudhv --test integration -- --nocapture --t
 
 See the **[docs/](docs/)** folder for detailed documentation:
 
-- **[Architecture](docs/architecture.md)** — system design, networking, container rootfs, snapshot/restore
+- **[Architecture](docs/architecture.md)** — system design, networking, container rootfs, block-device-only architecture
 - **[Configuration](docs/configuration.md)** — runtime config reference and pod annotation overrides
-- **[Performance](docs/performance.md)** — benchmarks, cold boot, snapshot restore, resource overhead
+- **[Performance](docs/performance.md)** — benchmarks, cold boot, resource overhead
 - **[Development](docs/development.md)** — building, testing, contributing, code quality standards
 
 ## Examples

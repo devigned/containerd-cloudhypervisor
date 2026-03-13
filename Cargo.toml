@@ -35,7 +35,7 @@ log = "0.4"
 env_logger = "0.11"
 
 # System
-nix = { version = "0.29", features = ["signal", "mount", "sched", "process", "fs", "poll"] }
+nix = { version = "0.29", features = ["signal", "mount", "sched", "process", "fs", "poll", "user"] }
 libc = "0.2"
 
 # Time

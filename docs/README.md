@@ -4,9 +4,9 @@
 
 | Document | Description |
 |----------|-------------|
-| [Architecture](architecture.md) | System design, networking, container rootfs, logging, snapshot/restore |
+| [Architecture](architecture.md) | System design, networking, container rootfs, logging, block-device-only architecture, vsock logs |
 | [Configuration](configuration.md) | Runtime config reference and pod annotation overrides |
-| [Performance](performance.md) | Benchmarks, cold boot, snapshot restore, resource overhead |
+| [Performance](performance.md) | Benchmarks, cold boot, resource overhead, vsock logs |
 | [Development](development.md) | Building, testing, contributing, code quality standards |
 | [Releasing](releasing.md) | Release process, Helm chart, GHCR artifacts |
 

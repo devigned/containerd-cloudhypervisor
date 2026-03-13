@@ -70,35 +70,39 @@ Following the same approach as [firecracker-containerd](https://github.com/firec
 
 This avoids FUSE in the container data path and enables proper `pivot_root`.
 
-## Volumes (CSI, ConfigMap, Secret)
+## Volumes (CSI, ConfigMap, Secret, emptyDir)
 
-Kubernetes volumes are transported into the VM using a dual-path approach
-optimized for each volume type:
+All Kubernetes volume types are transported into the VM using block devices:
 
-| Volume Type | Host Form | Transport | Guest Access | Writes Persist |
-|-------------|-----------|-----------|-------------|----------------|
-| Block PVC (raw) | `/dev/sdX` | `vm.add-disk` hot-plug | `/dev/vdX` direct I/O | Yes |
-| Filesystem PVC | directory | virtio-fs bind mount | bind mount | Yes |
-| ConfigMap | directory | virtio-fs bind mount | bind mount | No (read-only) |
-| Secret | directory | virtio-fs bind mount | bind mount | No (read-only) |
-| emptyDir | directory | virtio-fs bind mount | bind mount | Yes (pod lifetime) |
+| Volume Type | Transport | Guest Access | Writes Persist |
+|-------------|-----------|-------------|----------------|
+| Block PVC (raw) | `vm.add-disk` hot-plug | `/dev/vdX` direct I/O | Yes |
+| Filesystem PVC | Baked into rootfs image | bind mount | Yes |
+| ConfigMap | Baked into rootfs image | bind mount | No (read-only) |
+| Secret | Baked into rootfs image | bind mount | No (read-only) |
+| emptyDir | Baked into rootfs image | bind mount | Yes (pod lifetime) |
 
 ### How It Works
 
 1. The shim reads the OCI spec's mounts array from the container bundle
-2. For each volume mount (skipping system mounts like `/proc`, `/dev`, `/sys`):
-   - **Block devices**: detected via `is_block_device()`, hot-plugged into the VM
-     via `vm.add-disk`, agent discovers and mounts the new `/dev/vdX` device
-   - **Filesystem paths**: bind-mounted into the virtio-fs shared directory,
-     giving the guest a live view of the host data through virtio-fs
-3. Volume metadata (destination, source, type, readonly) is passed to the agent
-   via the `CreateContainer` RPC
-4. The agent injects the volumes as mounts in the adapted OCI spec
-5. `crun` mounts them at the expected paths inside the container
+2. System mounts (`/proc`, `/dev`, `/sys`) are skipped
+3. For each volume:
+   - **Block devices**: hot-plugged into the VM via `vm.add-disk`, agent
+     discovers and mounts the new `/dev/vdX` device
+   - **Filesystem volumes**: source data is copied into the container's rootfs
+     disk image under `volumes/<hash>/` during `mkfs.ext4 -d` staging. The
+     agent bind-mounts them from the disk at the expected paths.
+4. Volume metadata is passed to the agent via the `CreateContainer` RPC
+5. The agent injects the volumes as mounts in the adapted OCI spec
 
-Block device passthrough avoids FUSE overhead for I/O-intensive workloads.
-Filesystem sharing via virtio-fs preserves write persistence — changes inside
-the container propagate back to the host PV.
+Read-only filesystem volumes (ConfigMaps, Secrets) are baked into the rootfs
+disk image alongside the container rootfs — one disk, one `mkfs.ext4 -d` call.
+Block PVCs and emptyDir volumes use separate hot-plugged disks. No FUSE, no
+loopback mounts, no shared filesystem.
+
+> **Limitation:** Writable filesystem PVCs are not currently supported.
+> Writes to baked-in volumes do not persist back to the host. This requires
+> a shared filesystem transport which is planned for a future release.
 
 ## Networking
 
@@ -120,42 +124,19 @@ network, fully transparent to CNI and Kubernetes services.
 
 ## Container Logs
 
-Container stdout/stderr flows from the guest to `kubectl logs` without any agent-side
-log infrastructure:
+Container stdout/stderr flows from the guest to `kubectl logs` via vsock:
 
-1. `crun` inside the VM writes stdout/stderr to files on the virtio-fs shared directory
-2. The host shim tails these files and forwards lines to containerd's stdio FIFOs
-3. containerd delivers them as standard container logs (`crictl logs`, `kubectl logs`)
+1. The guest agent captures `crun` stdout/stderr via piped file descriptors
+2. The agent buffers output and serves it via the `GetContainerLogs` ttrpc RPC
+3. The host shim polls `GetContainerLogs` every 10ms and writes to containerd's stdio FIFOs
+4. containerd delivers them as standard container logs (`crictl logs`, `kubectl logs`)
+
+This approach uses no shared filesystem — all log data flows over the existing
+vsock connection between the shim and the guest agent.
 
 Infrastructure errors (VM boot failures, API errors, disk hot-plug issues) are logged
 via the shim's own logger and appear in the containerd log (`journalctl -u containerd`),
 keeping operator diagnostics separate from application output.
-
-## Snapshot/Restore
-
-The `SnapshotManager` captures a **golden snapshot** of a fully-booted VM (kernel up,
-agent running) and restores copies in ~30ms instead of cold-booting (~300ms):
-
-1. **Golden snapshot creation** (one-time, ~115ms): boot a minimal VM (disk + vsock,
-   no virtiofs), verify agent health, pause, snapshot to disk, shut down
-2. **Restore** (~32ms): start new CH process, restore from snapshot with per-instance
-   config.json (rewritten vsock paths, symlinked memory file), resume
-3. **Post-restore networking** (~50ms): hot-add virtio-net via `vm.add-net` API
-
-The golden snapshot excludes virtiofs because the vhost-user protocol state cannot
-reconnect to a fresh virtiofsd after restore. Container operations that need the
-shared directory (disk image hot-plug, I/O file forwarding) use full VM boot.
-The VM pool uses snapshot restore when a golden snapshot is available, falling back
-to cold boot transparently.
-
-process instead of a separate daemon. This eliminates ~5 MB RSS per VM and reduces
-virtiofsd startup from ~10ms to ~277µs. The vhost-user socket is still created —
-Cloud Hypervisor connects to it the same way — but no child process is spawned.
-
-```bash
-```
-
-Requires `libseccomp-dev` and `libcap-ng-dev` on Linux.
 
 ## Dynamic Memory Management
 

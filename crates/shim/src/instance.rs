@@ -341,6 +341,8 @@ impl CloudHvInstance {
         let shared_dir = &vm_state.shared_dir;
 
         // Create an ext4 disk image from the rootfs and hot-plug it into the VM.
+        // Filesystem volumes (ConfigMaps, Secrets, emptyDir) are baked into the
+        // same image under volumes/<hash>/ to avoid extra disk operations.
         let rootfs_path = self.bundle.join("rootfs");
         let disk_id = format!("ctr-{}", &container_id[..12.min(container_id.len())]);
         let disk_path = shared_dir
@@ -348,39 +350,35 @@ impl CloudHvInstance {
             .unwrap_or(shared_dir)
             .join(format!("{}.img", disk_id));
 
+        // Extract volumes from OCI spec
+        let spec_path = self.bundle.join("config.json");
+        let volumes = extract_volumes(&spec_path).ctx("extract volumes")?;
         info!(
-            "creating disk image: {} from rootfs {}",
-            disk_path.display(),
-            rootfs_path.display()
+            "creating disk image with {} volumes: {}",
+            volumes.len(),
+            disk_path.display()
         );
 
         let bundle_str = self.bundle.to_string_lossy().to_string();
         let disk_path_clone = disk_path.clone();
         let rootfs_clone = rootfs_path.clone();
+        let volumes_clone = volumes.clone();
         tokio::task::spawn_blocking(move || {
-            create_rootfs_disk_image(&bundle_str, &rootfs_clone, &disk_path_clone)
+            create_rootfs_disk_image(&bundle_str, &rootfs_clone, &disk_path_clone, &volumes_clone)
         })
         .await
         .map_err(|_| Error::Any(anyhow::anyhow!("disk image task panicked")))?
         .ctx("disk image")?;
 
-        info!("disk image created: {}", disk_path.display());
-
         // Hot-plug the disk into the VM
         let disk_path_str = disk_path.to_string_lossy().to_string();
         let api_socket = vm_state.api_socket.clone();
-
-        info!(
-            "hot-plugging disk {} to VM via {}",
-            disk_id,
-            api_socket.display()
-        );
         let disk_json = serde_json::json!({
             "path": disk_path_str,
             "readonly": false,
             "id": disk_id,
         });
-        let add_disk_resp = VmManager::api_request_to_socket(
+        VmManager::api_request_to_socket(
             &api_socket,
             "PUT",
             "/api/v1/vm.add-disk",
@@ -388,15 +386,78 @@ impl CloudHvInstance {
         )
         .await
         .ctx("hot-plug disk")?;
-        info!("disk hot-plugged: {}", add_disk_resp);
+        info!("disk hot-plugged: {}", disk_id);
+
+        // Hot-plug separate empty disks for emptyDir volumes.
+        // These are shared across containers in the pod (writable, pod lifetime).
+        for vol in &volumes {
+            if !vol.is_empty_dir {
+                continue;
+            }
+            let edir_id = format!("edir-{}", &vol.volume_id[..8.min(vol.volume_id.len())]);
+            let edir_path = shared_dir
+                .parent()
+                .unwrap_or(shared_dir)
+                .join(format!("{}.img", edir_id));
+
+            // Create a small empty ext4 image
+            let f = std::fs::File::create(&edir_path).ctx("create emptyDir image")?;
+            f.set_len(16 * 1024 * 1024)?; // 16MB default
+            drop(f);
+            let status = std::process::Command::new("mkfs.ext4")
+                .args(["-q", "-F"])
+                .arg(&edir_path)
+                .status();
+            if status.map(|s| !s.success()).unwrap_or(true) {
+                info!("mkfs.ext4 failed for emptyDir {}", vol.destination);
+                continue;
+            }
+
+            let edir_json = serde_json::json!({
+                "path": edir_path.to_string_lossy(),
+                "readonly": false,
+                "id": edir_id,
+            });
+            VmManager::api_request_to_socket(
+                &api_socket,
+                "PUT",
+                "/api/v1/vm.add-disk",
+                Some(&edir_json.to_string()),
+            )
+            .await
+            .ctx("hot-plug emptyDir disk")?;
+            info!("emptyDir hot-plugged: {} for {}", edir_id, vol.destination);
+        }
 
         let bundle_guest = format!("/run/containers/{}", container_id);
 
-        // Send CreateContainer RPC to the guest agent
+        // Send CreateContainer RPC with volume mount info.
+        // Filesystem volumes have source paths rewritten to point inside the
+        // mounted disk at /run/containers/<id>/volumes/<hash>/
         {
             let mut create_req = cloudhv_proto::CreateContainerRequest::new();
             create_req.container_id = container_id.to_string();
-            create_req.bundle_path = bundle_guest;
+            create_req.bundle_path = bundle_guest.clone();
+            for vol in &volumes {
+                let mut vm = cloudhv_proto::VolumeMount::new();
+                vm.destination = vol.destination.clone();
+                if vol.is_block || vol.is_empty_dir {
+                    // Block PVCs and emptyDir: agent discovers hot-plugged device
+                    vm.source = vol.source.clone();
+                    vm.volume_type = cloudhv_proto::VolumeType::BLOCK.into();
+                    vm.fs_type = if vol.is_empty_dir {
+                        "ext4".to_string()
+                    } else {
+                        vol.fs_type.clone()
+                    };
+                } else {
+                    // Read-only filesystem volume: baked into rootfs disk
+                    vm.source = format!("{}/volumes/{}", bundle_guest, vol.volume_id);
+                    vm.volume_type = cloudhv_proto::VolumeType::FILESYSTEM.into();
+                }
+                vm.readonly = vol.readonly;
+                create_req.volumes.push(vm);
+            }
             let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
             agent.create_container(ctx, &create_req).await
         }
@@ -571,6 +632,129 @@ fn parse_sandbox_spec(
     (netns, annotations, req, lim)
 }
 
+/// Volume extracted from the OCI spec's mounts array.
+#[derive(Clone, Debug)]
+struct VolumeSpec {
+    destination: String,
+    source: String,
+    readonly: bool,
+    is_block: bool,
+    is_empty_dir: bool,
+    fs_type: String,
+    volume_id: String,
+}
+
+/// System mount destinations that should NOT be treated as volumes.
+const SYSTEM_MOUNTS: &[&str] = &[
+    "/proc",
+    "/dev",
+    "/dev/pts",
+    "/dev/mqueue",
+    "/dev/shm",
+    "/sys",
+    "/sys/fs/cgroup",
+];
+
+/// Extract volume mounts from the OCI spec. Returns an error if the spec
+/// cannot be read or parsed, since missing volumes would cause silent failures.
+fn extract_volumes(spec_path: &std::path::Path) -> anyhow::Result<Vec<VolumeSpec>> {
+    use anyhow::Context;
+
+    let data = std::fs::read_to_string(spec_path)
+        .with_context(|| format!("read OCI spec for volumes: {}", spec_path.display()))?;
+    let spec: serde_json::Value = serde_json::from_str(&data)
+        .with_context(|| format!("parse OCI spec: {}", spec_path.display()))?;
+
+    let mounts = match spec.pointer("/mounts").and_then(|m| m.as_array()) {
+        Some(m) => m,
+        None => return Ok(vec![]),
+    };
+
+    let mut volumes = Vec::new();
+    for mount in mounts {
+        let dest = mount
+            .get("destination")
+            .and_then(|d| d.as_str())
+            .unwrap_or("");
+        let source = mount.get("source").and_then(|s| s.as_str()).unwrap_or("");
+        let mount_type = mount.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let options = mount
+            .get("options")
+            .and_then(|o| o.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        // Skip system mounts
+        if SYSTEM_MOUNTS.contains(&dest) {
+            continue;
+        }
+        // Skip non-bind mounts (proc, tmpfs, sysfs, devpts, etc.)
+        if mount_type != "bind" {
+            continue;
+        }
+        // Skip empty source
+        if source.is_empty() {
+            continue;
+        }
+
+        let readonly = options.contains(&"ro");
+        let is_block = std::path::Path::new(source)
+            .metadata()
+            .map(|m| {
+                use std::os::unix::fs::FileTypeExt;
+                m.file_type().is_block_device()
+            })
+            .unwrap_or(false);
+
+        // Detect emptyDir: writable directory, typically under
+        // /var/lib/kubelet/pods/<uid>/volumes/kubernetes.io~empty-dir/
+        let is_empty_dir = !readonly && !is_block && source.contains("empty-dir");
+
+        // Generate a short stable ID for the volume (hash of destination)
+        let volume_id = format!("{:x}", {
+            let mut h: u64 = 5381;
+            for b in dest.bytes() {
+                h = h.wrapping_mul(33).wrapping_add(b as u64);
+            }
+            h
+        });
+
+        // Fix #9: don't default to ext4 — let agent auto-detect
+        let fs_type = if is_block {
+            detect_block_fs_type(source).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        volumes.push(VolumeSpec {
+            destination: dest.to_string(),
+            source: source.to_string(),
+            readonly,
+            is_block,
+            is_empty_dir,
+            fs_type,
+            volume_id,
+        });
+    }
+
+    Ok(volumes)
+}
+
+/// Detect filesystem type of a block device via blkid.
+/// Returns None when detection fails — the agent will try auto-detect.
+fn detect_block_fs_type(device: &str) -> Option<String> {
+    let output = std::process::Command::new("blkid")
+        .args(["-o", "value", "-s", "TYPE", device])
+        .output()
+        .ok()?;
+    let fs = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if fs.is_empty() {
+        None
+    } else {
+        Some(fs)
+    }
+}
+
 /// Create an ext4 disk image containing the OCI bundle (config.json + rootfs).
 ///
 /// Uses `mkfs.ext4 -d` to populate the image directly from a staging directory,
@@ -579,20 +763,19 @@ fn create_rootfs_disk_image(
     bundle_path: &str,
     rootfs_path: &std::path::Path,
     disk_path: &std::path::Path,
+    volumes: &[VolumeSpec],
 ) -> anyhow::Result<()> {
     use anyhow::Context;
     use std::process::Command;
 
-    // Calculate rootfs size
-    let rootfs_size = dir_size(rootfs_path)?;
-    // Add 50% headroom + 16MB for ext4 metadata, minimum 64MB
-    let image_size_mb = std::cmp::max(64, (rootfs_size * 3 / 2 / 1024 / 1024 + 16) as u64);
-
-    log::info!(
-        "creating disk image: {}MB for rootfs ({}MB content)",
-        image_size_mb,
-        rootfs_size / 1024 / 1024
-    );
+    // Calculate total size: rootfs + read-only volume data (emptyDir excluded)
+    let mut total_size = dir_size(rootfs_path)?;
+    for vol in volumes {
+        if !vol.is_block && !vol.is_empty_dir {
+            total_size += dir_size(std::path::Path::new(&vol.source)).context("volume dir_size")?;
+        }
+    }
+    let image_size_mb = std::cmp::max(64, (total_size * 3 / 2 / 1024 / 1024 + 16) as u64);
 
     // Create sparse file
     let f = std::fs::File::create(disk_path)
@@ -600,7 +783,7 @@ fn create_rootfs_disk_image(
     f.set_len(image_size_mb * 1024 * 1024)?;
     drop(f);
 
-    // Stage the directory layout that mkfs.ext4 -d will embed into the image
+    // Stage the directory layout for mkfs.ext4 -d
     let staging = disk_path.with_extension("staging");
     std::fs::create_dir_all(staging.join("rootfs"))?;
 
@@ -620,7 +803,40 @@ fn create_rootfs_disk_image(
         std::fs::copy(&config_src, staging.join("config.json"))?;
     }
 
-    // Create and populate ext4 image in one step (no loopback mount needed)
+    // Stage read-only filesystem volumes (ConfigMaps, Secrets) into volumes/<id>/.
+    // emptyDir and block volumes are NOT baked in — they get separate disks.
+    for vol in volumes {
+        if vol.is_block || vol.is_empty_dir {
+            continue;
+        }
+        let vol_staging = staging.join("volumes").join(&vol.volume_id);
+        std::fs::create_dir_all(&vol_staging)?;
+        let src = std::path::Path::new(&vol.source);
+        if src.is_dir() {
+            let status = Command::new("cp")
+                .args(["-a", "--"])
+                .arg(format!("{}/.", src.display()))
+                .arg(&vol_staging)
+                .status()
+                .context("cp volume data")?;
+            if !status.success() {
+                std::fs::remove_dir_all(&staging).ok();
+                anyhow::bail!("failed to copy volume {} to staging: {status}", vol.source);
+            }
+        } else if src.is_file() {
+            // Copy single file preserving permissions (pure Rust, no shell)
+            copy_preserving_metadata(src, &vol_staging.join(src.file_name().unwrap_or_default()))
+                .with_context(|| format!("copy volume file: {}", src.display()))?;
+        }
+        log::info!(
+            "staged volume: {} -> volumes/{} (ro={})",
+            vol.destination,
+            vol.volume_id,
+            vol.readonly
+        );
+    }
+
+    // Create and populate ext4 image in one step (no loopback mount)
     let status = Command::new("mkfs.ext4")
         .args(["-q", "-F", "-d"])
         .arg(&staging)
@@ -635,6 +851,21 @@ fn create_rootfs_disk_image(
     }
 
     log::info!("disk image created: {}", disk_path.display());
+    Ok(())
+}
+
+/// Copy a file preserving ownership and permissions (pure Rust, no shell).
+fn copy_preserving_metadata(src: &std::path::Path, dst: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    std::fs::copy(src, dst)?;
+    let meta = std::fs::metadata(src)?;
+    std::fs::set_permissions(dst, std::fs::Permissions::from_mode(meta.mode()))?;
+    nix::unistd::chown(
+        dst,
+        Some(nix::unistd::Uid::from_raw(meta.uid())),
+        Some(nix::unistd::Gid::from_raw(meta.gid())),
+    )?;
     Ok(())
 }
 
@@ -835,4 +1066,378 @@ fn prefix_to_netmask(prefix: u32) -> String {
         (mask >> 8) & 0xff,
         mask & 0xff,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Helper: compute the djb2 volume ID hash for a destination path.
+    fn volume_id_for(dest: &str) -> String {
+        let mut h: u64 = 5381;
+        for b in dest.bytes() {
+            h = h.wrapping_mul(33).wrapping_add(b as u64);
+        }
+        format!("{:x}", h)
+    }
+
+    /// Write an OCI spec JSON to a file with optional mounts.
+    fn write_spec(path: &std::path::Path, mounts: &[serde_json::Value]) {
+        let spec = serde_json::json!({
+            "ociVersion": "1.0.2",
+            "process": {
+                "terminal": false,
+                "user": { "uid": 0, "gid": 0 },
+                "args": ["/bin/sh"],
+                "env": ["PATH=/bin"],
+                "cwd": "/"
+            },
+            "root": { "path": "rootfs", "readonly": false },
+            "linux": { "namespaces": [{"type": "pid"}, {"type": "mount"}] },
+            "mounts": mounts,
+        });
+        fs::write(path, serde_json::to_string_pretty(&spec).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn extract_volumes_empty_spec() {
+        let dir = TempDir::new().unwrap();
+        let spec = dir.path().join("config.json");
+        write_spec(&spec, &[]);
+        let vols = extract_volumes(&spec).unwrap();
+        assert!(vols.is_empty());
+    }
+
+    #[test]
+    fn extract_volumes_skips_system_mounts() {
+        let dir = TempDir::new().unwrap();
+        let spec = dir.path().join("config.json");
+        write_spec(
+            &spec,
+            &[
+                serde_json::json!({"destination": "/proc", "source": "/proc", "type": "bind"}),
+                serde_json::json!({"destination": "/dev", "source": "/dev", "type": "bind"}),
+                serde_json::json!({"destination": "/sys", "source": "/sys", "type": "bind"}),
+                serde_json::json!({"destination": "/dev/pts", "source": "/dev/pts", "type": "bind"}),
+                serde_json::json!({"destination": "/dev/mqueue", "source": "/dev/mqueue", "type": "bind"}),
+                serde_json::json!({"destination": "/dev/shm", "source": "/dev/shm", "type": "bind"}),
+                serde_json::json!({"destination": "/sys/fs/cgroup", "source": "/sys/fs/cgroup", "type": "bind"}),
+            ],
+        );
+        let vols = extract_volumes(&spec).unwrap();
+        assert!(vols.is_empty(), "system mounts should be filtered out");
+    }
+
+    #[test]
+    fn extract_volumes_skips_non_bind_mounts() {
+        let dir = TempDir::new().unwrap();
+        let spec = dir.path().join("config.json");
+        write_spec(
+            &spec,
+            &[
+                serde_json::json!({"destination": "/tmp", "source": "tmpfs", "type": "tmpfs"}),
+                serde_json::json!({"destination": "/mnt/proc", "source": "proc", "type": "proc"}),
+            ],
+        );
+        let vols = extract_volumes(&spec).unwrap();
+        assert!(vols.is_empty(), "non-bind mounts should be filtered out");
+    }
+
+    #[test]
+    fn extract_volumes_detects_configmap_readonly() {
+        let dir = TempDir::new().unwrap();
+        // Create a real source dir so metadata() succeeds (it's not a block device)
+        let src = dir.path().join("configmap-data");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("key"), "value").unwrap();
+
+        let spec = dir.path().join("config.json");
+        write_spec(
+            &spec,
+            &[serde_json::json!({
+                "destination": "/etc/config",
+                "source": src.to_string_lossy(),
+                "type": "bind",
+                "options": ["rbind", "ro"]
+            })],
+        );
+        let vols = extract_volumes(&spec).unwrap();
+        assert_eq!(vols.len(), 1);
+        assert_eq!(vols[0].destination, "/etc/config");
+        assert!(vols[0].readonly, "should be readonly");
+        assert!(!vols[0].is_block, "directory is not a block device");
+        assert!(!vols[0].is_empty_dir, "no 'empty-dir' in path");
+        assert_eq!(vols[0].volume_id, volume_id_for("/etc/config"));
+    }
+
+    #[test]
+    fn extract_volumes_detects_emptydir() {
+        let dir = TempDir::new().unwrap();
+        // Source path must contain "empty-dir" (kubelet convention)
+        let src = dir
+            .path()
+            .join("pods/uid/volumes/kubernetes.io~empty-dir/scratch");
+        fs::create_dir_all(&src).unwrap();
+
+        let spec = dir.path().join("config.json");
+        write_spec(
+            &spec,
+            &[serde_json::json!({
+                "destination": "/scratch",
+                "source": src.to_string_lossy(),
+                "type": "bind",
+                "options": []
+            })],
+        );
+        let vols = extract_volumes(&spec).unwrap();
+        assert_eq!(vols.len(), 1);
+        assert!(vols[0].is_empty_dir, "path contains 'empty-dir'");
+        assert!(!vols[0].readonly, "emptyDir is writable");
+    }
+
+    #[test]
+    fn extract_volumes_readonly_emptydir_not_detected() {
+        let dir = TempDir::new().unwrap();
+        let src = dir
+            .path()
+            .join("pods/uid/volumes/kubernetes.io~empty-dir/cache");
+        fs::create_dir_all(&src).unwrap();
+
+        let spec = dir.path().join("config.json");
+        write_spec(
+            &spec,
+            &[serde_json::json!({
+                "destination": "/cache",
+                "source": src.to_string_lossy(),
+                "type": "bind",
+                "options": ["ro"]
+            })],
+        );
+        let vols = extract_volumes(&spec).unwrap();
+        assert_eq!(vols.len(), 1);
+        // emptyDir detection requires writable mount
+        assert!(
+            !vols[0].is_empty_dir,
+            "readonly mount should not be emptyDir"
+        );
+    }
+
+    #[test]
+    fn extract_volumes_multiple_volumes() {
+        let dir = TempDir::new().unwrap();
+
+        let cm_src = dir.path().join("cm");
+        fs::create_dir_all(&cm_src).unwrap();
+        fs::write(cm_src.join("app.conf"), "setting=1").unwrap();
+
+        let secret_src = dir.path().join("secret");
+        fs::create_dir_all(&secret_src).unwrap();
+        fs::write(secret_src.join("password"), "hunter2").unwrap();
+
+        let edir_src = dir
+            .path()
+            .join("pods/x/volumes/kubernetes.io~empty-dir/tmp");
+        fs::create_dir_all(&edir_src).unwrap();
+
+        let spec = dir.path().join("config.json");
+        write_spec(
+            &spec,
+            &[
+                serde_json::json!({
+                    "destination": "/etc/config",
+                    "source": cm_src.to_string_lossy(),
+                    "type": "bind",
+                    "options": ["ro"]
+                }),
+                serde_json::json!({
+                    "destination": "/etc/secrets",
+                    "source": secret_src.to_string_lossy(),
+                    "type": "bind",
+                    "options": ["ro"]
+                }),
+                serde_json::json!({
+                    "destination": "/tmp",
+                    "source": edir_src.to_string_lossy(),
+                    "type": "bind",
+                    "options": []
+                }),
+                // System mount — should be filtered
+                serde_json::json!({
+                    "destination": "/proc",
+                    "source": "/proc",
+                    "type": "bind"
+                }),
+            ],
+        );
+        let vols = extract_volumes(&spec).unwrap();
+        assert_eq!(vols.len(), 3, "3 user volumes, /proc filtered");
+        assert!(vols[0].readonly);
+        assert!(vols[1].readonly);
+        assert!(vols[2].is_empty_dir);
+    }
+
+    #[test]
+    fn extract_volumes_no_mounts_key() {
+        let dir = TempDir::new().unwrap();
+        let spec = dir.path().join("config.json");
+        let data = serde_json::json!({
+            "ociVersion": "1.0.2",
+            "process": { "args": ["/bin/sh"] },
+            "root": { "path": "rootfs" }
+        });
+        fs::write(&spec, serde_json::to_string(&data).unwrap()).unwrap();
+        let vols = extract_volumes(&spec).unwrap();
+        assert!(vols.is_empty());
+    }
+
+    #[test]
+    fn extract_volumes_invalid_json_is_error() {
+        let dir = TempDir::new().unwrap();
+        let spec = dir.path().join("config.json");
+        fs::write(&spec, "not json").unwrap();
+        assert!(extract_volumes(&spec).is_err());
+    }
+
+    #[test]
+    fn extract_volumes_missing_file_is_error() {
+        let result = extract_volumes(std::path::Path::new("/nonexistent/config.json"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn copy_preserving_metadata_copies_content_and_permissions() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("source.txt");
+        let dst = dir.path().join("dest.txt");
+        fs::write(&src, "hello world").unwrap();
+
+        // Set specific permissions
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o644)).unwrap();
+
+        copy_preserving_metadata(&src, &dst).unwrap();
+
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "hello world");
+        let src_meta = fs::metadata(&src).unwrap();
+        let dst_meta = fs::metadata(&dst).unwrap();
+        assert_eq!(
+            src_meta.permissions().mode() & 0o777,
+            dst_meta.permissions().mode() & 0o777
+        );
+    }
+
+    #[test]
+    fn dir_size_counts_nested_files() {
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(dir.path().join("a.txt"), "aaaa").unwrap(); // 4 bytes
+        fs::write(sub.join("b.txt"), "bbbbbbbb").unwrap(); // 8 bytes
+        let size = super::dir_size(dir.path()).unwrap();
+        assert!(size >= 12, "total should be at least 12 bytes, got {size}");
+    }
+
+    #[test]
+    fn dir_size_empty_dir() {
+        let dir = TempDir::new().unwrap();
+        let size = super::dir_size(dir.path()).unwrap();
+        assert_eq!(size, 0);
+    }
+
+    #[test]
+    fn volume_id_is_deterministic() {
+        let id1 = volume_id_for("/etc/config");
+        let id2 = volume_id_for("/etc/config");
+        assert_eq!(id1, id2);
+        // Different paths produce different IDs
+        let id3 = volume_id_for("/etc/secrets");
+        assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn create_rootfs_disk_image_with_volumes() {
+        // Skip if mkfs.ext4 isn't available
+        if std::process::Command::new("which")
+            .arg("mkfs.ext4")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("SKIPPING: mkfs.ext4 not available");
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+
+        // Create a minimal rootfs
+        let rootfs = dir.path().join("rootfs");
+        fs::create_dir_all(rootfs.join("bin")).unwrap();
+        fs::write(rootfs.join("bin/hello"), "#!/bin/sh\necho hi\n").unwrap();
+
+        // Create bundle with config.json
+        let bundle = dir.path().join("bundle");
+        fs::create_dir_all(&bundle).unwrap();
+        let config = serde_json::json!({
+            "ociVersion": "1.0.2",
+            "process": { "args": ["/bin/hello"] },
+            "root": { "path": "rootfs" }
+        });
+        fs::write(
+            bundle.join("config.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+
+        // Create ConfigMap volume data
+        let cm_src = dir.path().join("cm-vol");
+        fs::create_dir_all(&cm_src).unwrap();
+        fs::write(cm_src.join("app.conf"), "key=value\n").unwrap();
+        fs::write(cm_src.join("extra.yaml"), "foo: bar\n").unwrap();
+
+        let volumes = vec![
+            VolumeSpec {
+                destination: "/etc/config".to_string(),
+                source: cm_src.to_string_lossy().to_string(),
+                readonly: true,
+                is_block: false,
+                is_empty_dir: false,
+                fs_type: String::new(),
+                volume_id: volume_id_for("/etc/config"),
+            },
+            // emptyDir should be skipped (separate disk)
+            VolumeSpec {
+                destination: "/tmp".to_string(),
+                source: "/var/lib/kubelet/pods/x/volumes/kubernetes.io~empty-dir/tmp".to_string(),
+                readonly: false,
+                is_block: false,
+                is_empty_dir: true,
+                fs_type: String::new(),
+                volume_id: volume_id_for("/tmp"),
+            },
+        ];
+
+        let disk = dir.path().join("container.img");
+        create_rootfs_disk_image(&bundle.to_string_lossy(), &rootfs, &disk, &volumes)
+            .expect("create_rootfs_disk_image should succeed");
+
+        // Verify the disk image was created and is non-trivial
+        let meta = fs::metadata(&disk).unwrap();
+        assert!(meta.len() > 0, "disk image should not be empty");
+
+        // Verify staging directory was cleaned up
+        assert!(
+            !disk.with_extension("staging").exists(),
+            "staging dir should be cleaned up"
+        );
+    }
+
+    #[test]
+    fn prefix_to_netmask_common_values() {
+        assert_eq!(super::prefix_to_netmask(24), "255.255.255.0");
+        assert_eq!(super::prefix_to_netmask(16), "255.255.0.0");
+        assert_eq!(super::prefix_to_netmask(32), "255.255.255.255");
+        assert_eq!(super::prefix_to_netmask(0), "0.0.0.0");
+    }
 }

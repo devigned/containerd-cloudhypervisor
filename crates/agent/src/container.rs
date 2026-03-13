@@ -238,7 +238,8 @@ impl ContainerManager {
                     vol.source, vol.destination, dev_path, vol.fs_type
                 );
             } else {
-                // Filesystem volumes: bind-mount from the virtio-fs shared dir
+                // Filesystem volumes: bind-mount from the container's disk
+                // (data baked into the rootfs image by the shim)
                 let mut opts = vec!["rbind".to_string()];
                 if vol.readonly {
                     opts.push("ro".to_string());
