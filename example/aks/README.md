@@ -19,7 +19,7 @@ CLUSTER="cloudhv-demo"
 # Create resource group
 az group create --name "$RG" --location "$REGION"
 
-# Create cluster with a system node pool
+# Create cluster with a system node pool (Azure Linux for nested virt support)
 az aks create \
   --resource-group "$RG" \
   --name "$CLUSTER" \
@@ -28,7 +28,8 @@ az aks create \
   --node-vm-size Standard_D2s_v5 \
   --nodepool-name system \
   --generate-ssh-keys \
-  --network-plugin azure
+  --network-plugin azure \
+  --os-sku AzureLinux
 
 # Add a worker pool with the cloudhv label (3 nodes with nested virt)
 az aks nodepool add \
@@ -36,8 +37,10 @@ az aks nodepool add \
   --cluster-name "$CLUSTER" \
   --name cloudhv \
   --node-count 3 \
-  --node-vm-size Standard_D4s_v5 \
-  --labels workload=cloudhv
+  --node-vm-size Standard_D8s_v5 \
+  --max-pods 60 \
+  --labels workload=cloudhv \
+  --os-sku AzureLinux
 
 # Get credentials
 az aks get-credentials --resource-group "$RG" --name "$CLUSTER"
@@ -46,18 +49,21 @@ az aks get-credentials --resource-group "$RG" --name "$CLUSTER"
 ## 2. Install the Shim with Helm
 
 The Helm chart is published to GHCR as an OCI artifact with each release.
+Check [Releases](https://github.com/devigned/containerd-cloudhypervisor/releases)
+for the latest version.
 
 ```bash
-# Install the latest release
+# Install (replace version with the latest release)
 helm install cloudhv-installer \
   oci://ghcr.io/devigned/charts/cloudhv-installer \
-  --version 0.1.3 \
+  --version 0.5.3 \
   --namespace kube-system
 ```
 
 This creates:
+- A **DaemonSet** that installs the shim binary, guest kernel, rootfs, and
   Cloud Hypervisor onto each node labeled `workload=cloudhv`
-- A **RuntimeClass** named `cloudhv` with pod overhead annotations
+- A **RuntimeClass** named `cloudhv` with pod overhead annotations (10m CPU, 50Mi memory)
 
 Verify installation:
 
@@ -78,7 +84,7 @@ Deploy an HTTP echo server as a Deployment with a Service, making it easy to
 scale up and down. Each replica runs inside its own Cloud Hypervisor microVM.
 
 ```bash
-kubectl apply -f - <<EOF
+kubectl apply -f - <<YAML
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -118,7 +124,7 @@ spec:
     - port: 80
       targetPort: 5678
   type: LoadBalancer
-EOF
+YAML
 
 # Wait for the deployment to be ready
 kubectl rollout status deployment echo-cloudhv
@@ -135,11 +141,12 @@ curl http://$EXTERNAL_IP/
 
 ### Scale Up
 
-Each new replica boots a fresh microVM in ~300-400ms (faster with rootfs caching):
+Each new replica boots a fresh microVM. With rootfs caching, subsequent pods
+of the same image start in ~300ms:
 
 ```bash
-# Scale to 5 replicas (5 VMs across 3 nodes)
-kubectl scale deployment echo-cloudhv --replicas=5
+# Scale to 150 replicas (150 VMs across 3 D8s_v5 nodes)
+kubectl scale deployment echo-cloudhv --replicas=150
 kubectl get pods -l app=echo-cloudhv -o wide -w
 ```
 
@@ -194,7 +201,8 @@ az group delete --name "$RG" --yes --no-wait
 | `image.tag` | `v<appVersion>` | Image tag |
 | `nodeSelector` | `workload: cloudhv` | Target nodes |
 | `runtimeClass.enabled` | `true` | Create RuntimeClass |
-| `runtimeClass.overhead.memory` | `50Mi` | Pod overhead |
+| `runtimeClass.overhead.cpu` | `10m` | Pod CPU overhead |
+| `runtimeClass.overhead.memory` | `50Mi` | Pod memory overhead |
 
 See [`charts/cloudhv-installer/values.yaml`](../../charts/cloudhv-installer/values.yaml)
 for all configurable values.
