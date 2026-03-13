@@ -10,7 +10,7 @@ use tokio::process::{Child, Command};
 use tokio::time::Duration;
 
 use cloudhv_common::types::*;
-use cloudhv_common::{GUEST_CID_START, RUNTIME_STATE_DIR, VIRTIOFS_TAG};
+use cloudhv_common::{GUEST_CID_START, RUNTIME_STATE_DIR};
 
 /// Global CID counter for allocating unique vsock CIDs to each VM.
 static NEXT_CID: AtomicU64 = AtomicU64::new(GUEST_CID_START);
@@ -31,19 +31,12 @@ pub struct VmManager {
     api_socket: PathBuf,
     /// Path to the vsock socket (host-side).
     vsock_socket: PathBuf,
-    /// Path to the virtiofsd socket.
-    virtiofsd_socket: PathBuf,
-    /// Shared directory for virtio-fs.
+    /// Shared directory for VM state (disk images, etc.).
     shared_dir: PathBuf,
     /// Path to the swtpm socket (if TPM enabled).
     tpm_socket: PathBuf,
     /// Cloud Hypervisor child process.
     ch_process: Option<Child>,
-    /// virtiofsd child process (used when embedded-virtiofsd feature is disabled).
-    virtiofsd_process: Option<Child>,
-    /// In-process virtiofsd backend (used when embedded-virtiofsd feature is enabled).
-    #[cfg(all(target_os = "linux", feature = "embedded-virtiofsd"))]
-    virtiofsd_backend: Option<crate::virtfs::VirtiofsBackend>,
     /// swtpm child process (if TPM enabled).
     swtpm_process: Option<Child>,
     /// Runtime configuration.
@@ -57,7 +50,6 @@ impl VmManager {
         let state_dir = PathBuf::from(RUNTIME_STATE_DIR).join(&vm_id);
         let api_socket = state_dir.join("api.sock");
         let vsock_socket = state_dir.join("vsock.sock");
-        let virtiofsd_socket = state_dir.join("virtiofsd.sock");
         let shared_dir = state_dir.join("shared");
         let tpm_socket = state_dir.join("tpm.sock");
 
@@ -74,13 +66,9 @@ impl VmManager {
             state_dir,
             api_socket,
             vsock_socket,
-            virtiofsd_socket,
             shared_dir,
             tpm_socket,
             ch_process: None,
-            virtiofsd_process: None,
-            #[cfg(all(target_os = "linux", feature = "embedded-virtiofsd"))]
-            virtiofsd_backend: None,
             swtpm_process: None,
             config,
         })
@@ -138,51 +126,6 @@ impl VmManager {
             "swtpm socket did not appear at {}",
             self.tpm_socket.display()
         );
-    }
-
-    /// Start virtiofsd to serve the shared directory.
-    ///
-    /// When the `embedded-virtiofsd` feature is enabled, runs virtiofsd
-    /// in-process as a thread (no child process, ~5MB RSS saved per VM).
-    /// Otherwise, spawns the virtiofsd binary as a child process.
-    ///
-    /// Returns immediately — use `wait_virtiofsd_ready()` to wait for the socket.
-    pub fn spawn_virtiofsd(&mut self) -> Result<()> {
-        #[cfg(all(target_os = "linux", feature = "embedded-virtiofsd"))]
-        {
-            let backend =
-                crate::virtfs::VirtiofsBackend::start(&self.virtiofsd_socket, &self.shared_dir)
-                    .context("failed to start embedded virtiofsd")?;
-            self.virtiofsd_backend = Some(backend);
-            Ok(())
-        }
-
-        #[cfg(not(all(target_os = "linux", feature = "embedded-virtiofsd")))]
-        {
-            let child = Command::new(&self.config.virtiofsd_binary)
-                .arg(format!("--socket-path={}", self.virtiofsd_socket.display()))
-                .arg(format!("--shared-dir={}", self.shared_dir.display()))
-                .arg("--cache=never")
-                .arg("--sandbox=none")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .context("failed to spawn virtiofsd")?;
-            self.virtiofsd_process = Some(child);
-            Ok(())
-        }
-    }
-
-    /// Wait for virtiofsd socket to appear.
-    pub async fn wait_virtiofsd_ready(&self) -> Result<()> {
-        for _ in 0..200 {
-            if self.virtiofsd_socket.exists() {
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        anyhow::bail!("virtiofsd socket did not appear");
     }
 
     /// Start the Cloud Hypervisor VMM process.
@@ -282,12 +225,7 @@ impl VmManager {
                 id: None,
             }],
             net,
-            fs: vec![VmFs {
-                tag: VIRTIOFS_TAG.to_string(),
-                socket: self.virtiofsd_socket.to_string_lossy().to_string(),
-                num_queues: 1,
-                queue_size: 128,
-            }],
+            fs: vec![],
             vsock: Some(VmVsock {
                 cid: self.cid,
                 socket: self.vsock_socket.to_string_lossy().to_string(),
@@ -499,19 +437,6 @@ impl VmManager {
             let _ = child.wait().await;
         }
 
-        // Kill virtiofsd if still running
-        if let Some(ref mut child) = self.virtiofsd_process {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-        }
-
-        // Stop embedded virtiofsd backend (thread exits when CH disconnects,
-        // which we ensured above by killing the CH process).
-        #[cfg(all(target_os = "linux", feature = "embedded-virtiofsd"))]
-        {
-            self.virtiofsd_backend.take();
-        }
-
         // Clean up swtpm if running
         if let Some(ref mut child) = self.swtpm_process {
             let _ = child.kill().await;
@@ -630,7 +555,6 @@ impl Drop for VmManager {
         // Kill child processes aggressively — SIGKILL to prevent orphans
         for (name, proc) in [
             ("cloud-hypervisor", &mut self.ch_process),
-            ("virtiofsd", &mut self.virtiofsd_process),
             ("swtpm", &mut self.swtpm_process),
         ] {
             if let Some(child) = proc.take() {

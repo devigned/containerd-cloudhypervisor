@@ -31,8 +31,6 @@ struct Container {
     pid: Option<u32>,
     exit_code: Option<i32>,
     state: ContainerState,
-    stdout_path: Option<String>,
-    stderr_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -42,6 +40,14 @@ pub enum ContainerState {
     Stopped,
 }
 
+/// Captured container output (buffered for streaming via RPC).
+#[derive(Debug, Default)]
+pub struct ContainerLogs {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub eof: bool,
+}
+
 /// Manages container lifecycle via crun.
 pub struct ContainerManager {
     containers: HashMap<String, Container>,
@@ -49,6 +55,8 @@ pub struct ContainerManager {
     known_disks: std::collections::HashSet<String>,
     /// Watch receivers for container exit notifications.
     exit_receivers: HashMap<String, watch::Receiver<Option<ExitStatus>>>,
+    /// Buffered container logs (stdout/stderr captured from crun).
+    logs: HashMap<String, std::sync::Arc<tokio::sync::Mutex<ContainerLogs>>>,
 }
 
 impl Default for ContainerManager {
@@ -64,6 +72,7 @@ impl ContainerManager {
             containers: HashMap::new(),
             known_disks,
             exit_receivers: HashMap::new(),
+            logs: HashMap::new(),
         }
     }
 
@@ -278,8 +287,6 @@ impl ContainerManager {
         &mut self,
         container_id: &str,
         bundle_path: &str,
-        stdout_path: Option<&str>,
-        stderr_path: Option<&str>,
         volumes: &[VolumeInfo],
     ) -> Result<u32> {
         info!("creating container: id={}", container_id);
@@ -318,8 +325,6 @@ impl ContainerManager {
                 pid: Some(pid),
                 exit_code: None,
                 state: ContainerState::Created,
-                stdout_path: stdout_path.map(String::from),
-                stderr_path: stderr_path.map(String::from),
             },
         );
         info!("container created: id={}", container_id);
@@ -330,39 +335,22 @@ impl ContainerManager {
     pub async fn start(&mut self, container_id: &str) -> Result<u32> {
         info!("starting container: {}", container_id);
 
-        let container = self
+        let _container = self
             .containers
             .get(container_id)
             .ok_or_else(|| anyhow::anyhow!("container not found: {}", container_id))?;
 
-        // Open stdout/stderr files for crun output (shared dir → host via virtio-fs).
-        // The shim tails these files and forwards to containerd FIFOs (kubectl logs).
-        let stdout_file = match &container.stdout_path {
-            Some(path) => Stdio::from(
-                std::fs::File::create(path)
-                    .with_context(|| format!("create stdout file: {path}"))?,
-            ),
-            None => Stdio::null(),
-        };
-        let stderr_file = match &container.stderr_path {
-            Some(path) => Stdio::from(
-                std::fs::File::create(path)
-                    .with_context(|| format!("create stderr file: {path}"))?,
-            ),
-            None => Stdio::null(),
-        };
-
         // Bundle path matches the mount point created in create().
         let bundle = PathBuf::from("/run/containers").join(container_id);
 
-        let child = Command::new("/bin/crun")
+        let mut child = Command::new("/bin/crun")
             .arg("run")
             .arg("--bundle")
             .arg(&bundle)
             .arg(container_id)
             .stdin(Stdio::null())
-            .stdout(stdout_file)
-            .stderr(stderr_file)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("spawn crun run (bundle={})", bundle.display()))?;
 
@@ -374,53 +362,66 @@ impl ContainerManager {
         }
         info!("container started: id={}, pid={}", container_id, pid);
 
+        // Create shared log buffer for streaming via GetContainerLogs RPC
+        let log_buf = std::sync::Arc::new(tokio::sync::Mutex::new(ContainerLogs::default()));
+        self.logs.insert(container_id.to_string(), log_buf.clone());
+
         // Create a watch channel for exit notification.
-        // Insert the receiver AFTER the spawn succeeds so we never orphan it.
         let (tx, rx) = watch::channel::<Option<ExitStatus>>(None);
 
-        // Wait for exit in background and send status through the watch channel
+        // Take stdout/stderr handles from child for streaming capture
+        let child_stdout = child.stdout.take();
+        let child_stderr = child.stderr.take();
+
+        // Spawn stdout reader
+        let log_buf_out = log_buf.clone();
+        if let Some(stdout) = child_stdout {
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut reader = stdout;
+                let mut buf = [0u8; 4096];
+                loop {
+                    match reader.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            log_buf_out.lock().await.stdout.extend_from_slice(&buf[..n]);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+
+        // Spawn stderr reader
+        let log_buf_err = log_buf.clone();
+        if let Some(stderr) = child_stderr {
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut reader = stderr;
+                let mut buf = [0u8; 4096];
+                loop {
+                    match reader.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            log_buf_err.lock().await.stderr.extend_from_slice(&buf[..n]);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+
+        // Wait for exit in background
         let container_id_owned = container_id.to_string();
         tokio::spawn(async move {
-            match child.wait_with_output().await {
-                Ok(output) => {
-                    let code = output.status.code().unwrap_or(137);
-                    info!(
-                        "container exited: id={} status={}",
-                        container_id_owned, output.status,
-                    );
-                    let _ = tx.send(Some(ExitStatus {
-                        code,
-                        exited_at: chrono::Utc::now().to_rfc3339(),
-                    }));
-
-                    // Write exit file to virtio-fs for fast host-side detection
-                    let exit_path = format!(
-                        "{}/io/{}/exit",
-                        cloudhv_common::VIRTIOFS_GUEST_MOUNT,
-                        container_id_owned
-                    );
-                    if let Err(e) = std::fs::write(&exit_path, code.to_string()) {
-                        warn!("failed to write exit file {}: {}", exit_path, e);
-                    }
-                }
-                Err(e) => {
-                    error!("container wait error: id={} err={}", container_id_owned, e);
-                    let _ = tx.send(Some(ExitStatus {
-                        code: 137,
-                        exited_at: chrono::Utc::now().to_rfc3339(),
-                    }));
-
-                    // Write exit file with error code for host-side detection
-                    let exit_path = format!(
-                        "{}/io/{}/exit",
-                        cloudhv_common::VIRTIOFS_GUEST_MOUNT,
-                        container_id_owned
-                    );
-                    if let Err(e) = std::fs::write(&exit_path, "137") {
-                        warn!("failed to write exit file {}: {}", exit_path, e);
-                    }
-                }
-            }
+            let status = child.wait().await;
+            let code = status.map(|s| s.code().unwrap_or(137)).unwrap_or(137);
+            info!("container exited: id={} code={}", container_id_owned, code);
+            log_buf.lock().await.eof = true;
+            let _ = tx.send(Some(ExitStatus {
+                code,
+                exited_at: chrono::Utc::now().to_rfc3339(),
+            }));
         });
 
         self.exit_receivers.insert(container_id.to_string(), rx);
@@ -512,6 +513,14 @@ impl ContainerManager {
             c.state = ContainerState::Stopped;
             c.exit_code = Some(code);
         }
+    }
+
+    /// Get the log buffer for a container (for streaming via GetContainerLogs RPC).
+    pub fn get_log_buffer(
+        &self,
+        id: &str,
+    ) -> Option<std::sync::Arc<tokio::sync::Mutex<ContainerLogs>>> {
+        self.logs.get(id).cloned()
     }
 
     /// Get the state of a container as a proto response.

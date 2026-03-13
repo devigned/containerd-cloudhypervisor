@@ -125,7 +125,6 @@ ghcr.io/devigned/cloudhv-installer:v0.1.0
 
 The chart is at `charts/cloudhv-installer/` and installs:
 
-- **DaemonSet**: copies shim, kernel, rootfs, virtiofsd, and Cloud Hypervisor
   onto each selected node, patches containerd config, restarts containerd
 - **RuntimeClass**: registers the `cloudhv` runtime handler with pod overhead
   annotations for accurate Kubernetes scheduler accounting

@@ -7,7 +7,6 @@ The shim loads its configuration from `/opt/cloudhv/config.json` at startup.
 | Field | Default | Description |
 |-------|---------|-------------|
 | `cloud_hypervisor_binary` | `/usr/local/bin/cloud-hypervisor` | Path to CH binary |
-| `virtiofsd_binary` | `/usr/libexec/virtiofsd` | Path to virtiofsd |
 | `kernel_path` | — | Path to guest vmlinux |
 | `rootfs_path` | — | Path to guest rootfs.ext4 |
 | `kernel_args` | `console=hvc0 root=/dev/vda rw quiet init=/init net.ifnames=0` | Guest kernel cmdline (see [Architecture Notes](#architecture-notes)) |
@@ -24,7 +23,6 @@ The shim loads its configuration from `/opt/cloudhv/config.json` at startup.
 ```json
 {
   "cloud_hypervisor_binary": "/usr/local/bin/cloud-hypervisor",
-  "virtiofsd_binary": "/usr/libexec/virtiofsd",
   "kernel_path": "/opt/cloudhv/vmlinux",
   "rootfs_path": "/opt/cloudhv/rootfs.ext4",
   "kernel_args": "console=hvc0 root=/dev/vda rw quiet init=/init net.ifnames=0",

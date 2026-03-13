@@ -12,7 +12,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY opt/cloudhv/ /opt/cloudhv/
 
 RUN chmod +x /opt/cloudhv/containerd-shim-cloudhv-v1 \
-             /opt/cloudhv/virtiofsd \
              /opt/cloudhv/install.sh
 
 ENTRYPOINT ["/opt/cloudhv/install.sh"]

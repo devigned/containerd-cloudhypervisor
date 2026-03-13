@@ -35,7 +35,7 @@ containerd           │                                                        
   creates disk images, hot-plugs block devices, sets up networking, forwards logs.
 - **Guest agent** (`cloudhv-agent`): PID 1 in the VM, discovers hot-plugged disks, adapts
   OCI specs, delegates to crun. Built as a separate workspace with its own ttrpc 0.9 dependency.
-- **Communication**: vsock + ttrpc — no network stack for the control plane.
+- **Communication: vsock + ttrpc — no network stack, no shared filesystem.
 - **Container runtime**: crun (1.8 MB static) — lighter than runc (10 MB).
 - **Kernel**: Custom kernel (~27 MB) with virtio, vsock, BPF, ACPI hot-plug,
   IP_PNP, and virtio-net. Supports both x86_64 (PVH boot, `console=hvc0`) and
@@ -148,15 +148,11 @@ shared directory (disk image hot-plug, I/O file forwarding) use full VM boot.
 The VM pool uses snapshot restore when a golden snapshot is available, falling back
 to cold boot transparently.
 
-## Embedded virtiofsd
-
-With the `embedded-virtiofsd` feature, virtiofsd runs as a thread inside the shim
 process instead of a separate daemon. This eliminates ~5 MB RSS per VM and reduces
 virtiofsd startup from ~10ms to ~277µs. The vhost-user socket is still created —
 Cloud Hypervisor connects to it the same way — but no child process is spawned.
 
 ```bash
-cargo build --release -p containerd-shim-cloudhv --features embedded-virtiofsd
 ```
 
 Requires `libseccomp-dev` and `libcap-ng-dev` on Linux.

@@ -4,10 +4,6 @@ use anyhow::Result;
 #[cfg(target_os = "linux")]
 use log::debug;
 use log::info;
-use log::warn;
-
-#[cfg(target_os = "linux")]
-use cloudhv_common::{VIRTIOFS_GUEST_MOUNT, VIRTIOFS_TAG};
 
 /// Mount essential filesystems for a minimal init environment.
 ///
@@ -89,55 +85,6 @@ pub fn mount_essential_filesystems() -> Result<()> {
 #[cfg(not(target_os = "linux"))]
 pub fn mount_essential_filesystems() -> Result<()> {
     info!("mount_essential_filesystems: no-op on non-Linux");
-    Ok(())
-}
-
-/// Mount the virtio-fs shared filesystem from the host.
-#[cfg(target_os = "linux")]
-pub fn mount_virtiofs() -> Result<()> {
-    use nix::mount::{mount, MsFlags};
-
-    let mount_point = VIRTIOFS_GUEST_MOUNT;
-    std::fs::create_dir_all(mount_point)
-        .with_context(|| format!("failed to create mount point: {mount_point}"))?;
-
-    // Retry the mount — the virtio-fs device may not be ready immediately
-    // after the kernel boots (vhost-user handshake with virtiofsd is async).
-    for attempt in 1..=10 {
-        match mount(
-            Some(VIRTIOFS_TAG),
-            mount_point,
-            Some("virtiofs"),
-            MsFlags::empty(),
-            None::<&str>,
-        ) {
-            Ok(()) => {
-                info!("virtio-fs mounted at {} (attempt {})", mount_point, attempt);
-                return Ok(());
-            }
-            Err(e) if attempt < 10 => {
-                warn!(
-                    "virtio-fs mount attempt {}/10 failed: {} (retrying in 100ms)",
-                    attempt, e
-                );
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            Err(e) => {
-                anyhow::bail!(
-                    "failed to mount virtio-fs tag={} at {} after 10 attempts: {}",
-                    VIRTIOFS_TAG,
-                    mount_point,
-                    e
-                );
-            }
-        }
-    }
-    unreachable!()
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn mount_virtiofs() -> Result<()> {
-    info!("mount_virtiofs: no-op on non-Linux");
     Ok(())
 }
 

@@ -10,8 +10,6 @@ make fmt            # Format code
 make clippy         # Run clippy
 make test           # Run unit tests
 
-# With embedded virtiofsd (eliminates ~5MB RSS per VM):
-cargo build --release -p containerd-shim-cloudhv --features embedded-virtiofsd
 # Requires libseccomp-dev and libcap-ng-dev on Linux
 ```
 
@@ -35,7 +33,6 @@ with the agent's ttrpc 0.9 server over vsock.
 - **protobuf-compiler** (`protoc`) — for ttrpc code generation
 - **Linux with KVM** — for integration tests (`/dev/kvm`)
 - **Cloud Hypervisor** — VMM binary
-- **virtiofsd** — virtio-fs daemon (or use `--features embedded-virtiofsd`)
 
 ## Guest Artifacts
 
@@ -88,7 +85,6 @@ Set environment variables to override default paths:
 | `CLOUDHV_TEST_KERNEL` | `guest/kernel/vmlinux` | Path to guest kernel |
 | `CLOUDHV_TEST_ROOTFS` | `guest/rootfs/rootfs.ext4` | Path to guest rootfs |
 | `CLOUDHV_TEST_CH_BIN` | `/usr/local/bin/cloud-hypervisor` | Path to CH binary |
-| `CLOUDHV_TEST_VFSD` | `/usr/libexec/virtiofsd` | Path to virtiofsd |
 | `CLOUDHV_TEST_HTTP_ECHO` | `/usr/local/bin/http-echo` | Path to http-echo binary |
 
 Tests that require `http-echo` (container networking, multi-container, e2e benchmark)

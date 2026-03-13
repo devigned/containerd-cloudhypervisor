@@ -11,7 +11,6 @@
 #   /opt/cloudhv/rootfs.ext4                 (guest rootfs)
 #   /opt/cloudhv/install.sh                  (node install script)
 
-# --- Stage 1: Build shim + agent + virtiofsd ---
 FROM rust:1-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
@@ -31,8 +30,6 @@ RUN cargo build --release -p containerd-shim-cloudhv
 # Build agent (separate workspace)
 RUN cd crates/agent && cargo build --release --target x86_64-unknown-linux-musl
 
-# Build virtiofsd (virtio-fs daemon needed by the shim for host↔guest fs sharing)
-RUN cargo install virtiofsd --root /virtiofsd-out
 
 # --- Stage 2: Build guest kernel ---
 FROM debian:bookworm-slim AS kernel-builder
@@ -83,11 +80,9 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /opt/cloudhv
 
 COPY --from=builder /src/target/release/containerd-shim-cloudhv-v1 ./
-COPY --from=builder /virtiofsd-out/bin/virtiofsd ./
 COPY --from=kernel-builder /kernel/vmlinux ./
 COPY --from=rootfs-builder /rootfs/rootfs.ext4 ./
 COPY installer/install.sh ./
 
-RUN chmod +x install.sh containerd-shim-cloudhv-v1 virtiofsd
 
 CMD ["/opt/cloudhv/install.sh"]

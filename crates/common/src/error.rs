@@ -23,9 +23,6 @@ pub enum CloudHvError {
     #[error("vsock error: {0}")]
     VsockError(String),
 
-    #[error("virtiofs error: {0}")]
-    VirtioFsError(String),
-
     #[error("runc error: exit_code={exit_code}, stderr={stderr}")]
     RuncError { exit_code: i32, stderr: String },
 

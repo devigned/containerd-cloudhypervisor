@@ -26,16 +26,6 @@ impl AgentService for AgentServiceHandler {
         req: CreateContainerRequest,
     ) -> ttrpc::Result<CreateContainerResponse> {
         info!("RPC: create_container id={}", req.container_id);
-        let stdout = if req.stdout.is_empty() {
-            None
-        } else {
-            Some(req.stdout.as_str())
-        };
-        let stderr = if req.stderr.is_empty() {
-            None
-        } else {
-            Some(req.stderr.as_str())
-        };
         let mut mgr = self.container_manager.lock().await;
         let volumes: Vec<crate::container::VolumeInfo> = req
             .volumes
@@ -49,13 +39,7 @@ impl AgentService for AgentServiceHandler {
             })
             .collect();
         let pid = mgr
-            .create(
-                &req.container_id,
-                &req.bundle_path,
-                stdout,
-                stderr,
-                &volumes,
-            )
+            .create(&req.container_id, &req.bundle_path, &volumes)
             .await
             .map_err(|e| ttrpc::Error::Others(format!("create_container failed: {e:#}")))?;
         let mut resp = CreateContainerResponse::new();
@@ -227,9 +211,38 @@ impl AgentService for AgentServiceHandler {
         }
         Ok(resp)
     }
-}
 
-// --- HealthService implementation ---
+    async fn get_container_logs(
+        &self,
+        _ctx: &TtrpcContext,
+        req: GetContainerLogsRequest,
+    ) -> ttrpc::Result<GetContainerLogsResponse> {
+        let id = &req.container_id;
+        let offset = req.offset as usize;
+
+        let log_buf = {
+            let mgr = self.container_manager.lock().await;
+            mgr.get_log_buffer(id)
+        };
+
+        let mut resp = GetContainerLogsResponse::new();
+        if let Some(buf) = log_buf {
+            let logs = buf.lock().await;
+            // Return data from offset onwards
+            if offset < logs.stdout.len() {
+                resp.stdout = logs.stdout[offset..].to_vec();
+            }
+            if offset < logs.stderr.len() {
+                resp.stderr = logs.stderr[offset..].to_vec();
+            }
+            resp.offset = std::cmp::max(logs.stdout.len(), logs.stderr.len()) as u64;
+            resp.eof = logs.eof;
+        } else {
+            resp.eof = true;
+        }
+        Ok(resp)
+    }
+}
 
 struct HealthServiceHandler;
 

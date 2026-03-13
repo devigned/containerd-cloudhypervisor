@@ -5,7 +5,6 @@ pub struct TestFixtures {
     pub kernel_path: PathBuf,
     pub rootfs_path: PathBuf,
     pub ch_binary: PathBuf,
-    pub virtiofsd_binary: PathBuf,
 }
 
 impl TestFixtures {
@@ -25,14 +24,11 @@ impl TestFixtures {
             "CLOUDHV_TEST_CH_BIN",
             PathBuf::from("/usr/local/bin/cloud-hypervisor"),
         );
-        let virtiofsd_binary =
-            env_or_default("CLOUDHV_TEST_VFSD", PathBuf::from("/usr/libexec/virtiofsd"));
 
         Some(TestFixtures {
             kernel_path,
             rootfs_path,
             ch_binary,
-            virtiofsd_binary,
         })
     }
 
@@ -49,9 +45,6 @@ impl TestFixtures {
         if !self.ch_binary.exists() {
             missing.push(format!("cloud-hypervisor: {}", self.ch_binary.display()));
         }
-        if !self.virtiofsd_binary.exists() {
-            missing.push(format!("virtiofsd: {}", self.virtiofsd_binary.display()));
-        }
         if !Path::new("/dev/kvm").exists() && !Path::new("/dev/mshv").exists() {
             missing.push("hypervisor: /dev/kvm or /dev/mshv".to_string());
         }
@@ -63,7 +56,6 @@ impl TestFixtures {
     pub fn runtime_config(&self) -> cloudhv_common::types::RuntimeConfig {
         cloudhv_common::types::RuntimeConfig {
             cloud_hypervisor_binary: self.ch_binary.to_string_lossy().to_string(),
-            virtiofsd_binary: self.virtiofsd_binary.to_string_lossy().to_string(),
             kernel_path: self.kernel_path.to_string_lossy().to_string(),
             rootfs_path: self.rootfs_path.to_string_lossy().to_string(),
             default_vcpus: 1,

@@ -56,7 +56,6 @@ helm install cloudhv-installer \
 ```
 
 This creates:
-- A **DaemonSet** that installs the shim, kernel, rootfs, virtiofsd, and
   Cloud Hypervisor onto each node labeled `workload=cloudhv`
 - A **RuntimeClass** named `cloudhv` with pod overhead annotations
 

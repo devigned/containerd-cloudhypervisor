@@ -7,10 +7,6 @@ pub struct RuntimeConfig {
     #[serde(default = "default_ch_binary")]
     pub cloud_hypervisor_binary: String,
 
-    /// Path to the virtiofsd binary
-    #[serde(default = "default_virtiofsd_binary")]
-    pub virtiofsd_binary: String,
-
     /// Path to the guest kernel (vmlinux or bzImage)
     pub kernel_path: String,
 
@@ -61,9 +57,6 @@ pub struct RuntimeConfig {
 
 fn default_ch_binary() -> String {
     crate::DEFAULT_CH_BINARY.to_string()
-}
-fn default_virtiofsd_binary() -> String {
-    crate::DEFAULT_VIRTIOFSD_BINARY.to_string()
 }
 fn default_vcpus() -> u32 {
     crate::DEFAULT_VCPUS

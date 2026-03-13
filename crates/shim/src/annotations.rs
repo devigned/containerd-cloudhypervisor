@@ -278,7 +278,6 @@ mod tests {
     fn default_config() -> RuntimeConfig {
         RuntimeConfig {
             cloud_hypervisor_binary: String::new(),
-            virtiofsd_binary: String::new(),
             kernel_path: String::new(),
             rootfs_path: String::new(),
             default_vcpus: 1,

@@ -1,7 +1,7 @@
 // Suppress removed lints from ttrpc-codegen generated code
 #![allow(unknown_lints)]
 
-use log::{error, info, warn};
+use log::{error, info};
 use nix::unistd::getpid;
 
 // Generated ttrpc/protobuf code from agent.proto
@@ -16,7 +16,6 @@ mod proto {
 
 mod container;
 mod mount;
-mod pressure;
 mod reaper;
 mod server;
 
@@ -58,17 +57,7 @@ fn init_setup() {
         error!("failed to mount essential filesystems: {}", e);
     }
 
-    if let Err(e) = mount::mount_virtiofs() {
-        warn!(
-            "failed to mount virtio-fs (may not be available yet): {}",
-            e
-        );
-    }
-
     reaper::set_child_subreaper();
-
-    // Start PSI memory pressure watcher — writes to shared dir on pressure events
-    pressure::start_pressure_watcher(std::path::Path::new(cloudhv_common::VIRTIOFS_GUEST_MOUNT));
 
     info!("init setup complete");
 }

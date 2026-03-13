@@ -273,12 +273,9 @@ impl CloudHvInstance {
 
         vm.start_swtpm().await.ctx("swtpm")?;
 
-        vm.spawn_virtiofsd().ctx("virtiofsd")?;
         vm.spawn_vmm_in_netns(netns_path.as_deref()).ctx("vmm")?;
 
-        let (vfsd_r, vmm_r) = tokio::join!(vm.wait_virtiofsd_ready(), vm.wait_vmm_ready());
-        vfsd_r.ctx("virtiofsd")?;
-        vmm_r.ctx("vmm")?;
+        vm.wait_vmm_ready().await.ctx("vmm")?;
 
         vm.create_and_boot_vm(tap_name.as_deref(), tap_mac.as_deref())
             .await
@@ -343,20 +340,6 @@ impl CloudHvInstance {
         let agent = get_or_connect_agent(&vm_state).await?;
         let shared_dir = &vm_state.shared_dir;
 
-        // Set up I/O files in the shared directory
-        let io_dir = shared_dir.join("io").join(container_id);
-        std::fs::create_dir_all(&io_dir).ctx("failed to create I/O dir")?;
-        let stdout_guest = format!(
-            "{}/io/{}/stdout",
-            cloudhv_common::VIRTIOFS_GUEST_MOUNT,
-            container_id
-        );
-        let stderr_guest = format!(
-            "{}/io/{}/stderr",
-            cloudhv_common::VIRTIOFS_GUEST_MOUNT,
-            container_id
-        );
-
         // Create an ext4 disk image from the rootfs and hot-plug it into the VM.
         let rootfs_path = self.bundle.join("rootfs");
         let disk_id = format!("ctr-{}", &container_id[..12.min(container_id.len())]);
@@ -414,8 +397,6 @@ impl CloudHvInstance {
             let mut create_req = cloudhv_proto::CreateContainerRequest::new();
             create_req.container_id = container_id.to_string();
             create_req.bundle_path = bundle_guest;
-            create_req.stdout = stdout_guest;
-            create_req.stderr = stderr_guest;
             let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
             agent.create_container(ctx, &create_req).await
         }
@@ -432,140 +413,95 @@ impl CloudHvInstance {
 
         vm_state.container_count.fetch_add(1, Ordering::SeqCst);
 
-        // Forward container stdout/stderr from virtio-fs files to containerd FIFOs.
-        // We open the FIFOs synchronously here (before start returns) so containerd's
-        // reader sees an active writer and doesn't get EOF.
-        let stdout_src = io_dir.join("stdout");
-        let stderr_src = io_dir.join("stderr");
-        let stdout_dst = self.stdout.to_string_lossy().to_string();
-        let stderr_dst = self.stderr.to_string_lossy().to_string();
-        let stdout_handle = if !stdout_dst.is_empty() {
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&stdout_dst)
-                .ok()
-                .map(|fifo| tokio::spawn(forward_output(stdout_src, fifo)))
-        } else {
-            None
-        };
-        let stderr_handle = if !stderr_dst.is_empty() {
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&stderr_dst)
-                .ok()
-                .map(|fifo| tokio::spawn(forward_output(stderr_src, fifo)))
-        } else {
-            None
-        };
-
-        // Watch for exit file in virtio-fs shared directory (fast path),
-        // with WaitContainer RPC as fallback if the exit file never appears.
-        let exit = self.exit.clone();
-        let cid = container_id.to_string();
-        let exit_file = io_dir.join("exit");
-        let fallback_agent = agent.clone();
-        tokio::spawn(async move {
-            // Fast path: poll for exit file (10ms resolution, near-instant via virtio-fs)
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-            let exit_code = loop {
-                if exit_file.exists() {
-                    let code = std::fs::read_to_string(&exit_file)
-                        .ok()
-                        .and_then(|s| s.trim().parse::<u32>().ok())
-                        .unwrap_or(137);
-                    info!("container {} exited with code {} (exit file)", cid, code);
-                    break code;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    // Fallback: WaitContainer RPC (handles agent panic / missing exit file)
-                    info!(
-                        "container {}: exit file not found after 30s, falling back to RPC",
-                        cid
-                    );
-                    let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
-                    wait_req.container_id = cid.clone();
-                    let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(600));
-                    let code = match fallback_agent.wait_container(ctx, &wait_req).await {
-                        Ok(resp) => resp.exit_status,
-                        Err(e) => {
-                            info!("wait_container RPC fallback error for {}: {e}", cid);
-                            137
+        // Stream container logs from agent via GetContainerLogs RPC.
+        // Open FIFOs synchronously so containerd sees an active writer.
+        let log_agent = agent.clone();
+        let log_cid = container_id.to_string();
+        let stdout_fifo = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.stdout)
+            .ok();
+        let stderr_fifo = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.stderr)
+            .ok();
+        let log_handle = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let mut stdout_writer = stdout_fifo.map(tokio::fs::File::from_std);
+            let mut stderr_writer = stderr_fifo.map(tokio::fs::File::from_std);
+            let mut offset = 0u64;
+            loop {
+                let mut req = cloudhv_proto::GetContainerLogsRequest::new();
+                req.container_id = log_cid.clone();
+                req.offset = offset;
+                let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(5));
+                match log_agent.get_container_logs(ctx, &req).await {
+                    Ok(resp) => {
+                        if let Some(ref mut w) = stdout_writer {
+                            if !resp.stdout.is_empty() {
+                                let _ = w.write_all(&resp.stdout).await;
+                            }
                         }
-                    };
-                    info!("container {} exited with code {} (RPC fallback)", cid, code);
-                    break code;
+                        if let Some(ref mut w) = stderr_writer {
+                            if !resp.stderr.is_empty() {
+                                let _ = w.write_all(&resp.stderr).await;
+                            }
+                        }
+                        offset = resp.offset;
+                        if resp.eof {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+
+        // Watch for container exit via WaitContainer RPC
+        let exit = self.exit.clone();
+        let cid = container_id.to_string();
+        let agent_clone = agent.clone();
+        tokio::spawn(async move {
+            let t0 = std::time::Instant::now();
+            let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
+            wait_req.container_id = cid.clone();
+            let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(86400));
+            let exit_code = match agent_clone.wait_container(ctx, &wait_req).await {
+                Ok(resp) => resp.exit_status,
+                Err(e) => {
+                    log::info!("wait_container RPC error for {}: {e}", cid);
+                    137
+                }
             };
-
-            // Abort I/O forwarding to close FIFOs
-            if let Some(h) = stdout_handle {
-                h.abort();
-            }
-            if let Some(h) = stderr_handle {
-                h.abort();
-            }
-
+            let rpc_ms = t0.elapsed().as_millis();
+            let t1 = std::time::Instant::now();
+            let log_result =
+                tokio::time::timeout(std::time::Duration::from_millis(100), log_handle).await;
+            let log_ms = t1.elapsed().as_millis();
+            let t2 = std::time::Instant::now();
             let _ = exit.set((exit_code, Utc::now()));
+            let set_ms = t2.elapsed().as_millis();
+            log::info!(
+                "container {} exit path: rpc={}ms log_wait={}ms({}), set={}ms, total={}ms",
+                cid,
+                rpc_ms,
+                log_ms,
+                if log_result.is_ok() {
+                    "completed"
+                } else {
+                    "timeout"
+                },
+                set_ms,
+                t0.elapsed().as_millis()
+            );
         });
 
         let pid = start_resp.pid;
         info!("started container {} pid={}", container_id, pid);
         Ok(pid)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// I/O forwarding
-// ---------------------------------------------------------------------------
-
-/// Forward container output from a virtio-fs file to an already-opened containerd FIFO.
-///
-/// The agent writes crun's stdout/stderr to files in the virtio-fs shared
-/// directory. This task tails the file and writes to the FIFO so that
-/// `crictl logs` and `kubectl logs` work.
-async fn forward_output(src: std::path::PathBuf, fifo: std::fs::File) {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-    // Wait for the source file to appear (agent creates it on container start)
-    for _ in 0..100 {
-        if src.exists() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    let src_file = match tokio::fs::File::open(&src).await {
-        Ok(f) => f,
-        Err(e) => {
-            info!("I/O forward: can't open source {}: {e}", src.display());
-            return;
-        }
-    };
-
-    let mut reader = BufReader::new(src_file);
-    let mut writer = tokio::fs::File::from_std(fifo);
-    let mut line = String::new();
-
-    loop {
-        line.clear();
-        match reader.read_line(&mut line).await {
-            Ok(0) => {
-                // EOF — file may still be written to, poll
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                if tokio::fs::metadata(&src).await.is_err() {
-                    break; // File removed, stop
-                }
-            }
-            Ok(_) => {
-                if writer.write_all(line.as_bytes()).await.is_err() {
-                    break; // FIFO reader disconnected
-                }
-            }
-            Err(_) => break,
-        }
     }
 }
 

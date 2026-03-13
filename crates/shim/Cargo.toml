@@ -41,16 +41,6 @@ libc = { workspace = true }
 # Time
 chrono = { workspace = true }
 
-[features]
-default = []
-embedded-virtiofsd = ["virtiofsd", "vhost-user-backend", "vhost", "vm-memory"]
-
-[target.'cfg(target_os = "linux")'.dependencies]
-virtiofsd = { version = "1.13", optional = true }
-vhost-user-backend = { version = "0.17", optional = true }
-vhost = { version = "0.13", optional = true }
-vm-memory = { version = "0.16", optional = true }
-
 [dev-dependencies]
 tempfile = "3"
 criterion = { version = "0.5", features = ["async_tokio"] }

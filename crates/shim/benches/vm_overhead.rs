@@ -40,12 +40,7 @@ fn bench_vm_config_serialization(c: &mut Criterion) {
             id: None,
         }],
         net: vec![],
-        fs: vec![VmFs {
-            tag: "containerfs".to_string(),
-            socket: "/run/cloudhv/vm-1/virtiofsd.sock".to_string(),
-            num_queues: 1,
-            queue_size: 128,
-        }],
+        fs: vec![],
         vsock: Some(VmVsock {
             cid: 3,
             socket: "/run/cloudhv/vm-1/vsock.sock".to_string(),
@@ -72,7 +67,6 @@ fn bench_vm_config_serialization(c: &mut Criterion) {
     group.bench_function("serialize_runtime_config", |b| {
         let rt_config = RuntimeConfig {
             cloud_hypervisor_binary: "/usr/local/bin/cloud-hypervisor".into(),
-            virtiofsd_binary: "/usr/libexec/virtiofsd".into(),
             kernel_path: "/opt/cloudhv/vmlinux".into(),
             rootfs_path: "/opt/cloudhv/rootfs.ext4".into(),
             default_vcpus: 1,
@@ -101,7 +95,6 @@ fn bench_cid_allocation(c: &mut Criterion) {
     group.bench_function("allocate_vm_manager", |b| {
         let config = RuntimeConfig {
             cloud_hypervisor_binary: "/usr/local/bin/cloud-hypervisor".into(),
-            virtiofsd_binary: "/usr/libexec/virtiofsd".into(),
             kernel_path: "/opt/vmlinux".into(),
             rootfs_path: "/opt/rootfs.ext4".into(),
             default_vcpus: 1,

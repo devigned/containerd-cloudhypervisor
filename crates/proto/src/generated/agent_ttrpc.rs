@@ -70,6 +70,11 @@ impl AgentServiceClient {
         let mut cres = super::agent::GetMemInfoResponse::new();
         ::ttrpc::async_client_request!(self, ctx, req, "cloudhv.agent.AgentService", "GetMemInfo", cres);
     }
+
+    pub async fn get_container_logs(&self, ctx: ttrpc::context::Context, req: &super::agent::GetContainerLogsRequest) -> ::ttrpc::Result<super::agent::GetContainerLogsResponse> {
+        let mut cres = super::agent::GetContainerLogsResponse::new();
+        ::ttrpc::async_client_request!(self, ctx, req, "cloudhv.agent.AgentService", "GetContainerLogs", cres);
+    }
 }
 
 struct CreateContainerMethod {
@@ -160,6 +165,17 @@ impl ::ttrpc::r#async::MethodHandler for GetMemInfoMethod {
     }
 }
 
+struct GetContainerLogsMethod {
+    service: Arc<Box<dyn AgentService + Send + Sync>>,
+}
+
+#[async_trait]
+impl ::ttrpc::r#async::MethodHandler for GetContainerLogsMethod {
+    async fn handler(&self, ctx: ::ttrpc::r#async::TtrpcContext, req: ::ttrpc::Request) -> ::ttrpc::Result<::ttrpc::Response> {
+        ::ttrpc::async_request_handler!(self, ctx, req, agent, GetContainerLogsRequest, get_container_logs);
+    }
+}
+
 #[async_trait]
 pub trait AgentService: Sync {
     async fn create_container(&self, _ctx: &::ttrpc::r#async::TtrpcContext, _: super::agent::CreateContainerRequest) -> ::ttrpc::Result<super::agent::CreateContainerResponse> {
@@ -185,6 +201,9 @@ pub trait AgentService: Sync {
     }
     async fn get_mem_info(&self, _ctx: &::ttrpc::r#async::TtrpcContext, _: super::agent::GetMemInfoRequest) -> ::ttrpc::Result<super::agent::GetMemInfoResponse> {
         Err(::ttrpc::Error::RpcStatus(::ttrpc::get_status(::ttrpc::Code::NOT_FOUND, "/cloudhv.agent.AgentService/GetMemInfo is not supported".to_string())))
+    }
+    async fn get_container_logs(&self, _ctx: &::ttrpc::r#async::TtrpcContext, _: super::agent::GetContainerLogsRequest) -> ::ttrpc::Result<super::agent::GetContainerLogsResponse> {
+        Err(::ttrpc::Error::RpcStatus(::ttrpc::get_status(::ttrpc::Code::NOT_FOUND, "/cloudhv.agent.AgentService/GetContainerLogs is not supported".to_string())))
     }
 }
 
@@ -216,6 +235,9 @@ pub fn create_agent_service(service: Arc<Box<dyn AgentService + Send + Sync>>) -
 
     methods.insert("GetMemInfo".to_string(),
                     Box::new(GetMemInfoMethod{service: service.clone()}) as Box<dyn ::ttrpc::r#async::MethodHandler + Send + Sync>);
+
+    methods.insert("GetContainerLogs".to_string(),
+                    Box::new(GetContainerLogsMethod{service: service.clone()}) as Box<dyn ::ttrpc::r#async::MethodHandler + Send + Sync>);
 
     ret.insert("cloudhv.agent.AgentService".to_string(), ::ttrpc::r#async::Service{ methods, streams });
     ret

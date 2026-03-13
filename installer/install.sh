@@ -32,9 +32,6 @@ echo "[cloudhv] Installing on $(cat /host/etc/hostname) (${HOST_ARCH})..."
 echo "[cloudhv] Copying shim binary..."
 install -D -m 755 "$ARTIFACTS/containerd-shim-cloudhv-v1" "$HOST/usr/local/bin/containerd-shim-cloudhv-v1"
 
-# 2. Copy virtiofsd
-echo "[cloudhv] Copying virtiofsd..."
-install -D -m 755 "$ARTIFACTS/virtiofsd" "$HOST/usr/libexec/virtiofsd"
 
 # 2. Copy guest artifacts
 echo "[cloudhv] Copying guest kernel and rootfs..."
@@ -47,7 +44,6 @@ echo "[cloudhv] Writing runtime config..."
 cat > "$HOST/opt/cloudhv/config.json" << CONFIG
 {
   "cloud_hypervisor_binary": "/usr/local/bin/cloud-hypervisor",
-  "virtiofsd_binary": "/usr/libexec/virtiofsd",
   "kernel_path": "/opt/cloudhv/vmlinux",
   "rootfs_path": "/opt/cloudhv/rootfs.ext4",
   "kernel_args": "${KERNEL_CONSOLE} root=/dev/vda rw init=/init net.ifnames=0",
@@ -99,7 +95,6 @@ TOML
     echo "[cloudhv] Runtime handler added to containerd config"
 fi
 
-# 5. Install cloud-hypervisor and virtiofsd if not present
 if [ ! -f "$HOST/usr/local/bin/cloud-hypervisor" ]; then
   echo "[cloudhv] Installing cloud-hypervisor (${HOST_ARCH})..."
   CH_VERSION="v44.0"

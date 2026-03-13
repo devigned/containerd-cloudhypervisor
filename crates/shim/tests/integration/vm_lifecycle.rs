@@ -13,11 +13,10 @@ use crate::skip_if_missing;
 /// This test:
 /// 1. Creates a VmManager with test config
 /// 2. Prepares the state directory
-/// 3. Starts virtiofsd
-/// 4. Starts the Cloud Hypervisor VMM
-/// 5. Creates and boots the VM
-/// 6. Waits for the guest agent to become reachable
-/// 7. Shuts down and cleans up
+/// 3. Starts the Cloud Hypervisor VMM
+/// 4. Creates and boots the VM
+/// 5. Waits for the guest agent to become reachable
+/// 6. Shuts down and cleans up
 #[test]
 fn test_vm_boot_and_agent_health() {
     let fixtures = TestFixtures::resolve().expect("failed to resolve test fixtures");
@@ -40,13 +39,6 @@ fn test_vm_boot_and_agent_health() {
         vm.prepare().await.expect("VM prepare failed");
         assert!(vm.state_dir().exists(), "state dir should exist");
         assert!(vm.shared_dir().exists(), "shared dir should exist");
-
-        // Start virtiofsd
-        eprintln!("=== Starting virtiofsd ===");
-        vm.spawn_virtiofsd().expect("failed to spawn virtiofsd");
-        vm.wait_virtiofsd_ready()
-            .await
-            .expect("failed to start virtiofsd");
 
         // Start Cloud Hypervisor
         eprintln!("=== Starting Cloud Hypervisor VMM ===");
@@ -175,12 +167,7 @@ fn test_vm_config_json_generation() {
             id: None,
         }],
         net: vec![],
-        fs: vec![VmFs {
-            tag: "containerfs".to_string(),
-            socket: "/run/virtiofsd.sock".to_string(),
-            num_queues: 1,
-            queue_size: 128,
-        }],
+        fs: vec![],
         vsock: Some(VmVsock {
             cid: 3,
             socket: "/run/vsock.sock".to_string(),
@@ -233,10 +220,6 @@ fn test_ttrpc_health_check_rpc() {
             .expect("failed to create VmManager");
 
         vm.prepare().await.expect("VM prepare failed");
-        vm.spawn_virtiofsd().expect("virtiofsd spawn failed");
-        vm.wait_virtiofsd_ready()
-            .await
-            .expect("virtiofsd ready failed");
         vm.spawn_vmm_in_netns(None).expect("VMM spawn failed");
         vm.wait_vmm_ready().await.expect("VMM ready failed");
         vm.create_and_boot_vm(None, None)
@@ -369,12 +352,11 @@ fn test_vm_config_with_hotplug() {
 ///
 /// Reports time for each phase:
 ///   1. VmManager::new + prepare (shim overhead)
-///   2. spawn_virtiofsd (host daemon overhead)
-///   3. spawn_vmm_in_netns (Cloud Hypervisor process startup)
-///   4. create_and_boot_vm (CH API create + boot)
-///   5. wait_for_agent (guest boot + agent startup)
-///   6. vsock ttrpc connect (ttrpc handshake)
-///   7. cleanup (shutdown + remove state)
+///   2. spawn_vmm_in_netns (Cloud Hypervisor process startup)
+///   3. create_and_boot_vm (CH API create + boot)
+///   4. wait_for_agent (guest boot + agent startup)
+///   5. vsock ttrpc connect (ttrpc handshake)
+///   6. cleanup (shutdown + remove state)
 ///
 /// This is an integration test that acts as a benchmark — run with --nocapture
 /// to see timing output.
@@ -403,43 +385,31 @@ fn test_vm_lifecycle_timing_breakdown() {
         let shim_overhead = t0.elapsed();
         eprintln!("  [1] Shim setup (new + prepare):  {:>8.1?}", shim_overhead);
 
-        // Phase 2: virtiofsd
-        let t1 = std::time::Instant::now();
-        vm.spawn_virtiofsd().expect("virtiofsd spawn failed");
-        vm.wait_virtiofsd_ready()
-            .await
-            .expect("virtiofsd ready failed");
-        let virtiofsd_time = t1.elapsed();
-        eprintln!(
-            "  [2] virtiofsd startup:           {:>8.1?}",
-            virtiofsd_time
-        );
-
-        // Phase 3: Cloud Hypervisor VMM
+        // Phase 2: Cloud Hypervisor VMM
         let t2 = std::time::Instant::now();
         vm.spawn_vmm_in_netns(None).expect("VMM spawn failed");
         vm.wait_vmm_ready().await.expect("VMM ready failed");
         let vmm_time = t2.elapsed();
-        eprintln!("  [3] Cloud Hypervisor startup:    {:>8.1?}", vmm_time);
+        eprintln!("  [2] Cloud Hypervisor startup:    {:>8.1?}", vmm_time);
 
-        // Phase 4: VM create + boot
+        // Phase 3: VM create + boot
         let t3 = std::time::Instant::now();
         vm.create_and_boot_vm(None, None)
             .await
             .expect("boot failed");
         let boot_time = t3.elapsed();
-        eprintln!("  [4] VM create + boot (CH API):   {:>8.1?}", boot_time);
+        eprintln!("  [3] VM create + boot (CH API):   {:>8.1?}", boot_time);
 
-        // Phase 5: Wait for agent
+        // Phase 4: Wait for agent
         let t4 = std::time::Instant::now();
         tokio::time::timeout(Duration::from_secs(30), vm.wait_for_agent())
             .await
             .expect("agent wait timed out (30s)")
             .expect("agent must be reachable");
         let agent_time = t4.elapsed();
-        eprintln!("  [5] Guest boot + agent ready:    {:>8.1?}", agent_time);
+        eprintln!("  [4] Guest boot + agent ready:    {:>8.1?}", agent_time);
 
-        // Phase 6: ttrpc connect
+        // Phase 5: ttrpc connect
         let t5 = std::time::Instant::now();
         let vsock_client = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
         let _ttrpc_result =
@@ -448,16 +418,16 @@ fn test_vm_lifecycle_timing_breakdown() {
                 .expect("ttrpc connect timed out (5s)")
                 .expect("ttrpc connect failed");
         let ttrpc_time = t5.elapsed();
-        eprintln!("  [6] ttrpc connect:               {:>8.1?}", ttrpc_time);
+        eprintln!("  [5] ttrpc connect:               {:>8.1?}", ttrpc_time);
 
-        // Phase 7: cleanup
+        // Phase 6: cleanup
         let t6 = std::time::Instant::now();
         vm.cleanup().await.expect("cleanup failed");
         let cleanup_time = t6.elapsed();
-        eprintln!("  [7] Shutdown + cleanup:          {:>8.1?}", cleanup_time);
+        eprintln!("  [6] Shutdown + cleanup:          {:>8.1?}", cleanup_time);
 
         let total = total_start.elapsed();
-        let overhead = shim_overhead + virtiofsd_time + vmm_time + cleanup_time;
+        let overhead = shim_overhead + vmm_time + cleanup_time;
         let guest = boot_time + agent_time;
         eprintln!("  ─────────────────────────────────────────");
         eprintln!("  Total:                           {:>8.1?}", total);
@@ -496,10 +466,6 @@ fn test_vm_resize_api() {
 
         vm.prepare().await.expect("VM prepare failed");
 
-        vm.spawn_virtiofsd().expect("virtiofsd spawn failed");
-        vm.wait_virtiofsd_ready()
-            .await
-            .expect("virtiofsd ready failed");
         vm.spawn_vmm_in_netns(None).expect("VMM spawn failed");
         vm.wait_vmm_ready().await.expect("VMM ready failed");
         vm.create_and_boot_vm(None, None)
@@ -518,7 +484,7 @@ fn test_vm_resize_api() {
     });
 }
 
-/// Test that container stdout and stderr are captured via virtio-fs.
+/// Test that container stdout and stderr are captured.
 ///
 /// This test:
 /// 1. Boots a VM using VmManager directly
@@ -572,8 +538,6 @@ fn test_container_logs_captured() {
         let mut vm = containerd_shim_cloudhv::vm::VmManager::new(vm_id.clone(), config)
             .expect("failed to create VmManager");
         vm.prepare().await.expect("prepare");
-        vm.spawn_virtiofsd().expect("virtiofsd");
-        vm.wait_virtiofsd_ready().await.expect("virtiofsd ready");
         vm.spawn_vmm_in_netns(None).expect("vmm");
         vm.wait_vmm_ready().await.expect("vmm ready");
         vm.create_and_boot_vm(None, None).await.expect("boot");
@@ -582,22 +546,6 @@ fn test_container_logs_captured() {
         // ── Connect ttrpc agent ───────────────────────────────────────
         let vsock_client = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
         let (agent, _health) = vsock_client.connect_ttrpc().await.expect("ttrpc");
-
-        // ── Create I/O directory on host (shared via virtio-fs) ───────
-        let io_dir = vm.shared_dir().join("io").join(&container_id);
-        std::fs::create_dir_all(&io_dir).unwrap_or_default();
-        let stdout_guest = format!(
-            "{}/io/{}/stdout",
-            cloudhv_common::VIRTIOFS_GUEST_MOUNT,
-            container_id
-        );
-        let stderr_guest = format!(
-            "{}/io/{}/stderr",
-            cloudhv_common::VIRTIOFS_GUEST_MOUNT,
-            container_id
-        );
-        let stdout_host = io_dir.join("stdout");
-        let stderr_host = io_dir.join("stderr");
 
         // ── Create disk image with a script that writes to both fds ───
         let disk_path = create_script_disk_image(
@@ -615,10 +563,7 @@ fn test_container_logs_captured() {
         // ── CreateContainer ───────────────────────────────────────────
         let mut create_req = cloudhv_proto::CreateContainerRequest::new();
         create_req.container_id = container_id.clone();
-        create_req.bundle_path =
-            format!("{}/{}", cloudhv_common::VIRTIOFS_GUEST_MOUNT, container_id);
-        create_req.stdout = stdout_guest;
-        create_req.stderr = stderr_guest;
+        create_req.bundle_path = format!("/run/containers/{}", container_id);
         let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
         agent
             .create_container(ctx, &create_req)
@@ -648,18 +593,24 @@ fn test_container_logs_captured() {
             wait_resp.exit_status
         );
 
-        // ── Assert stdout captured ────────────────────────────────────
-        let stdout_content = std::fs::read_to_string(&stdout_host)
-            .unwrap_or_else(|e| panic!("read stdout at {}: {e}", stdout_host.display()));
+        // ── Assert logs captured via GetContainerLogs RPC ──────────────
+        let mut log_req = cloudhv_proto::GetContainerLogsRequest::new();
+        log_req.container_id = container_id.clone();
+        log_req.offset = 0;
+        let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(5));
+        let log_resp = agent
+            .get_container_logs(ctx, &log_req)
+            .await
+            .expect("GetContainerLogs");
+
+        let stdout_content = String::from_utf8_lossy(&log_resp.stdout);
         assert!(
             stdout_content.contains("HELLO_STDOUT"),
             "stdout should contain HELLO_STDOUT, got: {stdout_content:?}"
         );
         eprintln!("  stdout OK: {:?}", stdout_content.trim());
 
-        // ── Assert stderr captured ────────────────────────────────────
-        let stderr_content = std::fs::read_to_string(&stderr_host)
-            .unwrap_or_else(|e| panic!("read stderr at {}: {e}", stderr_host.display()));
+        let stderr_content = String::from_utf8_lossy(&log_resp.stderr);
         assert!(
             stderr_content.contains("HELLO_STDERR"),
             "stderr should contain HELLO_STDERR, got: {stderr_content:?}"
@@ -785,7 +736,7 @@ fn create_script_disk_image(
 /// Requires:
 /// - Root (for netns, TAP, TC, mount)
 /// - KVM or MSHV
-/// - cloud-hypervisor, virtiofsd, kernel, rootfs
+/// - cloud-hypervisor, kernel, rootfs
 /// - A static HTTP echo binary: set `CLOUDHV_TEST_HTTP_ECHO` env var
 ///   (e.g. hashicorp/http-echo or any binary that listens on a port)
 ///
@@ -990,12 +941,9 @@ fn test_echo_container_with_networking() {
             .expect("VmManager::new");
         vm.prepare().await.expect("prepare");
 
-        vm.spawn_virtiofsd().expect("spawn_virtiofsd");
         vm.spawn_vmm_in_netns(Some(&netns_path))
             .expect("spawn_vmm_in_netns");
-        let (vfsd_r, vmm_r) = tokio::join!(vm.wait_virtiofsd_ready(), vm.wait_vmm_ready());
-        vfsd_r.expect("virtiofsd ready");
-        vmm_r.expect("vmm ready");
+        vm.wait_vmm_ready().await.expect("vmm ready");
 
         vm.create_and_boot_vm(Some(&tap_name), Some(&tap_mac))
             .await
@@ -1111,16 +1059,6 @@ fn test_echo_container_with_networking() {
         // Set up I/O directory for container stdout/stderr
         let io_dir = vm.shared_dir().join("io").join(&container_id);
         std::fs::create_dir_all(&io_dir).expect("mkdir io");
-        let stdout_guest = format!(
-            "{}/io/{}/stdout",
-            cloudhv_common::VIRTIOFS_GUEST_MOUNT,
-            container_id
-        );
-        let stderr_guest = format!(
-            "{}/io/{}/stderr",
-            cloudhv_common::VIRTIOFS_GUEST_MOUNT,
-            container_id
-        );
 
         // Connect to agent via ttrpc
         let vsock_client = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
@@ -1133,10 +1071,7 @@ fn test_echo_container_with_networking() {
         // CreateContainer RPC
         let mut create_req = cloudhv_proto::CreateContainerRequest::new();
         create_req.container_id = container_id.clone();
-        create_req.bundle_path =
-            format!("{}/{}", cloudhv_common::VIRTIOFS_GUEST_MOUNT, container_id);
-        create_req.stdout = stdout_guest;
-        create_req.stderr = stderr_guest;
+        create_req.bundle_path = format!("/run/containers/{}", container_id);
 
         let ctx = ttrpc::context::with_duration(Duration::from_secs(30));
         let create_resp = agent
@@ -1248,108 +1183,6 @@ fn run_cmd_status(cmd: &str, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-/// Test that the in-process virtiofsd backend works as a drop-in replacement
-/// for the spawned virtiofsd binary.
-///
-/// This test:
-///   1. Starts an in-process VirtiofsBackend on a vhost-user socket
-///   2. Boots a VM that connects to it (instead of a spawned virtiofsd)
-///   3. Verifies the agent is healthy (agent mounts virtiofs at boot)
-///   4. Verifies the shared directory works by checking container I/O setup
-///
-/// Requires the `embedded-virtiofsd` feature: cargo test --features embedded-virtiofsd
-#[cfg(all(target_os = "linux", feature = "embedded-virtiofsd"))]
-#[test]
-fn test_embedded_virtiofsd() {
-    let fixtures = TestFixtures::resolve().expect("failed to resolve test fixtures");
-    skip_if_missing!(fixtures);
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-
-    rt.block_on(async {
-        let config = fixtures.runtime_config();
-        let vm_id = format!("embed-vfsd-{}", std::process::id());
-
-        eprintln!("\n╔══════════════════════════════════════════════════════════╗");
-        eprintln!("║  Embedded virtiofsd — Integration Test                  ║");
-        eprintln!("╠══════════════════════════════════════════════════════════╣");
-
-        // ── Phase 1: Set up in-process virtiofsd ──────────────────────
-        eprintln!("  Phase 1 │ Starting in-process virtiofsd");
-        let p1 = std::time::Instant::now();
-
-        let mut vm = containerd_shim_cloudhv::vm::VmManager::new(vm_id.clone(), config)
-            .expect("VmManager::new");
-        vm.prepare().await.expect("prepare");
-
-        // Start the embedded virtiofsd instead of spawning a child process
-        let vfsd = containerd_shim_cloudhv::virtfs::VirtiofsBackend::start(
-            &vm.state_dir().join("virtiofsd.sock"),
-            vm.shared_dir(),
-        )
-        .expect("start embedded virtiofsd");
-
-        eprintln!(
-            "           │ in-process virtiofsd started: {:>8.1?}",
-            p1.elapsed()
-        );
-
-        // ── Phase 2: Boot VM (using the in-process virtiofsd socket) ──
-        eprintln!("  Phase 2 │ Booting VM with embedded virtiofsd");
-        let p2 = std::time::Instant::now();
-
-        // spawn CH only (virtiofsd already running in-process)
-        vm.spawn_vmm_in_netns(None).expect("spawn_vmm");
-        vm.wait_vmm_ready().await.expect("vmm ready");
-        vm.create_and_boot_vm(None, None).await.expect("boot");
-
-        tokio::time::timeout(Duration::from_secs(30), vm.wait_for_agent())
-            .await
-            .expect("agent timeout")
-            .expect("agent health");
-
-        eprintln!(
-            "           │ VM booted, agent healthy: {:>8.1?}",
-            p2.elapsed()
-        );
-
-        // ── Phase 3: Verify shared directory works ────────────────────
-        eprintln!("  Phase 3 │ Verifying shared directory");
-
-        // Create a test file in the shared dir and check it exists from host
-        let test_file = vm.shared_dir().join("embed-test.txt");
-        std::fs::write(&test_file, "hello from embedded virtiofsd").expect("write test file");
-        assert!(test_file.exists(), "test file should exist in shared dir");
-
-        // Connect to agent via ttrpc to verify full pipeline
-        let vsock_client = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
-        let (_agent, health) =
-            tokio::time::timeout(Duration::from_secs(5), vsock_client.connect_ttrpc())
-                .await
-                .expect("ttrpc timeout")
-                .expect("ttrpc connect");
-        let ctx = ttrpc::context::with_duration(Duration::from_secs(5));
-        let resp = health
-            .check(ctx, &cloudhv_proto::CheckRequest::new())
-            .await
-            .expect("health check");
-        assert!(resp.ready, "agent must be healthy with embedded virtiofsd");
-        eprintln!("           │ agent healthy, shared dir working ✅");
-        drop(_agent);
-        drop(health);
-
-        // ── Phase 4: Cleanup ──────────────────────────────────────────
-        eprintln!("  Phase 4 │ Cleaning up");
-        vm.cleanup().await.expect("cleanup");
-        drop(vfsd); // stops the in-process virtiofsd thread
-
-        eprintln!("╚══════════════════════════════════════════════════════════╝\n");
-    });
-}
-
 /// Helper: create an ext4 disk image containing an http-echo binary + OCI config.
 /// Returns the disk image path.
 fn create_echo_disk_image(
@@ -1438,7 +1271,7 @@ fn create_echo_disk_image(
 ///   4. Curl both endpoints from the host and verify independent responses
 ///   5. Both containers share the VM's network namespace (same IP, different ports)
 ///
-/// Requires: root, KVM, CH, virtiofsd, kernel, rootfs, http-echo binary
+/// Requires: root, KVM, CH, kernel, rootfs, http-echo binary
 #[test]
 fn test_two_containers_in_one_vm() {
     let fixtures = TestFixtures::resolve().expect("failed to resolve test fixtures");
@@ -1600,12 +1433,9 @@ fn test_two_containers_in_one_vm() {
         let mut vm = containerd_shim_cloudhv::vm::VmManager::new(vm_id.clone(), config)
             .expect("VmManager::new");
         vm.prepare().await.expect("prepare");
-        vm.spawn_virtiofsd().expect("spawn_virtiofsd");
         vm.spawn_vmm_in_netns(Some(&netns_path))
             .expect("spawn_vmm_in_netns");
-        let (vfsd_r, vmm_r) = tokio::join!(vm.wait_virtiofsd_ready(), vm.wait_vmm_ready());
-        vfsd_r.expect("virtiofsd ready");
-        vmm_r.expect("vmm ready");
+        vm.wait_vmm_ready().await.expect("vmm ready");
         vm.create_and_boot_vm(Some(&tap_name), Some(&tap_mac))
             .await
             .expect("create_and_boot_vm");
@@ -1641,17 +1471,7 @@ fn test_two_containers_in_one_vm() {
         std::fs::create_dir_all(&io_a).expect("mkdir io A");
         let mut req_a = cloudhv_proto::CreateContainerRequest::new();
         req_a.container_id = ctr_a_id.clone();
-        req_a.bundle_path = format!("{}/{}", cloudhv_common::VIRTIOFS_GUEST_MOUNT, ctr_a_id);
-        req_a.stdout = format!(
-            "{}/io/{}/stdout",
-            cloudhv_common::VIRTIOFS_GUEST_MOUNT,
-            ctr_a_id
-        );
-        req_a.stderr = format!(
-            "{}/io/{}/stderr",
-            cloudhv_common::VIRTIOFS_GUEST_MOUNT,
-            ctr_a_id
-        );
+        req_a.bundle_path = format!("/run/containers/{}", ctr_a_id);
         let ctx = ttrpc::context::with_duration(Duration::from_secs(30));
         agent.create_container(ctx, &req_a).await.expect("create A");
         let mut start_a = cloudhv_proto::StartContainerRequest::new();
@@ -1678,17 +1498,7 @@ fn test_two_containers_in_one_vm() {
         std::fs::create_dir_all(&io_b).expect("mkdir io B");
         let mut req_b = cloudhv_proto::CreateContainerRequest::new();
         req_b.container_id = ctr_b_id.clone();
-        req_b.bundle_path = format!("{}/{}", cloudhv_common::VIRTIOFS_GUEST_MOUNT, ctr_b_id);
-        req_b.stdout = format!(
-            "{}/io/{}/stdout",
-            cloudhv_common::VIRTIOFS_GUEST_MOUNT,
-            ctr_b_id
-        );
-        req_b.stderr = format!(
-            "{}/io/{}/stderr",
-            cloudhv_common::VIRTIOFS_GUEST_MOUNT,
-            ctr_b_id
-        );
+        req_b.bundle_path = format!("/run/containers/{}", ctr_b_id);
         let ctx = ttrpc::context::with_duration(Duration::from_secs(30));
         agent.create_container(ctx, &req_b).await.expect("create B");
         let mut start_b = cloudhv_proto::StartContainerRequest::new();
@@ -1781,10 +1591,6 @@ fn test_vm_memory_growth() {
 
         let mut vm = containerd_shim_cloudhv::vm::VmManager::new(vm_id, config).expect("VmManager");
         vm.prepare().await.expect("prepare");
-        vm.spawn_virtiofsd().expect("virtiofsd spawn failed");
-        vm.wait_virtiofsd_ready()
-            .await
-            .expect("virtiofsd ready failed");
         vm.spawn_vmm_in_netns(None).expect("vmm spawn failed");
         vm.wait_vmm_ready().await.expect("vmm ready failed");
         vm.create_and_boot_vm(None, None).await.expect("boot");
@@ -1874,10 +1680,6 @@ fn test_vm_memory_reclaim() {
 
         let mut vm = containerd_shim_cloudhv::vm::VmManager::new(vm_id, config).expect("VmManager");
         vm.prepare().await.expect("prepare");
-        vm.spawn_virtiofsd().expect("virtiofsd spawn failed");
-        vm.wait_virtiofsd_ready()
-            .await
-            .expect("virtiofsd ready failed");
         vm.spawn_vmm_in_netns(None).expect("vmm spawn failed");
         vm.wait_vmm_ready().await.expect("vmm ready failed");
         vm.create_and_boot_vm(None, None).await.expect("boot");
@@ -1942,11 +1744,11 @@ fn test_vm_memory_reclaim() {
     });
 }
 
-/// Test dual-path volume support: filesystem volumes via virtio-fs and
+/// Test dual-path volume support: filesystem volumes via shared dir and
 /// block volumes via vm.add-disk.
 ///
 /// Filesystem path:
-///   1. Write test data to a directory in the virtio-fs shared dir
+///   1. Write test data to a directory in the shared dir
 ///   2. Boot a container that reads from that directory
 ///   3. Verify the container sees the data
 ///
@@ -1955,7 +1757,7 @@ fn test_vm_memory_reclaim() {
 ///   2. Hot-plug it into the VM via vm.add-disk
 ///   3. Verify the agent can discover the new block device
 ///
-/// Requires: root, KVM, CH, virtiofsd, kernel, rootfs, http-echo
+/// Requires: root, KVM, CH, kernel, rootfs, http-echo
 #[test]
 fn test_volume_mounts() {
     let fixtures = TestFixtures::resolve().expect("failed to resolve test fixtures");
@@ -1993,10 +1795,6 @@ fn test_volume_mounts() {
         let mut vm =
             containerd_shim_cloudhv::vm::VmManager::new(vm_id.clone(), config).expect("VmManager");
         vm.prepare().await.expect("prepare");
-        vm.spawn_virtiofsd().expect("virtiofsd spawn failed");
-        vm.wait_virtiofsd_ready()
-            .await
-            .expect("virtiofsd ready failed");
         vm.spawn_vmm_in_netns(None).expect("vmm spawn failed");
         vm.wait_vmm_ready().await.expect("vmm ready failed");
         vm.create_and_boot_vm(None, None).await.expect("boot");
@@ -2007,7 +1805,7 @@ fn test_volume_mounts() {
         eprintln!("           │ VM booted");
 
         // ── Phase 2: Test filesystem volume via shared dir ────────────
-        eprintln!("  Phase 2 │ Testing filesystem volume (virtio-fs)");
+        eprintln!("  Phase 2 │ Testing filesystem volume");
 
         // Write test data to the shared dir (simulates bind-mount staging)
         let vol_dir = vm.shared_dir().join("volumes").join("fs-test");
@@ -2015,7 +1813,7 @@ fn test_volume_mounts() {
         let test_content = "hello from filesystem volume";
         std::fs::write(vol_dir.join("data.txt"), test_content).expect("write vol");
 
-        // Verify via agent health check that virtiofs is working
+        // Verify via agent health check that shared dir is working
         let vsock = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
         let (_agent, health) = vsock.connect_ttrpc().await.expect("ttrpc");
         let ctx = ttrpc::context::with_duration(Duration::from_secs(5));
@@ -2023,7 +1821,7 @@ fn test_volume_mounts() {
             .check(ctx, &cloudhv_proto::CheckRequest::new())
             .await
             .expect("health check");
-        assert!(resp.ready, "agent must be healthy (virtiofs working)");
+        assert!(resp.ready, "agent must be healthy");
 
         // Verify host-side data persists (simulates write-back)
         let read_back = std::fs::read_to_string(vol_dir.join("data.txt")).expect("read");

@@ -30,7 +30,6 @@ pod IP.
 | crictl | CRI command-line client |
 | CNI plugins | Pod networking |
 | Cloud Hypervisor | VMM binary |
-| virtiofsd | Virtio-fs daemon |
 | Guest kernel + rootfs | Pre-built VM image |
 
 ## Setup
@@ -85,7 +84,6 @@ sudo tee /etc/cni/net.d/10-bridge.conflist > /dev/null <<EOF
 EOF
 ```
 
-### 3. Install Cloud Hypervisor and virtiofsd
 
 ```bash
 # Cloud Hypervisor
@@ -94,8 +92,6 @@ wget -q "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/
   -O /tmp/cloud-hypervisor
 sudo install -m 755 /tmp/cloud-hypervisor /usr/local/bin/cloud-hypervisor
 
-# virtiofsd (usually available via package manager)
-sudo apt-get install -y virtiofsd
 # Or from the containerd-cloudhypervisor installer image (see example/aks/)
 ```
 
@@ -125,7 +121,6 @@ sudo cp guest/rootfs/rootfs.ext4 /opt/cloudhv/rootfs.ext4
 sudo tee /opt/cloudhv/config.json > /dev/null <<EOF
 {
   "cloud_hypervisor_binary": "/usr/local/bin/cloud-hypervisor",
-  "virtiofsd_binary": "/usr/libexec/virtiofsd",
   "kernel_path": "/opt/cloudhv/vmlinux",
   "rootfs_path": "/opt/cloudhv/rootfs.ext4",
   "kernel_args": "console=hvc0 root=/dev/vda rw init=/init net.ifnames=0",
@@ -299,7 +294,6 @@ crictl runp sandbox.json
     → shim reads /opt/cloudhv/config.json
     → shim creates TAP device in pod network namespace
     → shim sets up TC redirect (veth ↔ TAP)
-    → shim starts virtiofsd (or uses embedded backend)
     → shim starts cloud-hypervisor inside the pod netns
     → shim calls vm.create + vm.boot via CH HTTP API
     → kernel boots, agent starts, vsock connects back

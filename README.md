@@ -47,7 +47,6 @@ sudo cp guest/kernel/vmlinux guest/rootfs/rootfs.ext4 /opt/cloudhv/
 sudo tee /opt/cloudhv/config.json > /dev/null <<EOF
 {
   "cloud_hypervisor_binary": "/usr/local/bin/cloud-hypervisor",
-  "virtiofsd_binary": "/usr/libexec/virtiofsd",
   "kernel_path": "/opt/cloudhv/vmlinux",
   "rootfs_path": "/opt/cloudhv/rootfs.ext4",
   "kernel_args": "console=hvc0 root=/dev/vda rw quiet init=/init net.ifnames=0",

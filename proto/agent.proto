@@ -30,6 +30,9 @@ service AgentService {
 
     // GetMemInfo returns guest memory statistics from /proc/meminfo.
     rpc GetMemInfo(GetMemInfoRequest) returns (GetMemInfoResponse);
+
+    // GetContainerLogs returns buffered stdout/stderr from a container.
+    rpc GetContainerLogs(GetContainerLogsRequest) returns (GetContainerLogsResponse);
 }
 
 // HealthService provides health checking for the guest agent.
@@ -185,4 +188,18 @@ message GetMemInfoResponse {
     uint64 cached_kb = 5;
     uint64 swap_total_kb = 6;
     uint64 swap_free_kb = 7;
+}
+
+// --- GetContainerLogs ---
+
+message GetContainerLogsRequest {
+    string container_id = 1;
+    uint64 offset = 2;   // byte offset to read from (for incremental reads)
+}
+
+message GetContainerLogsResponse {
+    bytes stdout = 1;
+    bytes stderr = 2;
+    uint64 offset = 3;   // new offset after this read
+    bool eof = 4;         // true if container exited and all output captured
 }

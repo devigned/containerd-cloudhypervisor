@@ -9,7 +9,6 @@ Full VM lifecycle from scratch — kernel boots, agent starts, ttrpc connects.
 | Phase | Latency |
 |-------|---------|
 | Shim setup (new + prepare) | **~0.1ms** |
-| virtiofsd startup | **~6ms** |
 | Cloud Hypervisor startup | **~6ms** |
 | VM create + boot (CH API) | **~16ms** |
 | Guest boot + agent ready | **~231ms** |
@@ -47,21 +46,15 @@ restore when available, falling back to cold boot transparently.
 | Component | RSS |
 |-----------|-----|
 | Cloud Hypervisor (VMM) | ~50 MB |
-| virtiofsd | ~5 MB (0 with embedded mode) |
 | Shim process | ~10 MB |
-| **Total host overhead** | **~65 MB** (60 MB with embedded virtiofsd) |
 | VM guest memory | 128–512 MB (configurable) |
 
-### Embedded virtiofsd
 
-With `--features embedded-virtiofsd`, virtiofsd runs as a thread inside the shim
 process instead of a separate daemon:
 
 | Metric | Spawned | Embedded |
 |--------|---------|----------|
-| virtiofsd startup | ~10ms | **277µs** |
 | RSS per VM | ~5 MB | **0** (shared in shim) |
-| Processes per VM | 3 (CH + virtiofsd + shim) | **2** (CH + shim) |
 
 ## Density
 
@@ -69,7 +62,6 @@ At 100 VMs per node with 128 MB guest memory:
 
 | Component | Total |
 |-----------|-------|
-| Host process overhead | ~6.5 GB (6.0 GB with embedded virtiofsd) |
 | Guest memory | ~12.8 GB |
 | **Total** | **~19.3 GB** |
 
