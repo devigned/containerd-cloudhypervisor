@@ -266,7 +266,7 @@ jobs:
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [build-binaries, build-kernel, build-rootfs, build-installer-image]
+    needs: [build-binaries, build-kernel, build-rootfs]
     steps:
       - uses: actions/checkout@v4
         with:
