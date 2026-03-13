@@ -466,7 +466,7 @@ impl CloudHvInstance {
             f.set_len(16 * 1024 * 1024)?; // 16MB default
             drop(f);
             let status = std::process::Command::new("mkfs.ext4")
-                .args(["-q", "-F"])
+                .args(["-q", "-F", "-O", "^has_journal"])
                 .arg(&edir_path)
                 .status();
             if status.map(|s| !s.success()).unwrap_or(true) {
@@ -1076,8 +1076,11 @@ fn create_cached_rootfs_image(
         anyhow::bail!("cp rootfs to cache staging failed: {status}");
     }
 
+    // Create ext4 without journal — these are ephemeral container disks that
+    // don't need crash consistency. Saves ~4MB per image and eliminates
+    // journal write overhead on every file operation inside the guest.
     let status = Command::new("mkfs.ext4")
-        .args(["-q", "-F", "-d"])
+        .args(["-q", "-F", "-O", "^has_journal", "-d"])
         .arg(&staging)
         .arg(cache_path)
         .status()

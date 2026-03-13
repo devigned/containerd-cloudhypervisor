@@ -125,7 +125,10 @@ impl ContainerManager {
 
         info!("discovered new disk: {}", new_disk);
 
-        // Mount the disk — retry as the device may not be immediately ready
+        // Mount the disk — retry as the device may not be immediately ready.
+        // Use noatime (skip access time updates) and nobarrier (skip journal
+        // barriers) since these are ephemeral container disks — we don't need
+        // crash consistency guarantees for data that is recreated on every start.
         #[cfg(target_os = "linux")]
         {
             use nix::mount::{mount, MsFlags};
@@ -134,8 +137,8 @@ impl ContainerManager {
                     Some(new_disk.as_str()),
                     _mount_point,
                     Some("ext4"),
-                    MsFlags::empty(),
-                    None::<&str>,
+                    MsFlags::MS_NOATIME,
+                    Some("nobarrier"),
                 ) {
                     Ok(()) => return Ok(new_disk),
                     Err(e) if attempt < 20 => {
