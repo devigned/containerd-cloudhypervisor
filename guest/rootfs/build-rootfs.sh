@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/env sh
 #
 # Build a minimal guest rootfs for Cloud Hypervisor microVMs.
 #
@@ -15,9 +15,8 @@
 set -euo pipefail
 
 AGENT_BINARY="${1:?Usage: build-rootfs.sh <path-to-cloudhv-agent-binary>}"
-ROOTFS_DIR="rootfs"
-IMAGE_FILE="rootfs.ext4"
-IMAGE_SIZE_MB=16
+ROOTFS_DIR="rootfs-base"
+IMAGE_FILE="rootfs.erofs"
 
 echo "=== Building minimal guest rootfs ==="
 
@@ -32,21 +31,9 @@ if file "${AGENT_BINARY}" | grep -q "dynamically linked"; then
 fi
 
 # Clean previous build
-rm -rf "${ROOTFS_DIR}" "${IMAGE_FILE}"
-mkdir -p "${ROOTFS_DIR}"
+rm -f "${IMAGE_FILE}"
 
-# Create directory structure
-echo "Creating directory structure..."
-mkdir -p "${ROOTFS_DIR}"/{bin,dev,etc,proc,sys,tmp,run,var,containers}
-mkdir -p "${ROOTFS_DIR}"/dev/{pts,shm}
-mkdir -p "${ROOTFS_DIR}"/sys/fs/cgroup
-
-# Install agent as /init (PID 1)
 echo "Installing agent binary as /init..."
-cp "${AGENT_BINARY}" "${ROOTFS_DIR}/init"
-chmod 755 "${ROOTFS_DIR}/init"
-
-# Also place at /bin/cloudhv-agent for convenience
 cp "${AGENT_BINARY}" "${ROOTFS_DIR}/bin/cloudhv-agent"
 chmod 755 "${ROOTFS_DIR}/bin/cloudhv-agent"
 
@@ -69,50 +56,21 @@ if file "${ROOTFS_DIR}/bin/crun" | grep -q "dynamically linked"; then
     exit 1
 fi
 
-# Minimal /etc
-echo "Creating /etc files..."
-cat > "${ROOTFS_DIR}/etc/passwd" << 'EOF'
-root:x:0:0:root:/root:/bin/sh
-nobody:x:65534:65534:nobody:/nonexistent:/bin/false
-EOF
-
-cat > "${ROOTFS_DIR}/etc/group" << 'EOF'
-root:x:0:
-nobody:x:65534:
-EOF
-
-cat > "${ROOTFS_DIR}/etc/hosts" << 'EOF'
-127.0.0.1 localhost
-::1       localhost
-EOF
-
-cat > "${ROOTFS_DIR}/etc/resolv.conf" << 'EOF'
-nameserver 8.8.8.8
-nameserver 8.8.4.4
-EOF
-
 # Agent configuration
 if [ -f "agent.conf" ]; then
     cp agent.conf "${ROOTFS_DIR}/etc/cloudhv-agent.conf"
 fi
 
-# Create ext4 image
-echo "Creating ext4 image (${IMAGE_SIZE_MB} MB)..."
-dd if=/dev/zero of="${IMAGE_FILE}" bs=1M count="${IMAGE_SIZE_MB}" status=none
-mkfs.ext4 -q -F -L rootfs "${IMAGE_FILE}"
-
-# Mount and populate
-MOUNT_DIR=$(mktemp -d)
-sudo mount -o loop "${IMAGE_FILE}" "${MOUNT_DIR}"
-sudo cp -a "${ROOTFS_DIR}/." "${MOUNT_DIR}/"
-sudo umount "${MOUNT_DIR}"
-rmdir "${MOUNT_DIR}"
+# Create filesystem image
+echo "Creating root filesystem image"
+mkfs.erofs --all-root --exclude-regex '.*\.gitkeep' "${IMAGE_FILE}" "${ROOTFS_DIR}"
 
 # Report size
 IMAGE_ACTUAL_SIZE=$(du -sh "${IMAGE_FILE}" | cut -f1)
 ROOTFS_SIZE=$(du -sh "${ROOTFS_DIR}" | cut -f1)
 echo "=== Rootfs built ==="
+echo "  Contents:"
+find "${ROOTFS_DIR}" -type f -not -name '*.gitkeep' -exec ls -lh {} \; | awk '{print "    " $5 " " $9}'
+echo "----"
 echo "  Directory: ${ROOTFS_SIZE} (${ROOTFS_DIR}/)"
 echo "  Image:     ${IMAGE_ACTUAL_SIZE} (${IMAGE_FILE})"
-echo "  Contents:"
-find "${ROOTFS_DIR}" -type f -exec ls -lh {} \; | awk '{print "    " $5 " " $9}'
