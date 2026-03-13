@@ -226,10 +226,10 @@ impl CloudHvInstance {
         let sandbox_id = self.id.clone();
 
         let spec_path = self.bundle.join("config.json");
-        let (netns_path, pod_annotations, mem_request, mem_limit) = parse_sandbox_spec(&spec_path);
+        let sandbox_spec = parse_sandbox_spec(&spec_path);
 
         // Set up TAP device in the pod's network namespace
-        let (tap_name, tap_mac, ip_config) = if let Some(ref netns) = netns_path {
+        let (tap_name, tap_mac, ip_config) = if let Some(ref netns) = sandbox_spec.netns {
             match setup_tap_in_netns(netns, &sandbox_id) {
                 Ok(tap_info) => {
                     info!(
@@ -253,8 +253,12 @@ impl CloudHvInstance {
         };
 
         let config = load_config(None).ctx("config error")?;
-        let config = crate::annotations::apply_annotations(config, &pod_annotations);
-        let config = crate::annotations::apply_resource_limits(config, mem_request, mem_limit);
+        let config = crate::annotations::apply_annotations(config, &sandbox_spec.annotations);
+        let config = crate::annotations::apply_resource_limits(
+            config,
+            sandbox_spec.mem_request,
+            sandbox_spec.mem_limit,
+        );
 
         // Cold-boot a new VM
         let mut vm = VmManager::new(sandbox_id.clone(), config.clone()).ctx("VmManager")?;
@@ -273,7 +277,8 @@ impl CloudHvInstance {
 
         vm.start_swtpm().await.ctx("swtpm")?;
 
-        vm.spawn_vmm_in_netns(netns_path.as_deref()).ctx("vmm")?;
+        vm.spawn_vmm_in_netns(sandbox_spec.netns.as_deref())
+            .ctx("vmm")?;
 
         vm.wait_vmm_ready().await.ctx("vmm")?;
 
@@ -289,6 +294,17 @@ impl CloudHvInstance {
         let shared_dir = vm.shared_dir().to_path_buf();
         let api_socket = vm.api_socket_path().to_path_buf();
         let ch_pid = vm.ch_pid().unwrap_or(std::process::id());
+
+        // Place the Cloud Hypervisor process into the pod's cgroup so that
+        // kubectl top, HPA, and cAdvisor see the full VM resource usage
+        // (VMM process RSS, vCPU thread CPU time, mmap'd guest memory).
+        if let Some(ref cg_path) = sandbox_spec.cgroups_path {
+            if let Err(e) = place_in_pod_cgroup(ch_pid, cg_path) {
+                info!("cgroup placement failed (non-fatal): {e}");
+            } else {
+                info!("CH pid {ch_pid} placed in pod cgroup: {cg_path}");
+            }
+        }
 
         // Start memory monitor if hotplug is configured
         if config.hotplug_memory_mb > 0 {
@@ -663,22 +679,127 @@ fn parse_container_type(spec_path: &std::path::Path, default_id: &str) -> (bool,
     (is_sandbox, sandbox_id)
 }
 
+/// Place a process into the pod's cgroup so that Kubernetes metrics (kubectl top,
+/// HPA, cAdvisor) see the full VM resource usage.
+///
+/// Tries cgroup v2 unified hierarchy first, then systemd-style v2, then v1.
+/// The `cgroups_path` comes from the OCI spec's `linux.cgroupsPath` field.
+fn place_in_pod_cgroup(pid: u32, cgroups_path: &str) -> anyhow::Result<()> {
+    place_in_pod_cgroup_at(pid, cgroups_path, std::path::Path::new("/sys/fs/cgroup"))
+}
+
+/// Testable implementation that accepts the cgroup root path.
+fn place_in_pod_cgroup_at(
+    pid: u32,
+    cgroups_path: &str,
+    cgroup_root: &std::path::Path,
+) -> anyhow::Result<()> {
+    let pid_str = pid.to_string();
+    // Strip leading slash — OCI spec paths often have one
+    let cgroups_path = cgroups_path.trim_start_matches('/');
+
+    // Try cgroup v2 (unified hierarchy) — create the directory if needed
+    let v2_path = cgroup_root.join(cgroups_path);
+    let v2_procs = v2_path.join("cgroup.procs");
+    if v2_procs.exists() {
+        std::fs::write(&v2_procs, &pid_str)
+            .map_err(|e| anyhow::anyhow!("write cgroup v2 procs: {e}"))?;
+        return Ok(());
+    }
+    // On cgroup v2, creating the directory auto-populates cgroup.procs
+    if cgroup_root.join("cgroup.controllers").exists() {
+        std::fs::create_dir_all(&v2_path).ok();
+        if v2_path.join("cgroup.procs").exists() {
+            std::fs::write(v2_path.join("cgroup.procs"), &pid_str)
+                .map_err(|e| anyhow::anyhow!("write cgroup v2 procs (created): {e}"))?;
+            return Ok(());
+        }
+    }
+
+    // Try systemd-style cgroup v2 path
+    let systemd_path = to_systemd_cgroup_path(cgroups_path);
+    let v2_systemd = cgroup_root.join(&systemd_path);
+    if v2_systemd.join("cgroup.procs").exists() {
+        std::fs::write(v2_systemd.join("cgroup.procs"), &pid_str)
+            .map_err(|e| anyhow::anyhow!("write cgroup v2 systemd procs: {e}"))?;
+        return Ok(());
+    }
+
+    // Try cgroup v1 (separate controller hierarchies)
+    let mut placed = false;
+    for controller in &["memory", "cpu,cpuacct", "pids"] {
+        let v1_path = cgroup_root.join(controller).join(cgroups_path);
+        if v1_path.join("cgroup.procs").exists() {
+            std::fs::write(v1_path.join("cgroup.procs"), &pid_str)
+                .map_err(|e| anyhow::anyhow!("write cgroup v1 {controller} procs: {e}"))?;
+            placed = true;
+        }
+    }
+
+    if placed {
+        Ok(())
+    } else {
+        anyhow::bail!("no cgroup found for path {cgroups_path} (tried v2, v2-systemd, v1)")
+    }
+}
+
+/// Convert a kubelet-style cgroup path to a systemd slice path.
+///
+/// Input:  `kubepods/burstable/pod-uid/ctr-id`
+/// Output: `kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod_uid.slice/cri-containerd-ctr_id.scope`
+fn to_systemd_cgroup_path(cgroups_path: &str) -> String {
+    let parts: Vec<&str> = cgroups_path.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        return cgroups_path.to_string();
+    }
+
+    let mut result = String::new();
+    let mut prefix = String::new();
+    for (i, part) in parts.iter().enumerate() {
+        let sanitized = part.replace('-', "_");
+        if i == parts.len() - 1 {
+            // Last segment is a scope (container ID)
+            result.push_str(&format!("cri-containerd-{sanitized}.scope"));
+        } else {
+            // Intermediate segments are slices with hierarchical prefix
+            if prefix.is_empty() {
+                result.push_str(&format!("{sanitized}.slice/"));
+                prefix = sanitized;
+            } else {
+                let slice_name = format!("{prefix}-{sanitized}");
+                result.push_str(&format!("{slice_name}.slice/"));
+                prefix = slice_name;
+            }
+        }
+    }
+    result
+}
+
+/// Parsed sandbox configuration from the OCI spec.
+struct SandboxSpec {
+    netns: Option<String>,
+    annotations: HashMap<String, String>,
+    mem_request: Option<u64>,
+    mem_limit: Option<u64>,
+    cgroups_path: Option<String>,
+}
+
 /// Parse sandbox OCI spec for network namespace, annotations, and resources.
-fn parse_sandbox_spec(
-    spec_path: &std::path::Path,
-) -> (
-    Option<String>,
-    HashMap<String, String>,
-    Option<u64>,
-    Option<u64>,
-) {
+fn parse_sandbox_spec(spec_path: &std::path::Path) -> SandboxSpec {
+    let empty = SandboxSpec {
+        netns: None,
+        annotations: HashMap::new(),
+        mem_request: None,
+        mem_limit: None,
+        cgroups_path: None,
+    };
     let data = match std::fs::read_to_string(spec_path) {
         Ok(d) => d,
-        Err(_) => return (None, HashMap::new(), None, None),
+        Err(_) => return empty,
     };
     let spec: serde_json::Value = match serde_json::from_str(&data) {
         Ok(s) => s,
-        Err(_) => return (None, HashMap::new(), None, None),
+        Err(_) => return empty,
     };
 
     let netns = spec
@@ -694,6 +815,12 @@ fn parse_sandbox_spec(
     let annotations = crate::annotations::annotations_from_spec(&spec);
     let (req, lim) = crate::annotations::memory_resources_from_spec(&spec);
 
+    // Extract cgroups path for VM process placement
+    let cgroups_path = spec
+        .pointer("/linux/cgroupsPath")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
     if netns.is_some() {
         info!("sandbox netns: {:?}", netns);
     }
@@ -703,8 +830,17 @@ fn parse_sandbox_spec(
     if req.is_some() || lim.is_some() {
         info!("sandbox resources: request={:?}MiB limit={:?}MiB", req, lim);
     }
+    if cgroups_path.is_some() {
+        info!("sandbox cgroups: {:?}", cgroups_path);
+    }
 
-    (netns, annotations, req, lim)
+    SandboxSpec {
+        netns,
+        annotations,
+        mem_request: req,
+        mem_limit: lim,
+        cgroups_path,
+    }
 }
 
 /// Volume extracted from the OCI spec's mounts array.
@@ -1784,6 +1920,63 @@ mod tests {
         assert_eq!(super::prefix_to_netmask(16), "255.255.0.0");
         assert_eq!(super::prefix_to_netmask(32), "255.255.255.255");
         assert_eq!(super::prefix_to_netmask(0), "0.0.0.0");
+    }
+
+    #[test]
+    fn to_systemd_cgroup_path_converts_correctly() {
+        assert_eq!(
+            super::to_systemd_cgroup_path("kubepods/burstable/pod-abc/ctr-123"),
+            "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod_abc.slice/cri-containerd-ctr_123.scope"
+        );
+        assert_eq!(
+            super::to_systemd_cgroup_path("kubepods/besteffort/pod-xyz/ctr-456"),
+            "kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod_xyz.slice/cri-containerd-ctr_456.scope"
+        );
+    }
+
+    #[test]
+    fn place_in_pod_cgroup_v2_unified() {
+        let dir = TempDir::new().unwrap();
+        let cg = dir.path().join("kubepods/burstable/pod-abc");
+        fs::create_dir_all(&cg).unwrap();
+        fs::write(cg.join("cgroup.procs"), "").unwrap();
+
+        super::place_in_pod_cgroup_at(12345, "kubepods/burstable/pod-abc", dir.path())
+            .expect("should place in v2 cgroup");
+
+        let content = fs::read_to_string(cg.join("cgroup.procs")).unwrap();
+        assert_eq!(content, "12345");
+    }
+
+    #[test]
+    fn place_in_pod_cgroup_v1_fallback() {
+        let dir = TempDir::new().unwrap();
+        // Create v1-style hierarchy (no unified v2 path)
+        let mem_cg = dir.path().join("memory/kubepods/burstable/pod-abc");
+        let cpu_cg = dir.path().join("cpu,cpuacct/kubepods/burstable/pod-abc");
+        fs::create_dir_all(&mem_cg).unwrap();
+        fs::create_dir_all(&cpu_cg).unwrap();
+        fs::write(mem_cg.join("cgroup.procs"), "").unwrap();
+        fs::write(cpu_cg.join("cgroup.procs"), "").unwrap();
+
+        super::place_in_pod_cgroup_at(99999, "kubepods/burstable/pod-abc", dir.path())
+            .expect("should place in v1 cgroups");
+
+        assert_eq!(
+            fs::read_to_string(mem_cg.join("cgroup.procs")).unwrap(),
+            "99999"
+        );
+        assert_eq!(
+            fs::read_to_string(cpu_cg.join("cgroup.procs")).unwrap(),
+            "99999"
+        );
+    }
+
+    #[test]
+    fn place_in_pod_cgroup_no_path_fails() {
+        let dir = TempDir::new().unwrap();
+        let result = super::place_in_pod_cgroup_at(1, "nonexistent/path", dir.path());
+        assert!(result.is_err());
     }
 
     #[test]
