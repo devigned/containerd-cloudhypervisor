@@ -5,12 +5,15 @@
 #   " the `x86_64-unknown-linux-musl` target may not be installed"
 #
 # Usage:
-#   hacks/build-static.sh <component> [<component>...]
+#   hacks/build-static-rust.sh [--arch <arch>] <component> [<component>...]
 # e.g
-#   hacks/build-static.sh containerd-shim-cloudhv cloudhv-agent
+#   hacks/build-static.sh containerd-shim-cloudhv crates/agent/cloudhv-agent
 # to build both a static shim and agent.
+# The optional <arch> can be x86-64 or arm64.
 
 set -euo pipefail
+scriptdir="$(cd "$(dirname "$0")"; pwd)"
+source "${scriptdir}/util.inc"
 
 # Runs inside the container
 build() {
@@ -24,7 +27,7 @@ build() {
     cargo \
     rust \
     make \
-    musl-dev \
+    musl-dev
 
   mkdir -p /opt/build
   cd /opt/build
@@ -38,27 +41,42 @@ build() {
   export CARGO_TARGET_${TARGET}_RUSTFLAGS="-C target-feature=+crt-static -L /usr/lib -C link-arg=-Wl,-static"
   export CARGO_TARGET_${TARGET}_PKG_CONFIG_ALL_STATIC=1
   export CARGO_TARGET_${TARGET}_LIBBPF_SYS_STATIC=1
-  
+
   echo -e "\n############  Building static binaries ############"
   for f in "${@}"; do
     echo -e "\n   $f...\n"
-    cargo build --release -p ${f}
-    # target binaries might not be named exactly like components, so we're fuzzy here
-    for a in "$(find "target/${target}/release" -maxdepth 1 -name "${f}*" -type f -executable)"; do
-      cp "$a" /host/
-      chown -R "$host_user_group" "/host/$(basename "${a}")"
-    done
-    echo -e "\n   ==> Done: $f\n"
+    subdir="$(dirname "$f")"
+    component="$(basename "$f")"
+    ( 
+      set -euo pipefail
+      cd "$subdir"
+      cargo build --release -p "${component}"
+      # target binaries might not be named exactly like components, so we're fuzzy here
+      for a in "$(find "target/${target}/release" -maxdepth 1 -name "${component}*" -type f -executable)"; do
+        cp "$a" /host/
+        chown -R "$host_user_group" "/host/$(basename "${a}")"
+      done
+      echo -e "\n   ==> Done: $f\n"
+    )
   done
 }
 # --
-  
+ 
+# runs on the host
 if [ "$1" = "build" ] ; then
   shift
   build ${@}
 else
   uid="$(id -u)"
   gid="$(id -g)"
-  docker run --rm -ti -v $(pwd):/host alpine \
-      /host/hacks/build-static.sh "build" "$uid:$gid" ${@}
+  scriptname="$(basename "$0")"
+  arch="$(docker_arch "$@")"
+  platform="$(docker_platform "$arch")"
+  if [ "${1:-}" == "--arch" ] ; then
+    shift; shift
+  fi
+  docker run --rm -i -v $(pwd):/host \
+      $platform \
+      alpine \
+      "/host/hacks/${scriptname}" "build" "$uid:$gid" ${@}
 fi
