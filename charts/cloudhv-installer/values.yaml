@@ -23,4 +23,4 @@ runtimeClass:
   handler: cloudhv
   overhead:
     memory: "50Mi"
-    cpu: "50m"
+    cpu: "10m"
