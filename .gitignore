@@ -27,6 +27,9 @@ bzImage
 # Cloud Hypervisor runtime
 /run/
 
+# Reports and benchmarks (local staging, not committed)
+/reports/
+
 # Guest build artifacts
 guest/kernel/linux-*/
 guest/rootfs/*.img

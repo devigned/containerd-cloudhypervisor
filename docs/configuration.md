@@ -50,6 +50,27 @@ The shim loads its configuration from `/opt/cloudhv/config.json` at startup.
 - `max_containers_per_vm` limits density. Each container gets its own hot-plugged
   disk and mount + PID namespace isolation within the shared VM.
 
+## Rootfs Image Cache
+
+The shim caches rootfs ext4 images per unique container image to eliminate
+`mkfs.ext4` from the container startup hot path.
+
+| Item | Value |
+|------|-------|
+| **Cache directory** | `/opt/cloudhv/cache/` |
+| **Cache key** | FNV-1a hash of rootfs file metadata (path, size, mode) |
+| **File naming** | `/opt/cloudhv/cache/<hash>.img` |
+| **Lifetime** | Persistent until manual deletion |
+| **Typical size** | 64–500 MB per unique image |
+
+The installer creates the cache directory automatically. To clear:
+
+```bash
+sudo rm -f /opt/cloudhv/cache/*.img
+```
+
+> **Note:** Only clear the cache when no containers are actively starting.
+
 ## Pod Annotations
 
 VM resources can be overridden per-pod using OCI spec annotations. This allows

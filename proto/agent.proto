@@ -45,7 +45,7 @@ service HealthService {
 
 message CreateContainerRequest {
     string container_id = 1;
-    // OCI bundle path (relative to the shared virtio-fs mount)
+    // OCI bundle path (guest-side mount point for the container)
     string bundle_path = 2;
     // Stdin/stdout/stderr paths
     string stdin = 3;
@@ -55,6 +55,10 @@ message CreateContainerRequest {
     bool terminal = 6;
     // Volume mounts to add to the container (from CSI, ConfigMap, Secret, etc.)
     repeated VolumeMount volumes = 7;
+    // OCI config.json content, sent inline to avoid a second disk.
+    // When non-empty, the agent writes this to the container's bundle
+    // directory on the mounted rootfs disk, overriding any on-disk copy.
+    bytes config_json = 8;
 }
 
 // A volume mount to inject into the container's OCI spec.
@@ -71,6 +75,17 @@ message VolumeMount {
     VolumeType volume_type = 5;
     // Filesystem type for block volumes (e.g., "ext4", "xfs")
     string fs_type = 6;
+    // Inline file contents for FILESYSTEM volumes (ConfigMap, Secret).
+    // When present, the agent writes these to tmpfs and bind-mounts them
+    // instead of reading from a baked-in disk path.
+    repeated InlineFile files = 7;
+}
+
+// A file delivered inline via RPC for tmpfs-backed volumes.
+message InlineFile {
+    string path = 1;      // relative path within the volume (e.g., "app.conf")
+    bytes content = 2;    // file contents
+    uint32 mode = 3;      // Unix permissions (e.g., 0644)
 }
 
 enum VolumeType {

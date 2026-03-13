@@ -23,6 +23,16 @@ pub struct VolumeInfo {
     pub readonly: bool,
     pub is_block: bool,
     pub fs_type: String,
+    /// Inline file contents for filesystem volumes (ConfigMap, Secret).
+    /// When non-empty, files are written to tmpfs instead of read from disk.
+    pub inline_files: Vec<InlineFileInfo>,
+}
+
+/// A file delivered inline via the CreateContainer RPC.
+pub struct InlineFileInfo {
+    pub path: String,
+    pub content: Vec<u8>,
+    pub mode: u32,
 }
 
 /// Tracks the state of a container managed by the agent.
@@ -279,44 +289,85 @@ impl ContainerManager {
 
     /// Create a new container from a hot-plugged block device.
     ///
-    /// The host shim creates an ext4 disk image containing the OCI bundle
-    /// (config.json + rootfs) and hot-plugs it into the VM. The agent
-    /// discovers the new block device, mounts it, adapts the OCI spec for
-    /// the VM environment, and prepares it for crun. Execution happens in
-    /// `start()`.
+    /// The host shim hot-plugs a cached rootfs disk (rootfs/ only) into the VM.
+    /// The OCI config.json and filesystem volume data are delivered inline via
+    /// the RPC and written to tmpfs — no second disk needed.
     pub async fn create(
         &mut self,
         container_id: &str,
-        bundle_path: &str,
+        _bundle_path: &str,
         volumes: &[VolumeInfo],
+        config_json: &[u8],
     ) -> Result<u32> {
         info!("creating container: id={}", container_id);
 
-        // The bundle_path from the shim tells us the guest mount point.
-        // The host has already hot-plugged a block device containing the
-        // rootfs + config.json. We need to find and mount it.
-        let _bundle = PathBuf::from(bundle_path);
-
-        // Wait for the block device to appear and mount it.
-        // The host hot-plugged it just before this RPC — give the kernel
-        // time to detect it via ACPI.
         let mount_point = PathBuf::from("/run/containers").join(container_id);
         std::fs::create_dir_all(&mount_point)?;
 
+        // Discover and mount the rootfs disk
         let disk_path = self
             .discover_and_mount_new_disk(&mount_point)
             .await
-            .context("discover/mount container disk")?;
+            .context("discover/mount rootfs disk")?;
         info!(
-            "mounted container disk {} at {}",
+            "mounted rootfs disk {} at {}",
             disk_path,
             mount_point.display()
         );
 
-        // The disk image contains config.json and rootfs/ at its root
-        let local_bundle = mount_point.clone();
+        // Write config.json: prefer inline RPC data, fall back to disk content
+        if !config_json.is_empty() {
+            std::fs::write(mount_point.join("config.json"), config_json)
+                .context("write inline config.json")?;
+            info!("wrote inline config.json ({} bytes)", config_json.len());
+        } else if !mount_point.join("config.json").exists() {
+            anyhow::bail!("no config.json: neither inline data nor on-disk file present");
+        }
 
-        // Adapt the OCI spec for the VM environment
+        // Write inline filesystem volume files to the bundle directory
+        for vol in volumes {
+            if vol.is_block || vol.inline_files.is_empty() {
+                continue;
+            }
+            let vol_dir = mount_point
+                .join("volumes")
+                .join(vol.source.rsplit('/').next().unwrap_or("vol"));
+            std::fs::create_dir_all(&vol_dir)?;
+            for f in &vol.inline_files {
+                // Reject unsafe paths that could escape the volume directory
+                if f.path.starts_with('/')
+                    || f.path.contains("../")
+                    || f.path.contains("/..")
+                    || f.path == ".."
+                {
+                    warn!("skipping unsafe inline file path: {}", f.path);
+                    continue;
+                }
+                let file_path = vol_dir.join(&f.path);
+                if let Some(parent) = file_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&file_path, &f.content)
+                    .with_context(|| format!("write inline file: {}", f.path))?;
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if f.mode != 0 {
+                        std::fs::set_permissions(
+                            &file_path,
+                            std::fs::Permissions::from_mode(f.mode),
+                        )?;
+                    }
+                }
+            }
+            info!(
+                "wrote {} inline files for volume {}",
+                vol.inline_files.len(),
+                vol.destination
+            );
+        }
+
+        let local_bundle = mount_point.clone();
         self.adapt_oci_spec_for_vm(&local_bundle, volumes)?;
 
         let pid = std::process::id();

@@ -5,8 +5,9 @@ that runs container workloads inside lightweight microVMs with maximum density a
 
 ## Highlights
 
-- **~420ms end-to-end container lifecycle**
+- **~350ms end-to-end container lifecycle** (cached rootfs; ~420ms on first unique image)
 - **VM isolation** — each pod runs in its own Cloud Hypervisor microVM with dedicated kernel
+- **Rootfs image cache** — per-node cache eliminates mkfs.ext4 from the hot path (34× faster burst scaling)
 - **Block device rootfs** — container images delivered as hot-plugged virtio-blk disks (no FUSE)
 - **Dual hypervisor** — same binary runs on KVM (Linux) and MSHV (Azure/Hyper-V)
 - **Multi-container pods** — up to 5 containers per VM with mount + PID isolation
@@ -24,7 +25,7 @@ migration, consider [Kata Containers](https://katacontainers.io/) instead.
 
 | | containerd-cloudhypervisor | Kata Containers |
 | --- | --- | --- |
-| **Cold start** | ~420ms total e2e | ~500ms–1s |
+| **Cold start** | ~350ms (cached) / ~420ms (first image) | ~500ms–1s |
 | **Shim binary** | 2.4 MB | ~50 MB |
 | **Guest rootfs** | 16 MB (agent + crun) | ~150 MB |
 | **Language** | Rust | Go |
@@ -40,7 +41,7 @@ cd guest/rootfs && sudo bash build-rootfs.sh ../../target/x86_64-unknown-linux-m
 
 # Install
 sudo install -m 755 target/release/containerd-shim-cloudhv-v1 /usr/local/bin/
-sudo mkdir -p /opt/cloudhv
+sudo mkdir -p /opt/cloudhv /opt/cloudhv/cache
 sudo cp guest/kernel/vmlinux guest/rootfs/rootfs.ext4 /opt/cloudhv/
 
 # Configure (see docs/configuration.md for full reference)
@@ -64,9 +65,9 @@ sudo cargo test -p containerd-shim-cloudhv --test integration -- --nocapture --t
 
 See the **[docs/](docs/)** folder for detailed documentation:
 
-- **[Architecture](docs/architecture.md)** — system design, networking, container rootfs, block-device-only architecture
-- **[Configuration](docs/configuration.md)** — runtime config reference and pod annotation overrides
-- **[Performance](docs/performance.md)** — benchmarks, cold boot, resource overhead
+- **[Architecture](docs/architecture.md)** — system design, rootfs caching, inline metadata, networking
+- **[Configuration](docs/configuration.md)** — runtime config reference, cache management, pod annotations
+- **[Performance](docs/performance.md)** — benchmarks, cache hit/miss latencies, resource overhead
 - **[Development](docs/development.md)** — building, testing, contributing, code quality standards
 
 ## Examples

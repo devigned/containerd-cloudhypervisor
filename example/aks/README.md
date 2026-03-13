@@ -135,7 +135,7 @@ curl http://$EXTERNAL_IP/
 
 ### Scale Up
 
-Each new replica boots a fresh microVM in ~300ms:
+Each new replica boots a fresh microVM in ~300-400ms (faster with rootfs caching):
 
 ```bash
 # Scale to 5 replicas (5 VMs across 3 nodes)
