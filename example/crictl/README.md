@@ -109,7 +109,7 @@ cd guest/kernel && bash build-kernel.sh && cd ../..
 cd guest/rootfs && sudo bash build-rootfs.sh ../../target/x86_64-unknown-linux-musl/release/cloudhv-agent && cd ../..
 
 # Install guest artifacts
-sudo mkdir -p /opt/cloudhv
+sudo mkdir -p /opt/cloudhv /opt/cloudhv/cache
 sudo cp guest/kernel/vmlinux /opt/cloudhv/vmlinux
 sudo cp guest/rootfs/rootfs.ext4 /opt/cloudhv/rootfs.ext4
 ```
@@ -211,10 +211,10 @@ echo "Container started: $CTR_ID"
 ```
 
 Behind the scenes:
-1. The shim creates an ext4 disk image from the container's rootfs
+1. The shim clones a cached rootfs ext4 image (or creates the cache on first use)
 2. Hot-plugs it into the running VM via Cloud Hypervisor's `vm.add-disk` API
-3. The guest agent discovers the new `/dev/vdX` device and mounts it
-4. `crun` runs the container with mount + PID namespace isolation
+3. Sends config.json + volume data inline via the CreateContainer RPC
+4. The guest agent mounts the disk, writes metadata, and runs `crun`
 
 ### Verify it works
 
@@ -299,10 +299,11 @@ crictl runp sandbox.json
     → shim reports sandbox ready to containerd
 
 crictl create $POD container.json sandbox.json
-  → shim creates ext4 disk image from container rootfs
+  → shim clones cached rootfs image (or creates cache on first use)
   → shim calls vm.add-disk to hot-plug into the VM
-  → agent discovers /dev/vdX, mounts it
-  → agent runs crun with the OCI spec
+  → shim sends config.json + volume data inline via CreateContainer RPC
+  → agent discovers /dev/vdX, mounts it, writes metadata
+  → agent runs crun with the adapted OCI spec
   → shim forwards container stdout/stderr to containerd
 
 crictl stopp $POD
