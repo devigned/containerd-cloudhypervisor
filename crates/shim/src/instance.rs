@@ -364,25 +364,59 @@ impl CloudHvInstance {
         let cached_img = cache_dir.join(format!("{cache_key}.img"));
         let rootfs_disk_path = parent_dir.join(format!("{disk_id}.img"));
 
-        // Ensure rootfs base image is cached (one-time cost per container image)
+        // Ensure rootfs base image is cached (one-time cost per container image).
+        // Multiple shim processes may race here — use a lock file to serialize
+        // cache creation for the same hash.
         if !cached_img.exists() {
             info!("rootfs cache miss for {cache_key}, creating base image");
             let rootfs_for_cache = rootfs_path.clone();
             let cached_img_clone = cached_img.clone();
-            tokio::task::spawn_blocking(move || {
-                // Write to a temp file and atomic-rename to avoid races
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                // Ensure cache directory exists before creating lock file
+                if let Some(parent) = cached_img_clone.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+
+                let lock_path = cached_img_clone.with_extension("lock");
+                let lock_file = std::fs::File::create(&lock_path)
+                    .map_err(|e| anyhow::anyhow!("create cache lock: {e}"))?;
+
+                // Exclusive flock — blocks until we own the lock
+                let fd = std::os::unix::io::AsRawFd::as_raw_fd(&lock_file);
+                let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
+                if ret != 0 {
+                    return Err(anyhow::anyhow!(
+                        "flock cache lock: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+
+                // Re-check after acquiring lock (another process may have created it)
+                if cached_img_clone.exists() {
+                    log::info!(
+                        "cache populated by another process: {}",
+                        cached_img_clone.display()
+                    );
+                    return Ok(());
+                }
+
+                // Write to a temp file then atomic-rename
                 let tmp_path = cached_img_clone.with_extension("img.tmp");
                 create_cached_rootfs_image(&rootfs_for_cache, &tmp_path)?;
-                // Atomic rename — if another process already wrote it, that's fine
-                if let Err(e) = std::fs::rename(&tmp_path, &cached_img_clone) {
-                    // Another process won the race — clean up our temp file
+
+                // fsync the temp file to ensure it's fully flushed to disk
+                let f = std::fs::File::open(&tmp_path)?;
+                f.sync_all()?;
+                drop(f);
+
+                std::fs::rename(&tmp_path, &cached_img_clone).map_err(|e| {
                     std::fs::remove_file(&tmp_path).ok();
-                    if !cached_img_clone.exists() {
-                        return Err(anyhow::anyhow!(
-                            "cache rename failed and no cache exists: {e}"
-                        ));
-                    }
-                }
+                    anyhow::anyhow!("cache rename failed: {e}")
+                })?;
+
+                // Flush lock file (drop releases the flock)
+                drop(lock_file);
+                std::fs::remove_file(&lock_path).ok();
                 Ok(())
             })
             .await
@@ -932,6 +966,22 @@ fn dir_size(path: &std::path::Path) -> anyhow::Result<u64> {
     Ok(total)
 }
 
+/// Count total entries (files + directories + symlinks) in a directory tree.
+/// Used to estimate inode requirements for ext4 image sizing.
+fn dir_entry_count(path: &std::path::Path) -> anyhow::Result<u64> {
+    let mut count = 0u64;
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            count += 1;
+            if entry.path().is_dir() {
+                count += dir_entry_count(&entry.path())?;
+            }
+        }
+    }
+    Ok(count)
+}
+
 // ---------------------------------------------------------------------------
 // Rootfs image cache — cached rootfs + inline metadata
 // ---------------------------------------------------------------------------
@@ -999,7 +1049,13 @@ fn create_cached_rootfs_image(
     }
 
     let total_size = dir_size(rootfs_path)?;
-    let image_size_mb = std::cmp::max(64, total_size * 3 / 2 / 1024 / 1024 + 16);
+    let inode_count = dir_entry_count(rootfs_path)?;
+    // Size: fit rootfs with 50% headroom. ext4 needs ~1 inode per entry plus
+    // overhead. Minimum 16MB to ensure enough inodes for many-file images.
+    // At default 1 inode per 16KiB, a 16MB image provides ~1024 inodes.
+    let size_for_bytes = total_size * 3 / 2 / 1024 / 1024 + 4;
+    let size_for_inodes = (inode_count * 16 / 1024).max(1); // 16KiB per inode
+    let image_size_mb = std::cmp::max(16, std::cmp::max(size_for_bytes, size_for_inodes));
 
     let f = std::fs::File::create(cache_path)
         .with_context(|| format!("create cached image: {}", cache_path.display()))?;
