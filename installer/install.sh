@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
+# NOTE: intentionally NOT using set -e — devmapper setup has fallback paths
 
 # This script runs inside the DaemonSet installer pod with the host
 # filesystem mounted at /host. It copies the shim artifacts onto the
@@ -151,7 +152,8 @@ if [ "$POOL_READY" = "false" ]; then
     META_DEV=$(nsenter --target 1 --mount -- losetup --find --show "$HOST_META" 2>/dev/null || true)
 
     if [ -n "$DATA_DEV" ] && [ -n "$META_DEV" ]; then
-      DATA_SIZE=$(nsenter --target 1 --mount -- blockdev --getsize64 "$DATA_DEV")
+      DATA_SIZE=$(nsenter --target 1 --mount -- blockdev --getsize64 "$DATA_DEV" 2>/dev/null || echo 0)
+      if [ "$DATA_SIZE" -gt 0 ]; then
       LENGTH=$(( DATA_SIZE / 512 ))
       if nsenter --target 1 --mount -- dmsetup create "$POOL_NAME" \
         --table "0 $LENGTH thin-pool $META_DEV $DATA_DEV 128 32768"; then
