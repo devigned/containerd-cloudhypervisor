@@ -4,7 +4,7 @@
 
 | Document | Description |
 |----------|-------------|
-| [Architecture](architecture.md) | System design, rootfs caching, inline metadata delivery, networking, logging |
+| [Architecture](architecture.md) | System design, rootfs delivery (devmapper passthrough + ext4 cache), inline metadata, networking, logging |
 | [Configuration](configuration.md) | Runtime config reference, cache management, pod annotations |
 | [Performance](performance.md) | Benchmarks, cache hit/miss latencies, resource overhead |
 | [Development](development.md) | Building, testing, contributing, code quality standards |

@@ -126,9 +126,7 @@ impl ContainerManager {
         info!("discovered new disk: {}", new_disk);
 
         // Mount the disk — retry as the device may not be immediately ready.
-        // Use noatime (skip access time updates) and nobarrier (skip journal
-        // barriers) since these are ephemeral container disks — we don't need
-        // crash consistency guarantees for data that is recreated on every start.
+        // ext4 with noatime + nobarrier (ephemeral container disks don't need crash consistency).
         #[cfg(target_os = "linux")]
         {
             use nix::mount::{mount, MsFlags};
@@ -140,7 +138,9 @@ impl ContainerManager {
                     MsFlags::MS_NOATIME,
                     Some("nobarrier"),
                 ) {
-                    Ok(()) => return Ok(new_disk),
+                    Ok(()) => {
+                        return Ok(new_disk);
+                    }
                     Err(e) if attempt < 20 => {
                         debug!("mount attempt {attempt} failed: {e}");
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -307,15 +307,52 @@ impl ContainerManager {
         let mount_point = PathBuf::from("/run/containers").join(container_id);
         std::fs::create_dir_all(&mount_point)?;
 
-        // Discover and mount the rootfs disk
+        // Mount the hot-plugged disk at a staging location, then bind-mount
+        // rootfs/ into the bundle. This keeps the bundle directory writable
+        // (for config.json + volume files).
+        let disk_mount = mount_point.join("_disk");
+        std::fs::create_dir_all(&disk_mount)?;
+
         let disk_path = self
-            .discover_and_mount_new_disk(&mount_point)
+            .discover_and_mount_new_disk(&disk_mount)
             .await
             .context("discover/mount rootfs disk")?;
+
+        // Determine rootfs location on the disk:
+        //   - Our cached images: rootfs/ exists at top level
+        //   - Devmapper snapshots: container FS is at root (flat layout)
+        let rootfs_on_disk = if disk_mount.join("rootfs").exists() {
+            disk_mount.join("rootfs")
+        } else {
+            disk_mount.clone()
+        };
+
+        // Bind-mount rootfs into the bundle
+        let rootfs_dir = mount_point.join("rootfs");
+        std::fs::create_dir_all(&rootfs_dir)?;
+        #[cfg(target_os = "linux")]
+        {
+            use nix::mount::{mount, MsFlags};
+            mount(
+                Some(rootfs_on_disk.as_path()),
+                rootfs_dir.as_path(),
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            )
+            .with_context(|| {
+                format!(
+                    "bind-mount rootfs {} -> {}",
+                    rootfs_on_disk.display(),
+                    rootfs_dir.display()
+                )
+            })?;
+        }
         info!(
-            "mounted rootfs disk {} at {}",
+            "mounted rootfs disk {} -> {} -> {}",
             disk_path,
-            mount_point.display()
+            rootfs_on_disk.display(),
+            rootfs_dir.display()
         );
 
         // Write config.json: prefer inline RPC data, fall back to disk content
@@ -323,6 +360,14 @@ impl ContainerManager {
             std::fs::write(mount_point.join("config.json"), config_json)
                 .context("write inline config.json")?;
             info!("wrote inline config.json ({} bytes)", config_json.len());
+        } else if disk_mount.join("config.json").exists() {
+            // Legacy path: config.json baked into the disk image
+            std::fs::copy(
+                disk_mount.join("config.json"),
+                mount_point.join("config.json"),
+            )
+            .context("copy config.json from disk")?;
+            info!("copied config.json from disk");
         } else if !mount_point.join("config.json").exists() {
             anyhow::bail!("no config.json: neither inline data nor on-disk file present");
         }
@@ -368,6 +413,16 @@ impl ContainerManager {
                 vol.inline_files.len(),
                 vol.destination
             );
+        }
+
+        // If volumes were baked into the disk (legacy path), make them
+        // accessible at the expected bundle path via symlink
+        let disk_volumes = disk_mount.join("volumes");
+        let bundle_volumes = mount_point.join("volumes");
+        if disk_volumes.exists() && !bundle_volumes.exists() {
+            std::os::unix::fs::symlink(&disk_volumes, &bundle_volumes)
+                .with_context(|| "symlink disk volumes to bundle")?;
+            info!("linked disk volumes to bundle");
         }
 
         let local_bundle = mount_point.clone();

@@ -5,10 +5,10 @@ that runs container workloads inside lightweight microVMs with maximum density a
 
 ## Highlights
 
-- **~350ms end-to-end container lifecycle** (cached rootfs; ~420ms on first unique image)
+- **~530ms end-to-end container lifecycle (single pod via crictl)**
 - **VM isolation** — each pod runs in its own Cloud Hypervisor microVM with dedicated kernel
-- **Rootfs image cache** — per-node cache eliminates mkfs.ext4 from the hot path (34× faster burst scaling)
-- **Block device rootfs** — container images delivered as hot-plugged virtio-blk disks (no FUSE)
+- **Rootfs delivery** — devmapper block passthrough (zero-copy) with ext4 cache fallback
+- **Block device rootfs** — container images delivered as hot-plugged virtio-blk disks; devmapper snapshots passed directly, overlayfs cached as ext4
 - **Dual hypervisor** — same binary runs on KVM (Linux) and MSHV (Azure/Hyper-V)
 - **Multi-container pods** — up to 5 containers per VM with mount + PID isolation
 - **Pod networking** — transparent CNI integration via TAP + TC redirect
@@ -25,7 +25,7 @@ migration, consider [Kata Containers](https://katacontainers.io/) instead.
 
 | | containerd-cloudhypervisor | Kata Containers |
 | --- | --- | --- |
-| **Cold start** | ~350ms (cached) / ~420ms (first image) | ~500ms–1s |
+| **Cold start** | ~530ms (crictl) | ~500ms–1s |
 | **Shim binary** | 2.4 MB | ~50 MB |
 | **Guest rootfs** | 16 MB (agent + crun) | ~150 MB |
 | **Language** | Rust | Go |

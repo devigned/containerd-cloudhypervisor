@@ -364,100 +364,118 @@ impl CloudHvInstance {
         let spec_path = self.bundle.join("config.json");
         let volumes = extract_volumes(&spec_path).ctx("extract volumes")?;
 
-        // Rootfs image cache: the rootfs ext4 image is expensive to create
-        // (mkfs.ext4 on full rootfs). We cache it per unique rootfs content
-        // and clone it for each container — zero mkfs.ext4 on the hot path.
-        // Config.json and volume data are sent inline via the RPC and the
-        // agent writes them to tmpfs inside the VM.
-        let cache_dir = std::path::PathBuf::from("/opt/cloudhv/cache");
-        let rootfs_clone = rootfs_path.clone();
+        // Check if rootfs is backed by a block device (devmapper snapshotter).
+        // With devmapper, containerd mounts a thin snapshot at the rootfs path.
+        // We can pass the backing block device directly to the VM — zero image creation.
+        let rootfs_block_dev = detect_block_backing(&rootfs_path);
 
-        let cache_key = tokio::task::spawn_blocking(move || compute_rootfs_hash(&rootfs_clone))
-            .await
-            .map_err(|_| Error::Any(anyhow::anyhow!("hash task panicked")))?
-            .ctx("compute rootfs hash")?;
+        let rootfs_disk_path = if let Some(block_dev) = &rootfs_block_dev {
+            // Tier 1: devmapper block passthrough — zero-copy, zero CPU
+            info!(
+                "rootfs backed by block device {}, using direct passthrough",
+                block_dev.display()
+            );
+            block_dev.clone()
+        } else {
+            // Tier 2: create ext4 cache image from overlayfs directory
+            let disk_path = parent_dir.join(format!("{disk_id}.img"));
 
-        let cached_img = cache_dir.join(format!("{cache_key}.img"));
-        let rootfs_disk_path = parent_dir.join(format!("{disk_id}.img"));
+            // Rootfs image cache: cache per unique rootfs content, clone for each container.
+            // Config.json and volume data are sent inline via the RPC and the
+            // agent writes them to tmpfs inside the VM.
+            let cache_dir = std::path::PathBuf::from("/opt/cloudhv/cache");
+            let rootfs_clone = rootfs_path.clone();
 
-        // Ensure rootfs base image is cached (one-time cost per container image).
-        // Multiple shim processes may race here — use a lock file to serialize
-        // cache creation for the same hash.
-        if !cached_img.exists() {
-            info!("rootfs cache miss for {cache_key}, creating base image");
-            let rootfs_for_cache = rootfs_path.clone();
-            let cached_img_clone = cached_img.clone();
+            let cache_key = tokio::task::spawn_blocking(move || compute_rootfs_hash(&rootfs_clone))
+                .await
+                .map_err(|_| Error::Any(anyhow::anyhow!("hash task panicked")))?
+                .ctx("compute rootfs hash")?;
+
+            let cached_img = cache_dir.join(format!("{cache_key}.img"));
+            let rootfs_disk_path = parent_dir.join(format!("{disk_id}.img"));
+
+            // Ensure rootfs base image is cached (one-time cost per container image).
+            // Multiple shim processes may race here — use a lock file to serialize
+            // cache creation for the same hash.
+            if !cached_img.exists() {
+                info!("rootfs cache miss for {cache_key}, creating base image");
+                let rootfs_for_cache = rootfs_path.clone();
+                let cached_img_clone = cached_img.clone();
+                tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    // Ensure cache directory exists before creating lock file
+                    if let Some(parent) = cached_img_clone.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+
+                    let lock_path = cached_img_clone.with_extension("lock");
+                    let lock_file = std::fs::File::create(&lock_path)
+                        .map_err(|e| anyhow::anyhow!("create cache lock: {e}"))?;
+
+                    // Exclusive flock — blocks until we own the lock
+                    let fd = std::os::unix::io::AsRawFd::as_raw_fd(&lock_file);
+                    let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
+                    if ret != 0 {
+                        return Err(anyhow::anyhow!(
+                            "flock cache lock: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+
+                    // Re-check after acquiring lock (another process may have created it)
+                    if cached_img_clone.exists() {
+                        log::info!(
+                            "cache populated by another process: {}",
+                            cached_img_clone.display()
+                        );
+                        return Ok(());
+                    }
+
+                    // Write to a temp file then atomic-rename
+                    let tmp_path = cached_img_clone.with_extension("img.tmp");
+                    create_cached_rootfs_image(&rootfs_for_cache, &tmp_path)?;
+
+                    // fsync the temp file to ensure it's fully flushed to disk
+                    let f = std::fs::File::open(&tmp_path)?;
+                    f.sync_all()?;
+                    drop(f);
+
+                    std::fs::rename(&tmp_path, &cached_img_clone).map_err(|e| {
+                        std::fs::remove_file(&tmp_path).ok();
+                        anyhow::anyhow!("cache rename failed: {e}")
+                    })?;
+
+                    // Flush lock file (drop releases the flock)
+                    drop(lock_file);
+                    std::fs::remove_file(&lock_path).ok();
+                    Ok(())
+                })
+                .await
+                .map_err(|_| Error::Any(anyhow::anyhow!("cache build task panicked")))?
+                .ctx("build rootfs cache")?;
+            } else {
+                info!("rootfs cache hit for {cache_key}");
+            }
+
+            // Clone cached rootfs image (fast cp)
+            let cached_src = cached_img.clone();
+            let rootfs_dst = rootfs_disk_path.clone();
             tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                // Ensure cache directory exists before creating lock file
-                if let Some(parent) = cached_img_clone.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-
-                let lock_path = cached_img_clone.with_extension("lock");
-                let lock_file = std::fs::File::create(&lock_path)
-                    .map_err(|e| anyhow::anyhow!("create cache lock: {e}"))?;
-
-                // Exclusive flock — blocks until we own the lock
-                let fd = std::os::unix::io::AsRawFd::as_raw_fd(&lock_file);
-                let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
-                if ret != 0 {
-                    return Err(anyhow::anyhow!(
-                        "flock cache lock: {}",
-                        std::io::Error::last_os_error()
-                    ));
-                }
-
-                // Re-check after acquiring lock (another process may have created it)
-                if cached_img_clone.exists() {
-                    log::info!(
-                        "cache populated by another process: {}",
-                        cached_img_clone.display()
-                    );
-                    return Ok(());
-                }
-
-                // Write to a temp file then atomic-rename
-                let tmp_path = cached_img_clone.with_extension("img.tmp");
-                create_cached_rootfs_image(&rootfs_for_cache, &tmp_path)?;
-
-                // fsync the temp file to ensure it's fully flushed to disk
-                let f = std::fs::File::open(&tmp_path)?;
-                f.sync_all()?;
-                drop(f);
-
-                std::fs::rename(&tmp_path, &cached_img_clone).map_err(|e| {
-                    std::fs::remove_file(&tmp_path).ok();
-                    anyhow::anyhow!("cache rename failed: {e}")
-                })?;
-
-                // Flush lock file (drop releases the flock)
-                drop(lock_file);
-                std::fs::remove_file(&lock_path).ok();
+                std::fs::copy(&cached_src, &rootfs_dst)?;
                 Ok(())
             })
             .await
-            .map_err(|_| Error::Any(anyhow::anyhow!("cache build task panicked")))?
-            .ctx("build rootfs cache")?;
-        } else {
-            info!("rootfs cache hit for {cache_key}");
-        }
+            .map_err(|_| Error::Any(anyhow::anyhow!("rootfs copy panicked")))?
+            .ctx("copy cached rootfs")?;
 
-        // Clone cached rootfs image (fast cp, no mkfs.ext4)
-        let cached_src = cached_img.clone();
-        let rootfs_dst = rootfs_disk_path.clone();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            std::fs::copy(&cached_src, &rootfs_dst)?;
-            Ok(())
-        })
-        .await
-        .map_err(|_| Error::Any(anyhow::anyhow!("rootfs copy panicked")))?
-        .ctx("copy cached rootfs")?;
+            disk_path
+        }; // end of block device vs image creation branch
 
         // Hot-plug the rootfs disk into the VM
+        let readonly = false; // devmapper snapshots are COW
         let api_socket = vm_state.api_socket.clone();
         let disk_json = serde_json::json!({
             "path": rootfs_disk_path.to_string_lossy(),
-            "readonly": false,
+            "readonly": readonly,
             "id": &disk_id,
         });
         VmManager::api_request_to_socket(
@@ -773,6 +791,52 @@ fn to_systemd_cgroup_path(cgroups_path: &str) -> String {
         }
     }
     result
+}
+
+/// Detect if a directory is backed by a block device (e.g., devmapper snapshot).
+///
+/// Uses `findmnt` to check the mount source. If the source is a block device
+/// (or a symlink to one, like `/dev/mapper/containerd-pool-snap-N`), returns
+/// the resolved path. Returns None for overlayfs or other non-block mounts.
+fn detect_block_backing(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let output = std::process::Command::new("findmnt")
+        .args(["-n", "-o", "SOURCE"])
+        .arg(path)
+        .output()
+        .ok()?;
+
+    let source = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if source.is_empty() || source == "overlay" || source == "tmpfs" {
+        return None;
+    }
+
+    let source_path = std::path::PathBuf::from(&source);
+    // Resolve symlinks (e.g., /dev/mapper/containerd-pool-snap-N → /dev/dm-1)
+    let resolved = std::fs::canonicalize(&source_path).unwrap_or(source_path.clone());
+
+    // Verify it's actually a block device
+    if resolved
+        .metadata()
+        .map(|m| {
+            use std::os::unix::fs::FileTypeExt;
+            m.file_type().is_block_device()
+        })
+        .unwrap_or(false)
+    {
+        // Only pass through devmapper devices — other block-backed snapshotters
+        // (btrfs, zfs) report their backing device which is the host filesystem,
+        // not a per-container snapshot.
+        let source_str = source_path.to_string_lossy();
+        if !source_str.starts_with("/dev/mapper/") && !source_str.starts_with("/dev/dm-") {
+            return None;
+        }
+
+        // Return the original path (symlink), not the resolved one,
+        // because CH needs a stable path
+        Some(source_path)
+    } else {
+        None
+    }
 }
 
 /// Parsed sandbox configuration from the OCI spec.
@@ -1172,7 +1236,10 @@ fn compute_rootfs_hash(rootfs: &std::path::Path) -> anyhow::Result<String> {
 ///
 /// The resulting image contains only `rootfs/` — no config.json or volumes.
 /// It is stored at `/opt/cloudhv/cache/<hash>.img` and cloned (cp) for each
-/// container, eliminating mkfs.ext4 from the hot path.
+/// container, eliminating filesystem creation from the hot path.
+///
+/// Uses ext4 with journal disabled (`-O ^has_journal`) for minimal overhead
+/// on ephemeral container disks.
 fn create_cached_rootfs_image(
     rootfs_path: &std::path::Path,
     cache_path: &std::path::Path,
@@ -1183,20 +1250,6 @@ fn create_cached_rootfs_image(
     if let Some(parent) = cache_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-
-    let total_size = dir_size(rootfs_path)?;
-    let inode_count = dir_entry_count(rootfs_path)?;
-    // Size: fit rootfs with 50% headroom. ext4 needs ~1 inode per entry plus
-    // overhead. Minimum 16MB to ensure enough inodes for many-file images.
-    // At default 1 inode per 16KiB, a 16MB image provides ~1024 inodes.
-    let size_for_bytes = total_size * 3 / 2 / 1024 / 1024 + 4;
-    let size_for_inodes = (inode_count * 16 / 1024).max(1); // 16KiB per inode
-    let image_size_mb = std::cmp::max(16, std::cmp::max(size_for_bytes, size_for_inodes));
-
-    let f = std::fs::File::create(cache_path)
-        .with_context(|| format!("create cached image: {}", cache_path.display()))?;
-    f.set_len(image_size_mb * 1024 * 1024)?;
-    drop(f);
 
     let staging = cache_path.with_extension("staging");
     std::fs::create_dir_all(staging.join("rootfs"))?;
@@ -1212,28 +1265,35 @@ fn create_cached_rootfs_image(
         anyhow::bail!("cp rootfs to cache staging failed: {status}");
     }
 
-    // Create ext4 without journal — these are ephemeral container disks that
-    // don't need crash consistency. Saves ~4MB per image and eliminates
-    // journal write overhead on every file operation inside the guest.
+    let total_size = dir_size(rootfs_path)?;
+    let inode_count = dir_entry_count(rootfs_path)?;
+    let size_for_bytes = total_size * 3 / 2 / 1024 / 1024 + 4;
+    let size_for_inodes = (inode_count * 16 / 1024).max(1);
+    let image_size_mb = std::cmp::max(16, std::cmp::max(size_for_bytes, size_for_inodes));
+
+    let f = std::fs::File::create(cache_path)
+        .with_context(|| format!("create cached image: {}", cache_path.display()))?;
+    f.set_len(image_size_mb * 1024 * 1024)?;
+    drop(f);
+
     let status = Command::new("mkfs.ext4")
         .args(["-q", "-F", "-O", "^has_journal", "-d"])
         .arg(&staging)
         .arg(cache_path)
         .status()
         .context("mkfs.ext4 -d for cache")?;
-
-    std::fs::remove_dir_all(&staging).ok();
-
     if !status.success() {
+        std::fs::remove_dir_all(&staging).ok();
         std::fs::remove_file(cache_path).ok();
         anyhow::bail!("mkfs.ext4 -d for rootfs cache failed: {status}");
     }
 
-    log::info!(
-        "rootfs cached: {} ({}MB)",
-        cache_path.display(),
-        image_size_mb
-    );
+    std::fs::remove_dir_all(&staging).ok();
+
+    let size = std::fs::metadata(cache_path)
+        .map(|m| m.len() / 1024)
+        .unwrap_or(0);
+    log::info!("rootfs cached: {} ({}KB, ext4)", cache_path.display(), size);
     Ok(())
 }
 

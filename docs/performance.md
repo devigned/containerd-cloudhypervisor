@@ -10,7 +10,7 @@ Full VM lifecycle from scratch — kernel boots, agent starts, container runs.
 | Phase | Cache Hit | Cache Miss (first image) |
 |-------|-----------|--------------------------|
 | Sandbox (VM boot) | **~97ms** | **~97ms** |
-| Container create (rootfs cp + inline RPC) | **~8ms** | **~64ms** |
+| Container create (devmapper passthrough or cache cp + inline RPC) | **~8ms** | **~64ms** |
 | Container start (agent RPC) | **~160ms** | **~160ms** |
 | Exit detection | **~100ms** | **~100ms** |
 | **Total e2e** | **~365ms** | **~420ms** |
@@ -18,7 +18,11 @@ Full VM lifecycle from scratch — kernel boots, agent starts, container runs.
 Cache miss occurs only on the first container per unique container image on
 each node. All subsequent containers using the same image get a cache hit.
 
-## Rootfs Image Cache
+> **Note:** With devmapper snapshotter, container create is near-zero since
+> the thin snapshot is passed directly — no image creation or copying needed.
+> The cache hit/miss distinction applies only to the overlayfs fallback path.
+
+## Rootfs Delivery Performance
 
 The shim caches rootfs ext4 images at `/opt/cloudhv/cache/<hash>.img`,
 eliminating `mkfs.ext4` from the container startup hot path.

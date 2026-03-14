@@ -497,15 +497,11 @@ fn test_container_logs_captured() {
     let fixtures = TestFixtures::resolve().expect("failed to resolve test fixtures");
     skip_if_missing!(fixtures);
 
-    // We need /bin/busybox or /bin/sh on the host to copy into the rootfs
-    let shell_src = if std::path::Path::new("/bin/busybox").exists() {
-        std::path::PathBuf::from("/bin/busybox")
-    } else if std::path::Path::new("/bin/sh").exists() {
-        std::path::PathBuf::from("/bin/sh")
-    } else {
-        eprintln!("SKIPPING TEST: neither /bin/busybox nor /bin/sh found");
+    let shell_src = std::path::PathBuf::from("/bin/busybox");
+    if !shell_src.exists() {
+        eprintln!("SKIPPING: /bin/busybox not found (required for static shell)");
         return;
-    };
+    }
 
     for tool in ["mkfs.ext4", "mount", "umount"] {
         if std::process::Command::new("which")
@@ -1763,15 +1759,11 @@ fn test_volume_mounts() {
     let fixtures = TestFixtures::resolve().expect("failed to resolve test fixtures");
     skip_if_missing!(fixtures);
 
-    // Need busybox/sh to build a container that reads volume data
-    let shell_src = if std::path::Path::new("/bin/busybox").exists() {
-        std::path::PathBuf::from("/bin/busybox")
-    } else if std::path::Path::new("/bin/sh").exists() {
-        std::path::PathBuf::from("/bin/sh")
-    } else {
-        eprintln!("SKIPPING: neither /bin/busybox nor /bin/sh found");
+    let shell_src = std::path::PathBuf::from("/bin/busybox");
+    if !shell_src.exists() {
+        eprintln!("SKIPPING: /bin/busybox not found (required for static shell)");
         return;
-    };
+    }
 
     for tool in ["mkfs.ext4", "cp"] {
         if !run_cmd_status("which", &[tool]) {
@@ -2027,14 +2019,11 @@ fn test_inline_metadata_delivery() {
     let fixtures = TestFixtures::resolve().expect("failed to resolve test fixtures");
     skip_if_missing!(fixtures);
 
-    let shell_src = if std::path::Path::new("/bin/busybox").exists() {
-        std::path::PathBuf::from("/bin/busybox")
-    } else if std::path::Path::new("/bin/sh").exists() {
-        std::path::PathBuf::from("/bin/sh")
-    } else {
-        eprintln!("SKIPPING: neither /bin/busybox nor /bin/sh found");
+    let shell_src = std::path::PathBuf::from("/bin/busybox");
+    if !shell_src.exists() {
+        eprintln!("SKIPPING: /bin/busybox not found (required for static shell)");
         return;
-    };
+    }
 
     for tool in ["mkfs.ext4", "cp"] {
         if !run_cmd_status("which", &[tool]) {
@@ -2223,6 +2212,176 @@ fn test_inline_metadata_delivery() {
         vm.cleanup().await.expect("cleanup");
         let _ = std::fs::remove_file(&disk_path);
         let _ = std::fs::remove_dir_all(&bundle_dir);
+
+        eprintln!("╚══════════════════════════════════════════════════════════╝\n");
+    });
+}
+
+/// Test flat disk layout (simulating devmapper passthrough).
+///
+/// Creates an ext4 image with the container filesystem at the ROOT (no rootfs/
+/// subdirectory), simulating what a devmapper snapshot looks like. The agent
+/// should detect the flat layout and remount at rootfs/.
+#[test]
+fn test_flat_disk_layout() {
+    let fixtures = TestFixtures::resolve().expect("failed to resolve test fixtures");
+    skip_if_missing!(fixtures);
+
+    let shell_src = std::path::PathBuf::from("/bin/busybox");
+    if !shell_src.exists() {
+        eprintln!("SKIPPING: /bin/busybox not found (required for static shell)");
+        return;
+    }
+
+    for tool in ["mkfs.ext4", "cp"] {
+        if !run_cmd_status("which", &[tool]) {
+            eprintln!("SKIPPING: {tool} not found");
+            return;
+        }
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let config = fixtures.runtime_config();
+        let vm_id = format!("flat-test-{}", std::process::id());
+        let container_id = format!("flat-ctr-{}", std::process::id());
+
+        eprintln!("\n╔══════════════════════════════════════════════════════════╗");
+        eprintln!("║  Flat Disk Layout (devmapper sim) — Integration Test    ║");
+        eprintln!("╠══════════════════════════════════════════════════════════╣");
+
+        // ── Boot VM
+        eprintln!("  Phase 1 │ Booting VM");
+        let mut vm =
+            containerd_shim_cloudhv::vm::VmManager::new(vm_id.clone(), config).expect("VmManager");
+        vm.prepare().await.expect("prepare");
+        vm.spawn_vmm_in_netns(None).expect("vmm spawn failed");
+        vm.wait_vmm_ready().await.expect("vmm ready failed");
+        vm.create_and_boot_vm(None, None).await.expect("boot");
+        tokio::time::timeout(Duration::from_secs(30), vm.wait_for_agent())
+            .await
+            .expect("agent timeout")
+            .expect("agent");
+
+        // ── Create FLAT ext4 disk (container fs at root, no rootfs/ wrapper)
+        eprintln!("  Phase 2 │ Creating flat ext4 disk (no rootfs/ subdirectory)");
+        let rootfs_dir = vm.state_dir().join("flat-rootfs");
+        let bin_dir = rootfs_dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("mkdir bin");
+        std::fs::copy(&shell_src, bin_dir.join("sh")).expect("cp shell");
+        std::process::Command::new("chmod")
+            .args(["755", &bin_dir.join("sh").to_string_lossy()])
+            .status()
+            .expect("chmod");
+        if shell_src.to_string_lossy().contains("busybox") {
+            for applet in &["cat", "echo"] {
+                let _ = std::os::unix::fs::symlink("sh", bin_dir.join(applet));
+            }
+        }
+
+        // Create ext4 with files at ROOT (flat, like devmapper)
+        let disk_path = vm.state_dir().join(format!("{container_id}-flat.img"));
+        let f = std::fs::File::create(&disk_path).expect("create disk");
+        f.set_len(32 * 1024 * 1024).expect("set_len");
+        drop(f);
+        assert!(run_cmd_status(
+            "mkfs.ext4",
+            &[
+                "-q",
+                "-F",
+                "-O",
+                "^has_journal",
+                "-d",
+                &rootfs_dir.to_string_lossy(),
+                &disk_path.to_string_lossy()
+            ]
+        ));
+        eprintln!("           │ Flat disk created (files at root, no rootfs/ subdir)");
+
+        // ── Hot-plug + inline RPC
+        eprintln!("  Phase 3 │ Hot-plugging flat disk");
+        let disk_id = format!("ctr-{}", &container_id[..12.min(container_id.len())]);
+        vm.add_disk(&disk_path.to_string_lossy(), &disk_id, false)
+            .await
+            .expect("add_disk");
+
+        let vsock = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
+        let (agent, _health) = vsock.connect_ttrpc().await.expect("ttrpc");
+
+        let config_json = serde_json::json!({
+            "ociVersion": "1.0.2",
+            "process": {
+                "terminal": false,
+                "user": { "uid": 0, "gid": 0 },
+                "args": ["sh", "-c", "echo FLAT_LAYOUT_WORKS"],
+                "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+                "cwd": "/"
+            },
+            "root": { "path": "rootfs", "readonly": false },
+            "linux": { "namespaces": [{"type": "pid"}, {"type": "mount"}] }
+        });
+
+        let bundle_guest = format!("/run/containers/{}", container_id);
+        let mut create_req = cloudhv_proto::CreateContainerRequest::new();
+        create_req.container_id = container_id.clone();
+        create_req.bundle_path = bundle_guest.clone();
+        create_req.config_json = serde_json::to_vec_pretty(&config_json).unwrap();
+
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(30));
+        agent
+            .create_container(ctx, &create_req)
+            .await
+            .expect("CreateContainer with flat disk");
+
+        let mut start_req = cloudhv_proto::StartContainerRequest::new();
+        start_req.container_id = container_id.clone();
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(30));
+        agent
+            .start_container(ctx, &start_req)
+            .await
+            .expect("StartContainer");
+
+        let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
+        wait_req.container_id = container_id.clone();
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(60));
+        let wait_resp = agent
+            .wait_container(ctx, &wait_req)
+            .await
+            .expect("WaitContainer");
+        assert_eq!(wait_resp.exit_status, 0, "container should exit 0");
+
+        // ── Verify
+        eprintln!("  Phase 4 │ Verifying flat layout remount worked");
+        let mut log_req = cloudhv_proto::GetContainerLogsRequest::new();
+        log_req.container_id = container_id.clone();
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(5));
+        let log_resp = agent
+            .get_container_logs(ctx, &log_req)
+            .await
+            .expect("GetContainerLogs");
+        let stdout = String::from_utf8_lossy(&log_resp.stdout);
+        assert!(
+            stdout.contains("FLAT_LAYOUT_WORKS"),
+            "stdout should contain FLAT_LAYOUT_WORKS, got: {stdout:?}"
+        );
+        eprintln!("           │ ✅ Flat layout remount worked — container output verified");
+
+        // ── Cleanup
+        eprintln!("  Phase 5 │ Cleaning up");
+        let mut del_req = cloudhv_proto::DeleteContainerRequest::new();
+        del_req.container_id = container_id.clone();
+        let ctx = ttrpc::context::with_duration(Duration::from_secs(10));
+        let _ = agent.delete_container(ctx, &del_req).await;
+
+        drop(agent);
+        drop(_health);
+        vm.cleanup().await.expect("cleanup");
+        let _ = std::fs::remove_file(&disk_path);
+        let _ = std::fs::remove_dir_all(&rootfs_dir);
 
         eprintln!("╚══════════════════════════════════════════════════════════╝\n");
     });

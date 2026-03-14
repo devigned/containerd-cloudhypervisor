@@ -176,3 +176,23 @@ Then restart containerd:
 ```bash
 sudo systemctl restart containerd
 ```
+
+## Devmapper Snapshotter (Optional)
+
+For zero-copy rootfs delivery, configure containerd to use the devmapper
+snapshotter for the cloudhv runtime:
+
+```toml
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.cloudhv]
+  runtime_type = "io.containerd.cloudhv.v1"
+  snapshotter = "devmapper"
+```
+
+This requires a thin-provisioning pool. See
+[containerd devmapper docs](https://github.com/containerd/containerd/blob/main/docs/snapshotters/devmapper.md)
+for setup instructions.
+
+When devmapper is configured, the shim passes the container's thin snapshot
+block device directly to the VM — no image creation, no caching overhead.
+When not configured (overlayfs default), the shim falls back to creating
+cached ext4 images.

@@ -67,33 +67,45 @@ else
   # Backup
   cp "$CONTAINERD_CONFIG" "${CONTAINERD_CONFIG}.bak.$(date +%s)"
 
-  # Remove any stale cloudhv config (BinaryName/ConfigPath cause cgroup errors)
-  if grep -q "containerd-shim-cloudhv-v1" "$CONTAINERD_CONFIG"; then
-    echo "[cloudhv] Removing stale runtime handler config"
-    python3 -c "
-lines = open('$CONTAINERD_CONFIG').readlines()
+  # Remove existing cloudhv runtime config and all nested subtables (idempotent)
+  # This handles both [plugins."...".runtimes.cloudhv] and [plugins.'...'.runtimes.cloudhv]
+  # and any sub-tables like [plugins."...".runtimes.cloudhv.options]
+  python3 -c "
+import re, sys
+with open('$HOST/etc/containerd/config.toml', 'r') as f:
+    lines = f.readlines()
 out = []
 skip = False
 for line in lines:
-    if 'runtimes.cloudhv' in line:
+    # Start skipping at any cloudhv runtime table or sub-table
+    if re.search(r'\[.*runtimes[.\"]cloudhv', line, re.IGNORECASE):
         skip = True
         continue
-    if skip and (line.strip().startswith('runtime_type') or line.strip().startswith('BinaryName') or line.strip().startswith('ConfigPath') or line.strip().startswith('[plugins') and 'cloudhv.options' in line or line.strip() == ''):
-        continue
-    skip = False
-    out.append(line)
-open('$CONTAINERD_CONFIG','w').writelines(out)
+    # Stop skipping at the next non-cloudhv table header
+    if skip and line.strip().startswith('[') and 'cloudhv' not in line.lower():
+        skip = False
+    if not skip:
+        out.append(line)
+with open('$HOST/etc/containerd/config.toml', 'w') as f:
+    f.writelines(out)
 " 2>/dev/null || true
+
+  # Add cloudhv runtime with optional devmapper snapshotter
+  DM_LINE=""
+  if dmsetup ls 2>/dev/null | grep -q "containerd"; then
+    DM_LINE='  snapshotter = "devmapper"'
   fi
 
-  # Add clean cloudhv runtime handler
-  cat >> "$CONTAINERD_CONFIG" << 'TOML'
-
-# Cloud Hypervisor VM-isolated runtime
-[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.cloudhv]
-  runtime_type = "io.containerd.cloudhv.v1"
-TOML
-    echo "[cloudhv] Runtime handler added to containerd config"
+  {
+    echo ""
+    echo "# Cloud Hypervisor VM-isolated runtime"
+    echo '[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.cloudhv]'
+    echo '  runtime_type = "io.containerd.cloudhv.v1"'
+    if [ -n "$DM_LINE" ]; then
+      echo "$DM_LINE"
+    fi
+  } >> "$CONTAINERD_CONFIG"
+  echo "[cloudhv] Runtime handler added to containerd config"
 fi
 
 if [ ! -f "$HOST/usr/local/bin/cloud-hypervisor" ]; then

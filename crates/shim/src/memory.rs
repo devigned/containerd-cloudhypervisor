@@ -1,3 +1,7 @@
+// NOTE: The memory monitor and virtio-mem hot-plug may be unnecessary for
+// minimal guest images where CH's lazy mmap (prefault=off) provides natural
+// memory efficiency. See issue #47 for simplification discussion.
+
 //! Memory monitor for dynamic VM memory growth and reclaim.
 //!
 //! Polls guest `/proc/meminfo` via the agent's `GetMemInfo` RPC and

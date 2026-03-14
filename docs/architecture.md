@@ -59,33 +59,30 @@ sandbox creation and application containers:
   hot-plugs it into the running VM, and sends config.json + volume data inline via the
   CreateContainer RPC. The guest agent writes metadata to tmpfs and runs the container with crun.
 
-## Container Rootfs via Block Devices (Cached + Inline Metadata)
+## Container Rootfs Delivery
 
-Following the same approach as [firecracker-containerd](https://github.com/firecracker-microvm/firecracker-containerd),
-with a rootfs image cache and inline metadata delivery:
+The shim supports two rootfs delivery tiers, automatically selecting the best path:
 
-### Cache Miss (first container per image)
+### Tier 1: Block Device Passthrough (devmapper snapshotter)
 
-1. Host shim mounts the container rootfs from containerd's overlayfs snapshot
-2. Computes content hash of the rootfs (FNV-1a over sorted file metadata)
-3. Creates ext4 disk image containing the rootfs via `mkfs.ext4 -d`
-4. Saves to `/opt/cloudhv/cache/<hash>.img` (persists across pods)
-5. Hot-plugs the rootfs disk into the VM via `vm.add-disk`
-6. Sends config.json + volume file contents inline in the CreateContainer RPC
-7. Guest agent mounts the rootfs disk, writes metadata to tmpfs, runs container
+When containerd uses the devmapper snapshotter, the container rootfs is already
+a thin-provisioned block device. The shim detects this via `findmnt` and passes
+the device path directly to Cloud Hypervisor's `vm.add-disk` API — zero image
+creation, zero copying, zero host CPU for rootfs delivery.
 
-### Cache Hit (subsequent containers of same image)
+The guest agent detects the flat disk layout (no `rootfs/` subdirectory),
+remounts at the correct path, and runs the container.
 
-1. Host shim computes the same content hash → finds cached image
-2. `cp` the cached image to a per-container path (~50ms, no mkfs.ext4)
-3. Hot-plugs the single rootfs disk
-4. Sends config.json + volumes inline via RPC → agent writes to tmpfs
+### Tier 2: Cached Image (overlayfs snapshotter)
 
-The cache eliminates `mkfs.ext4` from the hot path for all but the very first container
-using each image. Metadata (config.json + ConfigMap/Secret files) is delivered inline
-via the existing vsock RPC — no second disk, no mkfs.ext4 for metadata. Under burst
-load (50 concurrent containers), this reduces disk creation time from 22.5s to 0.65s —
-**34× faster with zero failures**.
+When the snapshotter produces a directory mount, the shim creates an ext4
+image (journal-free, cached) per unique container image at
+`/opt/cloudhv/cache/<hash>.img`. Subsequent containers clone the cached
+image via `cp`.
+
+In both tiers, config.json and volume data (ConfigMaps, Secrets) are delivered
+inline via the CreateContainer RPC — the agent writes them to the bundle
+directory. No second disk, no virtiofsd.
 
 ## Volumes (CSI, ConfigMap, Secret, emptyDir)
 
@@ -94,9 +91,9 @@ All Kubernetes volume types are transported into the VM using block devices:
 | Volume Type | Transport | Guest Access | Writes Persist |
 |-------------|-----------|-------------|----------------|
 | Block PVC (raw) | `vm.add-disk` hot-plug | `/dev/vdX` direct I/O | Yes |
-| Filesystem PVC | Inline via RPC (tmpfs) | bind mount | No (read-only) |
-| ConfigMap | Inline via RPC (tmpfs) | bind mount | No (read-only) |
-| Secret | Inline via RPC (tmpfs) | bind mount | No (read-only) |
+| Filesystem PVC | Inline via RPC | bind mount | No (read-only) |
+| ConfigMap | Inline via RPC | bind mount | No (read-only) |
+| Secret | Inline via RPC | bind mount | No (read-only) |
 | emptyDir | Separate hot-plugged disk | bind mount | Yes (pod lifetime) |
 
 ### How It Works
@@ -106,20 +103,20 @@ All Kubernetes volume types are transported into the VM using block devices:
 3. For each volume:
    - **Block devices**: hot-plugged into the VM via `vm.add-disk`, agent
      discovers and mounts the new `/dev/vdX` device
-   - **Filesystem volumes**: source data is copied into the metadata disk
-     image under `volumes/<hash>/` during metadata disk creation. The
-     agent bind-mounts them from the metadata disk at the expected paths.
+   - **Filesystem volumes**: file contents are read by the shim and sent
+     inline in the `CreateContainer` RPC. The agent writes them to the
+     bundle directory and bind-mounts them at the expected paths.
 4. Volume metadata is passed to the agent via the `CreateContainer` RPC
 5. The agent injects the volumes as mounts in the adapted OCI spec
 
-Read-only filesystem volumes (ConfigMaps, Secrets) are baked into the metadata
-disk alongside config.json — separate from the cached rootfs disk.
+Read-only filesystem volumes (ConfigMaps, Secrets) are delivered inline via
+the CreateContainer RPC — no separate disk, no virtiofsd.
 Block PVCs and emptyDir volumes use separate hot-plugged disks. No FUSE, no
 loopback mounts, no shared filesystem.
 
 > **Limitation:** Writable filesystem PVCs are not currently supported.
-> Writes to baked-in volumes do not persist back to the host. This requires
-> a shared filesystem transport which is planned for a future release.
+> Writes to inline-delivered volumes do not persist back to the host. This
+> requires a shared filesystem transport which is planned for a future release.
 
 ## Networking
 
