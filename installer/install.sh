@@ -154,14 +154,17 @@ if [ "$POOL_READY" = "false" ]; then
     if [ -n "$DATA_DEV" ] && [ -n "$META_DEV" ]; then
       DATA_SIZE=$(nsenter --target 1 --mount -- blockdev --getsize64 "$DATA_DEV" 2>/dev/null || echo 0)
       if [ "$DATA_SIZE" -gt 0 ]; then
-      LENGTH=$(( DATA_SIZE / 512 ))
-      if nsenter --target 1 --mount -- dmsetup create "$POOL_NAME" \
-        --table "0 $LENGTH thin-pool $META_DEV $DATA_DEV 128 32768"; then
-        POOL_READY=true
+        LENGTH=$(( DATA_SIZE / 512 ))
+        if nsenter --target 1 --mount -- dmsetup create "$POOL_NAME" \
+          --table "0 $LENGTH thin-pool $META_DEV $DATA_DEV 128 32768"; then
+          POOL_READY=true
+        else
+          echo "[cloudhv] WARNING: loopback thin-pool creation failed"
+          nsenter --target 1 --mount -- losetup -d "$DATA_DEV" 2>/dev/null || true
+          nsenter --target 1 --mount -- losetup -d "$META_DEV" 2>/dev/null || true
+        fi
       else
-        echo "[cloudhv] WARNING: loopback thin-pool creation failed"
-        nsenter --target 1 --mount -- losetup -d "$DATA_DEV" 2>/dev/null || true
-        nsenter --target 1 --mount -- losetup -d "$META_DEV" 2>/dev/null || true
+        echo "[cloudhv] WARNING: blockdev failed for $DATA_DEV"
       fi
     else
       echo "[cloudhv] WARNING: losetup failed (DATA_DEV='$DATA_DEV' META_DEV='$META_DEV')"
