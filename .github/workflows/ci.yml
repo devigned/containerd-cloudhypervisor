@@ -42,6 +42,9 @@ jobs:
           cargo clippy --workspace --lib -- -D warnings
           cd crates/agent && cargo clippy --all-targets -- -D warnings
 
+      - name: Test installer
+        run: bash installer/test-install.sh
+
   unit-test:
     name: Unit Tests
     runs-on: ubuntu-latest

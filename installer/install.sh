@@ -66,7 +66,7 @@ DM_DIR="$HOST/var/lib/containerd/devmapper"
 POOL_READY=false
 
 # Check if pool already exists
-if nsenter --target 1 --mount -- dmsetup info "$POOL_NAME" 2>/dev/null | grep -q "EXISTS"; then
+if nsenter --target 1 --mount -- dmsetup info "$POOL_NAME" 2>/dev/null | grep -q "ACTIVE"; then
   echo "[cloudhv] Thin pool $POOL_NAME already exists"
   POOL_READY=true
 fi
@@ -187,46 +187,26 @@ if [ ! -f "$CONTAINERD_CONFIG" ]; then
 else
   # Backup
   cp "$CONTAINERD_CONFIG" "${CONTAINERD_CONFIG}.bak.$(date +%s)"
+  ORIG_MODE=$(stat -c '%a' "$CONTAINERD_CONFIG" 2>/dev/null || echo "644")
 
-  # Remove existing cloudhv runtime config and all nested subtables (idempotent)
-  python3 -c "
-import re, sys
-with open('$CONTAINERD_CONFIG', 'r') as f:
-    lines = f.readlines()
-out = []
-skip = False
-for line in lines:
-    if re.search(r'\[.*runtimes[.\"]cloudhv', line, re.IGNORECASE):
-        skip = True
-        continue
-    if skip and line.strip().startswith('[') and 'cloudhv' not in line.lower():
-        skip = False
-    if not skip:
-        out.append(line)
-with open('$CONTAINERD_CONFIG', 'w') as f:
-    f.writelines(out)
-" 2>/dev/null || true
+  # Remove existing cloudhv runtime sections (idempotent)
+  # Uses awk to delete lines from [*runtimes.cloudhv*] to the next non-cloudhv section header
+  awk '
+    /^\[.*\.runtimes\.cloudhv/ { skip=1; next }
+    skip && /^\[/ && !/cloudhv/ { skip=0 }
+    !skip { print }
+  ' "$CONTAINERD_CONFIG" > "${CONTAINERD_CONFIG}.tmp" && mv "${CONTAINERD_CONFIG}.tmp" "$CONTAINERD_CONFIG"
+  chmod "$ORIG_MODE" "$CONTAINERD_CONFIG" 2>/dev/null || true
 
   # Add devmapper snapshotter config if pool is ready
   if [ "$POOL_READY" = "true" ]; then
     # Remove existing devmapper snapshotter config
-    python3 -c "
-import re
-with open('$CONTAINERD_CONFIG', 'r') as f:
-    lines = f.readlines()
-out = []
-skip = False
-for line in lines:
-    if re.search(r'\[.*snapshotter.*devmapper', line, re.IGNORECASE):
-        skip = True
-        continue
-    if skip and line.strip().startswith('[') and 'devmapper' not in line.lower():
-        skip = False
-    if not skip:
-        out.append(line)
-with open('$CONTAINERD_CONFIG', 'w') as f:
-    f.writelines(out)
-" 2>/dev/null || true
+    awk '
+      /^\[.*\.snapshotter.*devmapper/ { skip=1; next }
+      skip && /^\[/ && !/devmapper/ { skip=0 }
+      !skip { print }
+    ' "$CONTAINERD_CONFIG" > "${CONTAINERD_CONFIG}.tmp" && mv "${CONTAINERD_CONFIG}.tmp" "$CONTAINERD_CONFIG"
+    chmod "$ORIG_MODE" "$CONTAINERD_CONFIG" 2>/dev/null || true
 
     cat >> "$CONTAINERD_CONFIG" << DMCONF
 
