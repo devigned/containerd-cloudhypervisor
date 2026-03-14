@@ -66,7 +66,7 @@ DM_DIR="$HOST/var/lib/containerd/devmapper"
 POOL_READY=false
 
 # Check if pool already exists
-if nsenter --target 1 --mount -- dmsetup info "$POOL_NAME" 2>/dev/null | grep -q "EXISTS"; then
+if nsenter --target 1 --mount -- dmsetup info "$POOL_NAME" 2>/dev/null | grep -q "ACTIVE"; then
   echo "[cloudhv] Thin pool $POOL_NAME already exists"
   POOL_READY=true
 fi
