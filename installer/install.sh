@@ -130,27 +130,39 @@ if [ "$POOL_READY" = "false" ]; then
   if [ "$POOL_READY" = "false" ]; then
     # Fallback: loopback sparse file (works everywhere, slightly lower performance)
     echo "[cloudhv] No ephemeral disk found, using loopback sparse file..."
+
+    # Paths as seen from the container (for file creation via /host mount)
     DATA_FILE="$DM_DIR/data"
     META_FILE="$DM_DIR/meta"
+    # Paths as seen from the host (for losetup/dmsetup via nsenter)
+    HOST_DATA="/var/lib/containerd/devmapper/data"
+    HOST_META="/var/lib/containerd/devmapper/meta"
 
-    # Ensure both files exist with correct sizes
+    # Ensure directory exists on host and both files exist with correct sizes
+    mkdir -p "$DM_DIR"
     if [ ! -f "$DATA_FILE" ] || [ ! -f "$META_FILE" ]; then
       rm -f "$DATA_FILE" "$META_FILE"
       truncate -s 50G "$DATA_FILE"
       truncate -s 2G "$META_FILE"
     fi
 
-    DATA_DEV=$(nsenter --target 1 --mount -- losetup --find --show "$DATA_FILE" 2>/dev/null || true)
-    META_DEV=$(nsenter --target 1 --mount -- losetup --find --show "$META_FILE" 2>/dev/null || true)
+    # losetup runs in host mount namespace — must use host-side paths
+    DATA_DEV=$(nsenter --target 1 --mount -- losetup --find --show "$HOST_DATA" 2>/dev/null || true)
+    META_DEV=$(nsenter --target 1 --mount -- losetup --find --show "$HOST_META" 2>/dev/null || true)
 
     if [ -n "$DATA_DEV" ] && [ -n "$META_DEV" ]; then
-      DATA_SIZE=$(blockdev --getsize64 "$DATA_DEV")
+      DATA_SIZE=$(nsenter --target 1 --mount -- blockdev --getsize64 "$DATA_DEV")
       LENGTH=$(( DATA_SIZE / 512 ))
-      nsenter --target 1 --mount -- dmsetup create "$POOL_NAME" \
-        --table "0 $LENGTH thin-pool $META_DEV $DATA_DEV 128 32768" \
-        2>/dev/null && POOL_READY=true || echo "[cloudhv] WARNING: loopback thin-pool creation failed"
+      if nsenter --target 1 --mount -- dmsetup create "$POOL_NAME" \
+        --table "0 $LENGTH thin-pool $META_DEV $DATA_DEV 128 32768"; then
+        POOL_READY=true
+      else
+        echo "[cloudhv] WARNING: loopback thin-pool creation failed"
+        nsenter --target 1 --mount -- losetup -d "$DATA_DEV" 2>/dev/null || true
+        nsenter --target 1 --mount -- losetup -d "$META_DEV" 2>/dev/null || true
+      fi
     else
-      echo "[cloudhv] WARNING: losetup failed, devmapper not available"
+      echo "[cloudhv] WARNING: losetup failed (DATA_DEV='$DATA_DEV' META_DEV='$META_DEV')"
     fi
   fi
 fi
