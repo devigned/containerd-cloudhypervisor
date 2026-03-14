@@ -3,8 +3,9 @@ set -euo pipefail
 
 # This script runs inside the DaemonSet installer pod with the host
 # filesystem mounted at /host. It copies the shim artifacts onto the
-# node, patches containerd to register the cloudhv runtime, and
-# restarts containerd.
+# node, sets up a devmapper thin pool for zero-copy rootfs delivery,
+# patches containerd to register the cloudhv runtime with the devmapper
+# snapshotter, and restarts containerd.
 
 ARTIFACTS=/opt/cloudhv
 HOST=/host
@@ -51,13 +52,116 @@ cat > "$HOST/opt/cloudhv/config.json" << CONFIG
   "default_vcpus": 1,
   "default_memory_mb": 512,
   "max_containers_per_vm": 5,
-  "hotplug_memory_mb": 128,
-  "hotplug_method": "virtio-mem",
+  "hotplug_memory_mb": 0,
+  "hotplug_method": "acpi",
   "tpm_enabled": false
 }
 CONFIG
 
-# 4. Patch containerd config to add cloudhv runtime handler
+# 4. Set up devmapper thin pool for zero-copy rootfs delivery
+echo "[cloudhv] Setting up devmapper thin pool..."
+POOL_NAME="cloudhv-pool"
+DM_DIR="$HOST/var/lib/containerd/devmapper"
+POOL_READY=false
+
+# Check if pool already exists
+if nsenter --target 1 --mount -- dmsetup info "$POOL_NAME" 2>/dev/null | grep -q "EXISTS"; then
+  echo "[cloudhv] Thin pool $POOL_NAME already exists"
+  POOL_READY=true
+fi
+
+if [ "$POOL_READY" = "false" ]; then
+  mkdir -p "$DM_DIR"
+
+  # Detect available block devices for the thin pool.
+  # Priority: ephemeral/temp disk > resource disk > loopback sparse file
+  BACKING_DEV=""
+
+  # Azure VMs often have an ephemeral resource disk at /dev/sdb
+  # Check for unpartitioned or unmounted block devices
+  for DEV in /dev/sdb /dev/nvme1n1 /dev/vdb; do
+    # Check in host mount namespace for accurate device/mount info
+    if nsenter --target 1 --mount -- test -b "$DEV" && \
+       ! nsenter --target 1 --mount -- findmnt -n -o TARGET "$DEV" >/dev/null 2>&1; then
+      SIZE_BYTES=$(nsenter --target 1 --mount -- blockdev --getsize64 "$DEV" 2>/dev/null || echo 0)
+      if [ "$SIZE_BYTES" -gt 10737418240 ]; then
+        BACKING_DEV="$DEV"
+        echo "[cloudhv] Found ephemeral disk: $DEV ($(( SIZE_BYTES / 1073741824 )) GiB)"
+        break
+      fi
+    fi
+  done
+
+  if [ -n "$BACKING_DEV" ]; then
+    # Use the real block device directly — best performance
+    echo "[cloudhv] Creating thin pool on $BACKING_DEV..."
+
+    # Partition: 95% for data, 5% for metadata
+    TOTAL_SECTORS=$(blockdev --getsz "$BACKING_DEV")
+    META_SECTORS=$(( TOTAL_SECTORS / 20 ))
+    DATA_SECTORS=$(( TOTAL_SECTORS - META_SECTORS ))
+
+    # Create data and metadata devices using dmsetup linear targets
+    # Clean up any stale mappings first
+    nsenter --target 1 --mount -- dmsetup remove "${POOL_NAME}-data" 2>/dev/null || true
+    nsenter --target 1 --mount -- dmsetup remove "${POOL_NAME}-meta" 2>/dev/null || true
+
+    if ! nsenter --target 1 --mount -- dmsetup create "${POOL_NAME}-data" \
+      --table "0 $DATA_SECTORS linear $BACKING_DEV 0"; then
+      echo "[cloudhv] WARNING: failed to create data mapping"
+    elif ! nsenter --target 1 --mount -- dmsetup create "${POOL_NAME}-meta" \
+      --table "0 $META_SECTORS linear $BACKING_DEV $DATA_SECTORS"; then
+      echo "[cloudhv] WARNING: failed to create meta mapping"
+      nsenter --target 1 --mount -- dmsetup remove "${POOL_NAME}-data" 2>/dev/null || true
+    else
+      # Zero metadata and create thin-pool
+      nsenter --target 1 --mount -- dd if=/dev/zero of="/dev/mapper/${POOL_NAME}-meta" bs=4096 count=100 2>/dev/null
+      if nsenter --target 1 --mount -- dmsetup create "$POOL_NAME" \
+        --table "0 $DATA_SECTORS thin-pool /dev/mapper/${POOL_NAME}-meta /dev/mapper/${POOL_NAME}-data 128 32768"; then
+        POOL_READY=true
+      else
+        echo "[cloudhv] WARNING: thin-pool creation failed, cleaning up"
+        nsenter --target 1 --mount -- dmsetup remove "${POOL_NAME}-meta" 2>/dev/null || true
+        nsenter --target 1 --mount -- dmsetup remove "${POOL_NAME}-data" 2>/dev/null || true
+      fi
+    fi
+  fi
+
+  if [ "$POOL_READY" = "false" ]; then
+    # Fallback: loopback sparse file (works everywhere, slightly lower performance)
+    echo "[cloudhv] No ephemeral disk found, using loopback sparse file..."
+    DATA_FILE="$DM_DIR/data"
+    META_FILE="$DM_DIR/meta"
+
+    # Ensure both files exist with correct sizes
+    if [ ! -f "$DATA_FILE" ] || [ ! -f "$META_FILE" ]; then
+      rm -f "$DATA_FILE" "$META_FILE"
+      truncate -s 50G "$DATA_FILE"
+      truncate -s 2G "$META_FILE"
+    fi
+
+    DATA_DEV=$(nsenter --target 1 --mount -- losetup --find --show "$DATA_FILE" 2>/dev/null || true)
+    META_DEV=$(nsenter --target 1 --mount -- losetup --find --show "$META_FILE" 2>/dev/null || true)
+
+    if [ -n "$DATA_DEV" ] && [ -n "$META_DEV" ]; then
+      DATA_SIZE=$(blockdev --getsize64 "$DATA_DEV")
+      LENGTH=$(( DATA_SIZE / 512 ))
+      nsenter --target 1 --mount -- dmsetup create "$POOL_NAME" \
+        --table "0 $LENGTH thin-pool $META_DEV $DATA_DEV 128 32768" \
+        2>/dev/null && POOL_READY=true || echo "[cloudhv] WARNING: loopback thin-pool creation failed"
+    else
+      echo "[cloudhv] WARNING: losetup failed, devmapper not available"
+    fi
+  fi
+fi
+
+if [ "$POOL_READY" = "true" ]; then
+  echo "[cloudhv] Thin pool $POOL_NAME ready"
+else
+  echo "[cloudhv] WARNING: devmapper thin pool not available, using ext4 cache fallback"
+fi
+
+# 5. Patch containerd config to add cloudhv runtime handler + devmapper
 echo "[cloudhv] Patching containerd config..."
 CONTAINERD_CONFIG="$HOST/etc/containerd/config.toml"
 
@@ -68,41 +172,64 @@ else
   cp "$CONTAINERD_CONFIG" "${CONTAINERD_CONFIG}.bak.$(date +%s)"
 
   # Remove existing cloudhv runtime config and all nested subtables (idempotent)
-  # This handles both [plugins."...".runtimes.cloudhv] and [plugins.'...'.runtimes.cloudhv]
-  # and any sub-tables like [plugins."...".runtimes.cloudhv.options]
   python3 -c "
 import re, sys
-with open('$HOST/etc/containerd/config.toml', 'r') as f:
+with open('$CONTAINERD_CONFIG', 'r') as f:
     lines = f.readlines()
 out = []
 skip = False
 for line in lines:
-    # Start skipping at any cloudhv runtime table or sub-table
     if re.search(r'\[.*runtimes[.\"]cloudhv', line, re.IGNORECASE):
         skip = True
         continue
-    # Stop skipping at the next non-cloudhv table header
     if skip and line.strip().startswith('[') and 'cloudhv' not in line.lower():
         skip = False
     if not skip:
         out.append(line)
-with open('$HOST/etc/containerd/config.toml', 'w') as f:
+with open('$CONTAINERD_CONFIG', 'w') as f:
     f.writelines(out)
 " 2>/dev/null || true
 
-  # Add cloudhv runtime with optional devmapper snapshotter
-  DM_LINE=""
-  if dmsetup ls 2>/dev/null | grep -q "containerd"; then
-    DM_LINE='  snapshotter = "devmapper"'
+  # Add devmapper snapshotter config if pool is ready
+  if [ "$POOL_READY" = "true" ]; then
+    # Remove existing devmapper snapshotter config
+    python3 -c "
+import re
+with open('$CONTAINERD_CONFIG', 'r') as f:
+    lines = f.readlines()
+out = []
+skip = False
+for line in lines:
+    if re.search(r'\[.*snapshotter.*devmapper', line, re.IGNORECASE):
+        skip = True
+        continue
+    if skip and line.strip().startswith('[') and 'devmapper' not in line.lower():
+        skip = False
+    if not skip:
+        out.append(line)
+with open('$CONTAINERD_CONFIG', 'w') as f:
+    f.writelines(out)
+" 2>/dev/null || true
+
+    cat >> "$CONTAINERD_CONFIG" << DMCONF
+
+# CloudHV devmapper snapshotter for zero-copy rootfs delivery
+[plugins."io.containerd.snapshotter.v1.devmapper"]
+  root_path = "/var/lib/containerd/devmapper"
+  pool_name = "$POOL_NAME"
+  base_image_size = "1024MB"
+DMCONF
+    echo "[cloudhv] Devmapper snapshotter configured"
   fi
 
+  # Add cloudhv runtime
   {
     echo ""
     echo "# Cloud Hypervisor VM-isolated runtime"
     echo '[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.cloudhv]'
     echo '  runtime_type = "io.containerd.cloudhv.v1"'
-    if [ -n "$DM_LINE" ]; then
-      echo "$DM_LINE"
+    if [ "$POOL_READY" = "true" ]; then
+      echo '  snapshotter = "devmapper"'
     fi
   } >> "$CONTAINERD_CONFIG"
   echo "[cloudhv] Runtime handler added to containerd config"
@@ -117,9 +244,6 @@ if [ ! -f "$HOST/usr/local/bin/cloud-hypervisor" ]; then
 fi
 
 # 6. Schedule a deferred containerd restart on the host.
-#    We use nsenter to run in the host's PID/mount namespace so the restart
-#    happens outside this container. A 5-second delay ensures this pod
-#    reports Running before containerd cycles.
 echo "[cloudhv] Scheduling deferred containerd restart (5s delay)..."
 nsenter --target 1 --mount --uts --ipc --pid -- \
   bash -c 'nohup bash -c "sleep 5 && systemctl restart containerd" &>/dev/null &'
@@ -135,6 +259,11 @@ fi
 # 8. Label node as ready
 NODE_NAME=$(cat "$HOST/etc/hostname")
 echo "[cloudhv] Installation complete on $NODE_NAME"
+if [ "$POOL_READY" = "true" ]; then
+  echo "[cloudhv] Rootfs delivery: devmapper passthrough (zero-copy)"
+else
+  echo "[cloudhv] Rootfs delivery: ext4 cache (fallback)"
+fi
 
 # Keep running so the DaemonSet stays healthy
 echo "[cloudhv] Installer idle. Shim is active."
