@@ -242,7 +242,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: /tmp/image-root-amd64
-          file: .github/Dockerfile.installer
+          file: installer/Dockerfile
           platforms: linux/amd64
           push: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-amd64
@@ -254,7 +254,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: /tmp/image-root-arm64
-          file: .github/Dockerfile.installer
+          file: installer/Dockerfile
           platforms: linux/arm64
           push: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-arm64
