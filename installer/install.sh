@@ -143,8 +143,8 @@ if [ "$POOL_READY" = "false" ]; then
     mkdir -p "$DM_DIR"
     if [ ! -f "$DATA_FILE" ] || [ ! -f "$META_FILE" ]; then
       rm -f "$DATA_FILE" "$META_FILE"
-      truncate -s 50G "$DATA_FILE"
-      truncate -s 2G "$META_FILE"
+      truncate -s 10G "$DATA_FILE"
+      truncate -s 1G "$META_FILE"
     fi
 
     # losetup runs in host mount namespace — must use host-side paths
@@ -156,7 +156,7 @@ if [ "$POOL_READY" = "false" ]; then
       if [ "$DATA_SIZE" -gt 0 ]; then
         LENGTH=$(( DATA_SIZE / 512 ))
         if nsenter --target 1 --mount -- dmsetup create "$POOL_NAME" \
-          --table "0 $LENGTH thin-pool $META_DEV $DATA_DEV 128 32768"; then
+          --table "0 $LENGTH thin-pool $META_DEV $DATA_DEV 128 32768 1 skip_block_zeroing"; then
           POOL_READY=true
         else
           echo "[cloudhv] WARNING: loopback thin-pool creation failed"
