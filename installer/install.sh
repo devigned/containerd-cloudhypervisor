@@ -31,11 +31,11 @@ echo "[cloudhv] Installing on $(cat /host/etc/hostname) (${HOST_ARCH})..."
 # 0. Ensure tc (traffic control) is available — required for VM TAP networking
 if ! nsenter --target 1 --mount -- sh -c 'command -v tc' >/dev/null 2>&1; then
   echo "[cloudhv] tc not found, attempting to install iproute-tc..."
-  if nsenter --target 1 --mount --uts --ipc --pid -- tdnf install -y iproute-tc 2>&1 | tail -3; then
+  if nsenter --target 1 --mount --uts --ipc --pid --cgroup -- tdnf install -y iproute-tc 2>&1 | tail -3; then
     echo "[cloudhv] iproute-tc installed"
-  elif nsenter --target 1 --mount --uts --ipc --pid -- dnf install -y iproute-tc 2>&1 | tail -3; then
+  elif nsenter --target 1 --mount --uts --ipc --pid --cgroup -- dnf install -y iproute-tc 2>&1 | tail -3; then
     echo "[cloudhv] iproute-tc installed (dnf)"
-  elif nsenter --target 1 --mount --uts --ipc --pid -- sh -c 'apt-get update -qq && apt-get install -y iproute2' 2>&1 | tail -3; then
+  elif nsenter --target 1 --mount --uts --ipc --pid --cgroup -- sh -c 'apt-get update -qq && apt-get install -y iproute2' 2>&1 | tail -3; then
     echo "[cloudhv] iproute2 installed (apt)"
   else
     echo "[cloudhv] ERROR: tc (traffic control) is required but not found and could not be installed."
