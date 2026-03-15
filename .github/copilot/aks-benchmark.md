@@ -15,7 +15,8 @@ release needs performance validation.
 
 ## Prerequisites
 
-- Azure CLI authenticated (`az account set --subscription extremis`)
+- An Azure subscription name from the user
+- Azure CLI authenticated (`az account set --subscription "${SUBSCRIPTION_NAME}"`) where ${SUBSCRIPTION_NAME} is the user provide subscription name
 - `kubectl` and `helm` installed
 - A released version of the CloudHV shim Helm chart on GHCR
 
@@ -42,10 +43,10 @@ wait
 
 # Add worker pools in parallel
 az aks nodepool add --resource-group "$RG" --cluster-name cloudhv-bench \
-  --name cloudhv --node-count 3 --node-vm-size Standard_D8s_v5 \
+  --name cloudhv --node-count 3 --node-vm-size Standard_D8ds_v5 \
   --max-pods 60 --labels workload=cloudhv --os-sku AzureLinux &
 az aks nodepool add --resource-group "$RG" --cluster-name kata-bench \
-  --name kata --node-count 3 --node-vm-size Standard_D8s_v5 \
+  --name kata --node-count 3 --node-vm-size Standard_D8ds_v5 \
   --max-pods 60 --os-sku AzureLinux --workload-runtime KataMshvVmIsolation &
 wait
 ```
@@ -73,6 +74,8 @@ resources:
   requests:
     cpu: "100m"
     memory: "64Mi"
+  limits:
+    memory: "256Mi"
 ```
 
 RuntimeClassName: `cloudhv` for CloudHV, `kata-vm-isolation` for Kata.
@@ -80,6 +83,7 @@ RuntimeClassName: `cloudhv` for CloudHV, `kata-vm-isolation` for Kata.
 ### 4. Scale Benchmark (3 iterations)
 
 For each runtime, run 3 iterations of:
+
 1. Scale deployment to 150 replicas
 2. Poll every 5s until target ready or 60s timeout
 3. Record: ready count, time, crash count, pending count
