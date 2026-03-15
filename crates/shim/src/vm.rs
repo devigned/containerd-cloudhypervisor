@@ -440,16 +440,22 @@ impl VmManager {
             }
         }
 
-        // Kill CH process if still running
+        // Kill CH process if still running (short timeout to avoid blocking)
         if let Some(ref mut child) = self.ch_process {
             let _ = child.kill().await;
-            let _ = child.wait().await;
+            match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
+                Ok(_) => {}
+                Err(_) => warn!("VM {} CH process wait timed out", self.vm_id),
+            }
         }
 
         // Clean up swtpm if running
         if let Some(ref mut child) = self.swtpm_process {
             let _ = child.kill().await;
-            let _ = child.wait().await;
+            match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+                Ok(_) => {}
+                Err(_) => warn!("VM {} swtpm wait timed out", self.vm_id),
+            }
         }
 
         Ok(())
