@@ -290,17 +290,21 @@ impl ContainerManager {
         Ok(())
     }
 
-    /// Create a new container from a hot-plugged block device.
+    /// Create a new container from a block device.
     ///
-    /// The host shim hot-plugs a cached rootfs disk (rootfs/ only) into the VM.
-    /// The OCI config.json and filesystem volume data are delivered inline via
-    /// the RPC and written to tmpfs — no second disk needed.
+    /// The host shim either hot-plugs a cached rootfs disk or pre-attaches it
+    /// at VM boot time. The OCI config.json and filesystem volume data are
+    /// delivered inline via the RPC and written to tmpfs.
+    ///
+    /// When `rootfs_preattached` is true, the rootfs disk is at `/dev/vdb`
+    /// (deterministic, attached at boot). Skips discover_and_mount_new_disk polling.
     pub async fn create(
         &mut self,
         container_id: &str,
         _bundle_path: &str,
         volumes: &[VolumeInfo],
         config_json: &[u8],
+        rootfs_preattached: bool,
     ) -> Result<u32> {
         info!("creating container: id={}", container_id);
 
@@ -313,10 +317,54 @@ impl ContainerManager {
         let disk_mount = mount_point.join("_disk");
         std::fs::create_dir_all(&disk_mount)?;
 
-        let disk_path = self
-            .discover_and_mount_new_disk(&disk_mount)
-            .await
-            .context("discover/mount rootfs disk")?;
+        let disk_path = if rootfs_preattached {
+            // Pre-attached at boot: rootfs is deterministically at /dev/vdb
+            let dev = "/dev/vdb".to_string();
+            info!("rootfs pre-attached at {}", dev);
+
+            #[cfg(target_os = "linux")]
+            {
+                use nix::mount::{mount, MsFlags};
+                for attempt in 1..=20 {
+                    match mount(
+                        Some(dev.as_str()),
+                        &disk_mount,
+                        Some("ext4"),
+                        MsFlags::MS_NOATIME,
+                        Some("nobarrier"),
+                    ) {
+                        Ok(()) => {
+                            info!(
+                                "mounted pre-attached rootfs {} at {}",
+                                dev,
+                                disk_mount.display()
+                            );
+                            break;
+                        }
+                        Err(e) if attempt < 20 => {
+                            debug!("mount attempt {attempt} for pre-attached rootfs failed: {e}");
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                        Err(e) => {
+                            anyhow::bail!(
+                                "mount pre-attached {} at {}: {e}",
+                                dev,
+                                disk_mount.display()
+                            )
+                        }
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = &disk_mount;
+
+            dev
+        } else {
+            // Hot-plugged: discover the new disk by scanning /sys/block
+            self.discover_and_mount_new_disk(&disk_mount)
+                .await
+                .context("discover/mount rootfs disk")?
+        };
 
         // Determine rootfs location on the disk:
         //   - Our cached images: rootfs/ exists at top level
@@ -537,6 +585,27 @@ impl ContainerManager {
         self.exit_receivers.insert(container_id.to_string(), rx);
 
         Ok(pid)
+    }
+
+    /// Create and start a container atomically (used for the first container
+    /// whose rootfs was pre-attached at VM boot time).
+    pub async fn run(
+        &mut self,
+        container_id: &str,
+        bundle_path: &str,
+        volumes: &[VolumeInfo],
+        config_json: &[u8],
+        rootfs_preattached: bool,
+    ) -> Result<u32> {
+        self.create(
+            container_id,
+            bundle_path,
+            volumes,
+            config_json,
+            rootfs_preattached,
+        )
+        .await?;
+        self.start(container_id).await
     }
 
     /// Send a signal to a container.

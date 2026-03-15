@@ -47,7 +47,7 @@ fn test_vm_boot_and_agent_health() {
 
         // Create and boot VM
         eprintln!("=== Creating and booting VM ===");
-        vm.create_and_boot_vm(None, None)
+        vm.create_and_boot_vm(None, None, vec![])
             .await
             .expect("failed to create and boot VM");
 
@@ -222,7 +222,7 @@ fn test_ttrpc_health_check_rpc() {
         vm.prepare().await.expect("VM prepare failed");
         vm.spawn_vmm_in_netns(None).expect("VMM spawn failed");
         vm.wait_vmm_ready().await.expect("VMM ready failed");
-        vm.create_and_boot_vm(None, None)
+        vm.create_and_boot_vm(None, None, vec![])
             .await
             .expect("boot failed");
 
@@ -394,7 +394,7 @@ fn test_vm_lifecycle_timing_breakdown() {
 
         // Phase 3: VM create + boot
         let t3 = std::time::Instant::now();
-        vm.create_and_boot_vm(None, None)
+        vm.create_and_boot_vm(None, None, vec![])
             .await
             .expect("boot failed");
         let boot_time = t3.elapsed();
@@ -468,7 +468,7 @@ fn test_vm_resize_api() {
 
         vm.spawn_vmm_in_netns(None).expect("VMM spawn failed");
         vm.wait_vmm_ready().await.expect("VMM ready failed");
-        vm.create_and_boot_vm(None, None)
+        vm.create_and_boot_vm(None, None, vec![])
             .await
             .expect("boot failed");
 
@@ -536,7 +536,9 @@ fn test_container_logs_captured() {
         vm.prepare().await.expect("prepare");
         vm.spawn_vmm_in_netns(None).expect("vmm");
         vm.wait_vmm_ready().await.expect("vmm ready");
-        vm.create_and_boot_vm(None, None).await.expect("boot");
+        vm.create_and_boot_vm(None, None, vec![])
+            .await
+            .expect("boot");
         vm.wait_for_agent().await.expect("agent");
 
         // ── Connect ttrpc agent ───────────────────────────────────────
@@ -941,7 +943,7 @@ fn test_echo_container_with_networking() {
             .expect("spawn_vmm_in_netns");
         vm.wait_vmm_ready().await.expect("vmm ready");
 
-        vm.create_and_boot_vm(Some(&tap_name), Some(&tap_mac))
+        vm.create_and_boot_vm(Some(&tap_name), Some(&tap_mac), vec![])
             .await
             .expect("create_and_boot_vm");
 
@@ -1432,7 +1434,7 @@ fn test_two_containers_in_one_vm() {
         vm.spawn_vmm_in_netns(Some(&netns_path))
             .expect("spawn_vmm_in_netns");
         vm.wait_vmm_ready().await.expect("vmm ready");
-        vm.create_and_boot_vm(Some(&tap_name), Some(&tap_mac))
+        vm.create_and_boot_vm(Some(&tap_name), Some(&tap_mac), vec![])
             .await
             .expect("create_and_boot_vm");
         tokio::time::timeout(Duration::from_secs(30), vm.wait_for_agent())
@@ -1589,7 +1591,9 @@ fn test_vm_memory_growth() {
         vm.prepare().await.expect("prepare");
         vm.spawn_vmm_in_netns(None).expect("vmm spawn failed");
         vm.wait_vmm_ready().await.expect("vmm ready failed");
-        vm.create_and_boot_vm(None, None).await.expect("boot");
+        vm.create_and_boot_vm(None, None, vec![])
+            .await
+            .expect("boot");
         tokio::time::timeout(Duration::from_secs(30), vm.wait_for_agent())
             .await
             .expect("agent timeout")
@@ -1678,7 +1682,9 @@ fn test_vm_memory_reclaim() {
         vm.prepare().await.expect("prepare");
         vm.spawn_vmm_in_netns(None).expect("vmm spawn failed");
         vm.wait_vmm_ready().await.expect("vmm ready failed");
-        vm.create_and_boot_vm(None, None).await.expect("boot");
+        vm.create_and_boot_vm(None, None, vec![])
+            .await
+            .expect("boot");
         tokio::time::timeout(Duration::from_secs(30), vm.wait_for_agent())
             .await
             .expect("agent timeout")
@@ -1793,7 +1799,9 @@ fn test_volume_mounts() {
         vm.prepare().await.expect("prepare");
         vm.spawn_vmm_in_netns(None).expect("vmm spawn failed");
         vm.wait_vmm_ready().await.expect("vmm ready failed");
-        vm.create_and_boot_vm(None, None).await.expect("boot");
+        vm.create_and_boot_vm(None, None, vec![])
+            .await
+            .expect("boot");
         tokio::time::timeout(Duration::from_secs(30), vm.wait_for_agent())
             .await
             .expect("agent timeout")
@@ -2053,7 +2061,9 @@ fn test_inline_metadata_delivery() {
         vm.prepare().await.expect("prepare");
         vm.spawn_vmm_in_netns(None).expect("vmm spawn failed");
         vm.wait_vmm_ready().await.expect("vmm ready failed");
-        vm.create_and_boot_vm(None, None).await.expect("boot");
+        vm.create_and_boot_vm(None, None, vec![])
+            .await
+            .expect("boot");
         tokio::time::timeout(Duration::from_secs(30), vm.wait_for_agent())
             .await
             .expect("agent timeout")
@@ -2261,7 +2271,9 @@ fn test_flat_disk_layout() {
         vm.prepare().await.expect("prepare");
         vm.spawn_vmm_in_netns(None).expect("vmm spawn failed");
         vm.wait_vmm_ready().await.expect("vmm ready failed");
-        vm.create_and_boot_vm(None, None).await.expect("boot");
+        vm.create_and_boot_vm(None, None, vec![])
+            .await
+            .expect("boot");
         tokio::time::timeout(Duration::from_secs(30), vm.wait_for_agent())
             .await
             .expect("agent timeout")
