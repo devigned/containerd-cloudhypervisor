@@ -31,17 +31,31 @@ echo "[cloudhv] Installing on $(cat /host/etc/hostname) (${HOST_ARCH})..."
 # 0. Ensure tc (traffic control) is available — required for VM TAP networking
 if ! nsenter --target 1 --mount -- sh -c 'command -v tc' >/dev/null 2>&1; then
   echo "[cloudhv] tc not found, attempting to install iproute-tc..."
-  if nsenter --target 1 --mount --uts --ipc --pid --cgroup -- tdnf install -y iproute-tc 2>&1 | tail -3; then
+  # Write a helper script to the host and run it there so package manager
+  # runs as a native host process (avoids container cgroup OOM).
+  cat > "$HOST/tmp/cloudhv-install-tc.sh" << 'TCEOF'
+#!/bin/sh
+if command -v tdnf >/dev/null 2>&1; then
+  tdnf install -y iproute-tc
+elif command -v dnf >/dev/null 2>&1; then
+  dnf install -y iproute-tc
+elif command -v apt-get >/dev/null 2>&1; then
+  apt-get update -qq && apt-get install -y iproute2
+else
+  echo "No supported package manager found" >&2
+  exit 1
+fi
+TCEOF
+  chmod +x "$HOST/tmp/cloudhv-install-tc.sh"
+  if nsenter --target 1 --mount --uts --ipc --pid -- /tmp/cloudhv-install-tc.sh 2>&1 | tail -5; then
     echo "[cloudhv] iproute-tc installed"
-  elif nsenter --target 1 --mount --uts --ipc --pid --cgroup -- dnf install -y iproute-tc 2>&1 | tail -3; then
-    echo "[cloudhv] iproute-tc installed (dnf)"
-  elif nsenter --target 1 --mount --uts --ipc --pid --cgroup -- sh -c 'apt-get update -qq && apt-get install -y iproute2' 2>&1 | tail -3; then
-    echo "[cloudhv] iproute2 installed (apt)"
   else
-    echo "[cloudhv] ERROR: tc (traffic control) is required but not found and could not be installed."
+    echo "[cloudhv] ERROR: tc (traffic control) is required but could not be installed."
     echo "[cloudhv] ERROR: Install iproute-tc (AzureLinux/Fedora) or iproute2 (Debian/Ubuntu) on the host."
+    rm -f "$HOST/tmp/cloudhv-install-tc.sh"
     exit 1
   fi
+  rm -f "$HOST/tmp/cloudhv-install-tc.sh"
 fi
 echo "[cloudhv] tc available: $(nsenter --target 1 --mount -- sh -c 'command -v tc')"
 
