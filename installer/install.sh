@@ -15,11 +15,9 @@ HOST=/host
 HOST_ARCH="$(uname -m)"
 case "${HOST_ARCH}" in
     x86_64)
-        CH_ARCH_SUFFIX="static"
         KERNEL_CONSOLE="console=ttyS0"
         ;;
     aarch64)
-        CH_ARCH_SUFFIX="static-aarch64"
         KERNEL_CONSOLE="console=ttyAMA0"
         ;;
     *)
@@ -241,11 +239,8 @@ DMCONF
 fi
 
 if [ ! -f "$HOST/usr/local/bin/cloud-hypervisor" ]; then
-  echo "[cloudhv] Installing cloud-hypervisor (${HOST_ARCH})..."
-  CH_VERSION="v44.0"
-  curl -sL "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-${CH_ARCH_SUFFIX}" \
-    -o "$HOST/usr/local/bin/cloud-hypervisor"
-  chmod 755 "$HOST/usr/local/bin/cloud-hypervisor"
+  echo "[cloudhv] Copying cloud-hypervisor binary (${HOST_ARCH})..."
+  install -m 755 "$ARTIFACTS/cloud-hypervisor" "$HOST/usr/local/bin/cloud-hypervisor"
 fi
 
 # 6. Schedule a deferred containerd restart on the host.

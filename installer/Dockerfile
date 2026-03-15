@@ -73,15 +73,26 @@ RUN mkdir -p rootfs/bin rootfs/dev/pts rootfs/dev/shm rootfs/etc \
 # --- Stage 4: Final installer image ---
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y \
-    python3 jq curl \
-    && rm -rf /var/lib/apt/lists/*
+# Download cloud-hypervisor at build time (not at runtime on the node).
+# TARGETARCH is set by Docker buildx (amd64 or arm64).
+ARG CH_VERSION=v44.0
+ARG TARGETARCH
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+      CH_SUFFIX="static-aarch64"; \
+    else \
+      CH_SUFFIX="static"; \
+    fi && \
+    apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && \
+    curl -sL "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-${CH_SUFFIX}" \
+      -o /opt/cloud-hypervisor && chmod 755 /opt/cloud-hypervisor && \
+    apt-get purge -y curl && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/cloudhv
 
 COPY --from=builder /src/target/release/containerd-shim-cloudhv-v1 ./
 COPY --from=kernel-builder /kernel/vmlinux ./
 COPY --from=rootfs-builder /rootfs/rootfs.ext4 ./
+RUN cp /opt/cloud-hypervisor ./cloud-hypervisor
 COPY installer/install.sh ./
 
 
