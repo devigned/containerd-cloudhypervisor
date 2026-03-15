@@ -174,6 +174,36 @@ impl Instance for CloudHvInstance {
     async fn delete(&self) -> Result<(), Error> {
         info!("CloudHvInstance::delete id={}", self.id);
 
+        // Always unmount the rootfs that containerd mounted, regardless of
+        // VM state. Without this, the devmapper snapshot stays "in use" and
+        // containerd's snapshotter retries deactivation in a blocking loop
+        // (100 × 15s), preventing all new container creation on the node.
+        let rootfs_mount = self.bundle.join("rootfs");
+        #[cfg(target_os = "linux")]
+        {
+            let rpath = rootfs_mount.clone();
+            let umount_result = tokio::task::spawn_blocking(move || {
+                use std::ffi::CString;
+                match CString::new(rpath.to_string_lossy().as_bytes()) {
+                    Ok(cpath) => {
+                        let rc = unsafe { libc::umount2(cpath.as_ptr(), libc::MNT_DETACH) };
+                        if rc == 0 {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::last_os_error())
+                        }
+                    }
+                    Err(e) => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)),
+                }
+            })
+            .await;
+            match umount_result {
+                Ok(Ok(())) => info!("unmounted rootfs: {}", rootfs_mount.display()),
+                Ok(Err(e)) => info!("rootfs unmount (best-effort): {e}"),
+                Err(e) => info!("rootfs unmount task failed: {e}"),
+            }
+        }
+
         let vm_state = get_vm(&self.sandbox_id);
 
         if let Some(vm_state) = vm_state {

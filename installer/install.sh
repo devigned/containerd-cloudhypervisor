@@ -28,6 +28,23 @@ esac
 
 echo "[cloudhv] Installing on $(cat /host/etc/hostname) (${HOST_ARCH})..."
 
+# 0. Ensure tc (traffic control) is available — required for VM TAP networking
+if ! nsenter --target 1 --mount -- sh -c 'command -v tc' >/dev/null 2>&1; then
+  echo "[cloudhv] tc not found, attempting to install iproute-tc..."
+  if nsenter --target 1 --mount --uts --ipc --pid -- tdnf install -y iproute-tc 2>&1 | tail -3; then
+    echo "[cloudhv] iproute-tc installed"
+  elif nsenter --target 1 --mount --uts --ipc --pid -- dnf install -y iproute-tc 2>&1 | tail -3; then
+    echo "[cloudhv] iproute-tc installed (dnf)"
+  elif nsenter --target 1 --mount --uts --ipc --pid -- sh -c 'apt-get update -qq && apt-get install -y iproute2' 2>&1 | tail -3; then
+    echo "[cloudhv] iproute2 installed (apt)"
+  else
+    echo "[cloudhv] ERROR: tc (traffic control) is required but not found and could not be installed."
+    echo "[cloudhv] ERROR: Install iproute-tc (AzureLinux/Fedora) or iproute2 (Debian/Ubuntu) on the host."
+    exit 1
+  fi
+fi
+echo "[cloudhv] tc available: $(nsenter --target 1 --mount -- sh -c 'command -v tc')"
+
 # 1. Copy binaries
 echo "[cloudhv] Copying shim binary..."
 install -D -m 755 "$ARTIFACTS/containerd-shim-cloudhv-v1" "$HOST/usr/local/bin/containerd-shim-cloudhv-v1"
