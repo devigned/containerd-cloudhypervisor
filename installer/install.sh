@@ -118,7 +118,11 @@ if [ "$POOL_READY" = "false" ]; then
       # Zero metadata and create thin-pool
       nsenter --target 1 --mount -- dd if=/dev/zero of="/dev/mapper/${POOL_NAME}-meta" bs=4096 count=100 2>/dev/null
       if nsenter --target 1 --mount -- dmsetup create "$POOL_NAME" \
+        --table "0 $DATA_SECTORS thin-pool /dev/mapper/${POOL_NAME}-meta /dev/mapper/${POOL_NAME}-data 128 32768 1 skip_block_zeroing"; then
+        POOL_READY=true
+      elif nsenter --target 1 --mount -- dmsetup create "$POOL_NAME" \
         --table "0 $DATA_SECTORS thin-pool /dev/mapper/${POOL_NAME}-meta /dev/mapper/${POOL_NAME}-data 128 32768"; then
+        echo "[cloudhv] WARNING: skip_block_zeroing not supported, pool creation may be slow"
         POOL_READY=true
       else
         echo "[cloudhv] WARNING: thin-pool creation failed, cleaning up"
@@ -157,6 +161,10 @@ if [ "$POOL_READY" = "false" ]; then
         LENGTH=$(( DATA_SIZE / 512 ))
         if nsenter --target 1 --mount -- dmsetup create "$POOL_NAME" \
           --table "0 $LENGTH thin-pool $META_DEV $DATA_DEV 128 32768 1 skip_block_zeroing"; then
+          POOL_READY=true
+        elif nsenter --target 1 --mount -- dmsetup create "$POOL_NAME" \
+          --table "0 $LENGTH thin-pool $META_DEV $DATA_DEV 128 32768"; then
+          echo "[cloudhv] WARNING: skip_block_zeroing not supported, pool creation may be slow"
           POOL_READY=true
         else
           echo "[cloudhv] WARNING: loopback thin-pool creation failed"
