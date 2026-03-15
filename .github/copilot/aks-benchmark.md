@@ -51,7 +51,7 @@ az aks nodepool add --resource-group "$RG" --cluster-name kata-bench \
 wait
 ```
 
-### 2. Install Shim and Wait for Metrics
+### 2. Install Shim and Warm Up Metrics
 
 ```bash
 az aks get-credentials --resource-group "$RG" --name cloudhv-bench
@@ -59,9 +59,47 @@ helm install cloudhv-installer oci://ghcr.io/devigned/charts/cloudhv-installer \
   --version <VERSION> --namespace kube-system
 ```
 
-**Critical**: Wait until ALL worker nodes on BOTH clusters report metrics via
-`kubectl top nodes` (no `<unknown>` values). This may take 1-3 minutes after
-node pool creation.
+Wait for the installer DaemonSet to roll out:
+```bash
+kubectl -n kube-system rollout status daemonset/cloudhv-installer --timeout=180s
+```
+
+**Known issue**: The installer's `dmsetup create` on loopback sparse files may
+hang silently, preventing containerd config patching and CH binary installation.
+Check installer logs (`kubectl -n kube-system logs -l app.kubernetes.io/name=cloudhv-installer`).
+If logs stop at "using loopback sparse file...", manually complete the setup on
+each node via the installer pod (patch containerd config, install CH, restart
+containerd).
+
+**Metrics warmup (critical)**: After installation and any containerd restarts,
+deploy a small warmup workload (3 pods, one per node) using the `cloudhv`
+RuntimeClass. Wait for all warmup pods to reach `Running`, then poll
+`kubectl top nodes` until ALL worker nodes report real values (not `<unknown>`).
+This confirms metrics-server has recovered from any containerd restart.
+
+```bash
+# Deploy 3 warmup pods
+kubectl create deployment warmup --image=hashicorp/http-echo:latest \
+  --replicas=3 -- -text=warmup -listen=:5678
+kubectl patch deployment warmup -p '{"spec":{"template":{"spec":{
+  "runtimeClassName":"cloudhv",
+  "nodeSelector":{"workload":"cloudhv"},
+  "containers":[{"name":"http-echo","resources":{"requests":{"cpu":"100m","memory":"64Mi"},"limits":{"memory":"256Mi"}}}]
+}}}}'
+
+# Wait for metrics (poll every 10s, up to 5 min)
+until kubectl top nodes 2>&1 | grep "aks-cloudhv" | grep -qv "unknown"; do
+  sleep 10
+done
+kubectl top nodes
+
+# Clean up warmup
+kubectl delete deployment warmup
+sleep 15
+```
+
+Only proceed to the benchmark workload after `kubectl top nodes` shows real
+CPU/memory values for all worker nodes.
 
 ### 3. Deploy Workload
 
@@ -150,10 +188,19 @@ az group delete --name "$RG" --yes --no-wait
   Devmapper passthrough (Tier 1) is active when the installer succeeds.
   If no ephemeral disk is available and loopback setup fails, the ext4
   cache fallback (Tier 2) is used instead.
+- **Installer reliability**: `dmsetup create` on loopback sparse files can
+  hang for minutes, causing the installer script to skip config patching and
+  CH binary installation. Always verify installer logs completed through
+  "Installation complete" before proceeding.
+- **Metrics warmup is essential**: After containerd restarts (from shim
+  installation), metrics-server loses connection to worker nodes. Deploying
+  a small warmup workload and waiting for `kubectl top nodes` to report
+  real values ensures metrics are available during the benchmark. Without
+  this step, worker nodes will show `<unknown>` throughout the benchmark.
 - Kata on AKS uses `disable_block_device_use = true` and virtiofsd for rootfs.
 - The 600Mi Kata RuntimeClass overhead is set by Microsoft's AKS addon, not
   by the Kata project (which recommends 130Mi for Cloud Hypervisor).
 - CloudHV's 50Mi overhead accurately reflects ~59MB actual per-pod RSS.
-- kubectl top may show `<unknown>` for CloudHV worker nodes due to metrics-server
-  scrape timing. Per-pod RSS via /proc is the reliable measurement.
+- Per-pod RSS via /proc (using installer pods with host PID access) is more
+  reliable than `kubectl top` for per-process memory measurement.
 - Always delete Azure resources after benchmarking to avoid charges.
