@@ -522,7 +522,9 @@ impl CloudHvInstance {
                         let msg = format!("{e:#}");
                         *vm_state.boot_state.lock().await = BootState::Failed(msg.clone());
                         vm_state.boot_complete.notify_waiters();
-                        return Err(Error::Any(anyhow::anyhow!("agent connect after boot: {msg}")));
+                        return Err(Error::Any(anyhow::anyhow!(
+                            "agent connect after boot: {msg}"
+                        )));
                     }
                 }
 
