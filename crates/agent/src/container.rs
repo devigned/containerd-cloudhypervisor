@@ -251,8 +251,32 @@ impl ContainerManager {
                     vol.source, vol.destination, dev_path, vol.fs_type
                 );
             } else {
-                // Filesystem volumes: bind-mount from the container's disk
-                // (data baked into the rootfs image by the shim)
+                // Filesystem volumes: bind-mount from the container's bundle.
+                // Single-file volumes where the inline filename matches the
+                // destination basename (e.g., /etc/hostname with file "hostname")
+                // need the source to be a file — crun can't mount a dir onto
+                // a file destination.
+                let source = if vol.inline_files.len() == 1 {
+                    let dest_basename = std::path::Path::new(&vol.destination)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("");
+                    let file_basename = std::path::Path::new(&vol.inline_files[0].path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("");
+                    if !dest_basename.is_empty() && dest_basename == file_basename {
+                        let vol_dir = std::path::Path::new(&vol.source);
+                        vol_dir
+                            .join(&vol.inline_files[0].path)
+                            .to_string_lossy()
+                            .to_string()
+                    } else {
+                        vol.source.clone()
+                    }
+                } else {
+                    vol.source.clone()
+                };
                 let mut opts = vec!["rbind".to_string()];
                 if vol.readonly {
                     opts.push("ro".to_string());
@@ -260,12 +284,12 @@ impl ContainerManager {
                 mounts.push(serde_json::json!({
                     "destination": vol.destination,
                     "type": "bind",
-                    "source": vol.source,
+                    "source": source,
                     "options": opts,
                 }));
                 info!(
                     "fs volume mount: {} -> {} (ro={})",
-                    vol.source, vol.destination, vol.readonly
+                    source, vol.destination, vol.readonly
                 );
             }
         }
