@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
 
 use chrono::{DateTime, Utc};
@@ -46,6 +46,19 @@ fn get_vm(sandbox_id: &str) -> Option<Arc<SharedVmState>> {
         .cloned()
 }
 
+/// Tracks the VM boot lifecycle so concurrent containers can synchronize.
+#[derive(Debug, Clone, PartialEq)]
+enum BootState {
+    /// VM process is running but vm.create/boot has not been called yet.
+    NotBooted,
+    /// First container is currently booting the VM.
+    Booting,
+    /// VM booted and agent connected successfully.
+    Booted,
+    /// VM boot failed — subsequent containers should not proceed.
+    Failed(String),
+}
+
 /// Shared state for a running VM (one per pod).
 struct SharedVmState {
     vm: VmManager,
@@ -54,7 +67,8 @@ struct SharedVmState {
     shared_dir: PathBuf,
     container_count: AtomicUsize,
     api_socket: PathBuf,
-    booted: AtomicBool,
+    boot_state: tokio::sync::Mutex<BootState>,
+    boot_complete: tokio::sync::Notify,
     // Store sandbox boot config for deferred boot
     tap_name: Option<String>,
     tap_mac: Option<String>,
@@ -327,7 +341,8 @@ impl CloudHvInstance {
             shared_dir,
             container_count: AtomicUsize::new(1), // sandbox itself counts
             api_socket,
-            booted: AtomicBool::new(false),
+            boot_state: tokio::sync::Mutex::new(BootState::NotBooted),
+            boot_complete: tokio::sync::Notify::new(),
             tap_name,
             tap_mac,
             cgroups_path: sandbox_spec.cgroups_path.clone(),
@@ -451,60 +466,115 @@ impl CloudHvInstance {
             disk_path
         };
 
-        // Determine if this is the first container (triggers deferred VM boot)
-        let is_first_container = !vm_state.booted.swap(true, Ordering::SeqCst);
+        // Determine boot role: first container boots the VM, others wait.
+        enum BootRole {
+            First,
+            Subsequent,
+        }
 
-        if is_first_container {
-            // First container — boot VM with rootfs pre-attached as /dev/vdb
-            let extra_disk = VmDisk {
-                path: rootfs_disk_path.to_string_lossy().to_string(),
-                readonly: false,
-                id: Some(disk_id.clone()),
-            };
-            vm_state
-                .vm
-                .create_and_boot_vm(
-                    vm_state.tap_name.as_deref(),
-                    vm_state.tap_mac.as_deref(),
-                    vec![extra_disk],
-                )
-                .await
-                .ctx("boot with rootfs")?;
-            info!("VM booted with pre-attached rootfs: {disk_id}");
-
-            // Wait for agent and connect
-            let _agent = get_or_connect_agent(&vm_state).await?;
-
-            // Place CH in pod cgroup now that the VM is running
-            if let Some(ref cg) = vm_state.cgroups_path {
-                let ch_pid = vm_state.vm.ch_pid().unwrap_or(std::process::id());
-                if let Err(e) = place_in_pod_cgroup(ch_pid, cg) {
-                    info!("cgroup placement failed (non-fatal): {e}");
-                } else {
-                    info!("CH pid {ch_pid} placed in pod cgroup: {cg}");
+        let boot_role = {
+            let mut state = vm_state.boot_state.lock().await;
+            match &*state {
+                BootState::NotBooted => {
+                    *state = BootState::Booting;
+                    BootRole::First
+                }
+                BootState::Booting => BootRole::Subsequent,
+                BootState::Booted => BootRole::Subsequent,
+                BootState::Failed(msg) => {
+                    return Err(Error::Any(anyhow::anyhow!(
+                        "VM boot previously failed: {msg}"
+                    )));
                 }
             }
-        } else {
-            // Subsequent containers — wait for VM boot to complete, then hot-plug.
-            // get_or_connect_agent blocks until the agent is reachable, which
-            // implies the first container's boot sequence has finished.
-            let _agent = get_or_connect_agent(&vm_state).await?;
+        };
+        let is_first_container = matches!(boot_role, BootRole::First);
 
-            let api_socket = vm_state.api_socket.clone();
-            let disk_json = serde_json::json!({
-                "path": rootfs_disk_path.to_string_lossy(),
-                "readonly": false,
-                "id": &disk_id,
-            });
-            VmManager::api_request_to_socket(
-                &api_socket,
-                "PUT",
-                "/api/v1/vm.add-disk",
-                Some(&disk_json.to_string()),
-            )
-            .await
-            .ctx("hot-plug rootfs disk")?;
-            info!("rootfs disk hot-plugged: {disk_id}");
+        match boot_role {
+            BootRole::First => {
+                // First container — boot VM with rootfs pre-attached as /dev/vdb
+                let extra_disk = VmDisk {
+                    path: rootfs_disk_path.to_string_lossy().to_string(),
+                    readonly: false,
+                    id: Some(disk_id.clone()),
+                };
+                let boot_result = vm_state
+                    .vm
+                    .create_and_boot_vm(
+                        vm_state.tap_name.as_deref(),
+                        vm_state.tap_mac.as_deref(),
+                        vec![extra_disk],
+                    )
+                    .await;
+
+                if let Err(e) = boot_result {
+                    let msg = format!("{e:#}");
+                    *vm_state.boot_state.lock().await = BootState::Failed(msg.clone());
+                    vm_state.boot_complete.notify_waiters();
+                    return Err(Error::Any(anyhow::anyhow!("boot with rootfs: {msg}")));
+                }
+                info!("VM booted with pre-attached rootfs: {disk_id}");
+
+                // Connect to agent — confirms VM is fully booted and agent is responsive
+                match get_or_connect_agent(&vm_state).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        *vm_state.boot_state.lock().await = BootState::Failed(msg.clone());
+                        vm_state.boot_complete.notify_waiters();
+                        return Err(Error::Any(anyhow::anyhow!("agent connect after boot: {msg}")));
+                    }
+                }
+
+                // Mark boot as complete and wake any waiting containers
+                *vm_state.boot_state.lock().await = BootState::Booted;
+                vm_state.boot_complete.notify_waiters();
+
+                // Place CH in pod cgroup now that the VM is running
+                if let Some(ref cg) = vm_state.cgroups_path {
+                    let ch_pid = vm_state.vm.ch_pid().unwrap_or(std::process::id());
+                    if let Err(e) = place_in_pod_cgroup(ch_pid, cg) {
+                        info!("cgroup placement failed (non-fatal): {e}");
+                    } else {
+                        info!("CH pid {ch_pid} placed in pod cgroup: {cg}");
+                    }
+                }
+            }
+            BootRole::Subsequent => {
+                // Wait for boot to complete (first container drives boot)
+                loop {
+                    let state = vm_state.boot_state.lock().await.clone();
+                    match state {
+                        BootState::Booted => break,
+                        BootState::Failed(msg) => {
+                            return Err(Error::Any(anyhow::anyhow!(
+                                "VM boot previously failed: {msg}"
+                            )));
+                        }
+                        _ => {
+                            // Still booting — wait for notification
+                            vm_state.boot_complete.notified().await;
+                        }
+                    }
+                }
+
+                // Hot-plug disk for this container
+                let api_socket = vm_state.api_socket.clone();
+                let disk_json = serde_json::json!({
+                    "path": rootfs_disk_path.to_string_lossy(),
+                    "readonly": false,
+                    "id": &disk_id,
+                });
+                VmManager::api_request_to_socket(
+                    &api_socket,
+                    "PUT",
+                    "/api/v1/vm.add-disk",
+                    Some(&disk_json.to_string()),
+                )
+                .await
+                .ctx("hot-plug rootfs disk")?;
+                info!("rootfs disk hot-plugged: {disk_id}");
+            }
         }
 
         let agent = get_or_connect_agent(&vm_state).await?;

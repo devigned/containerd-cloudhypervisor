@@ -14,6 +14,29 @@ use crate::container::ContainerManager;
 
 // --- AgentService implementation ---
 
+/// Convert proto VolumeMount list to VolumeInfo for the container manager.
+fn proto_volumes_to_info(volumes: &[VolumeMount]) -> Vec<crate::container::VolumeInfo> {
+    volumes
+        .iter()
+        .map(|v| crate::container::VolumeInfo {
+            destination: v.destination.clone(),
+            source: v.source.clone(),
+            readonly: v.readonly,
+            is_block: v.volume_type == crate::proto::agent::VolumeType::BLOCK.into(),
+            fs_type: v.fs_type.clone(),
+            inline_files: v
+                .files
+                .iter()
+                .map(|f| crate::container::InlineFileInfo {
+                    path: f.path.clone(),
+                    content: f.content.clone(),
+                    mode: f.mode,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 struct AgentServiceHandler {
     container_manager: Arc<tokio::sync::Mutex<ContainerManager>>,
 }
@@ -27,26 +50,7 @@ impl AgentService for AgentServiceHandler {
     ) -> ttrpc::Result<CreateContainerResponse> {
         info!("RPC: create_container id={}", req.container_id);
         let mut mgr = self.container_manager.lock().await;
-        let volumes: Vec<crate::container::VolumeInfo> = req
-            .volumes
-            .iter()
-            .map(|v| crate::container::VolumeInfo {
-                destination: v.destination.clone(),
-                source: v.source.clone(),
-                readonly: v.readonly,
-                is_block: v.volume_type == crate::proto::agent::VolumeType::BLOCK.into(),
-                fs_type: v.fs_type.clone(),
-                inline_files: v
-                    .files
-                    .iter()
-                    .map(|f| crate::container::InlineFileInfo {
-                        path: f.path.clone(),
-                        content: f.content.clone(),
-                        mode: f.mode,
-                    })
-                    .collect(),
-            })
-            .collect();
+        let volumes = proto_volumes_to_info(&req.volumes);
         let pid = mgr
             .create(
                 &req.container_id,
@@ -85,26 +89,7 @@ impl AgentService for AgentServiceHandler {
     ) -> ttrpc::Result<StartContainerResponse> {
         info!("RPC: run_container id={}", req.container_id);
         let mut mgr = self.container_manager.lock().await;
-        let volumes: Vec<crate::container::VolumeInfo> = req
-            .volumes
-            .iter()
-            .map(|v| crate::container::VolumeInfo {
-                destination: v.destination.clone(),
-                source: v.source.clone(),
-                readonly: v.readonly,
-                is_block: v.volume_type == crate::proto::agent::VolumeType::BLOCK.into(),
-                fs_type: v.fs_type.clone(),
-                inline_files: v
-                    .files
-                    .iter()
-                    .map(|f| crate::container::InlineFileInfo {
-                        path: f.path.clone(),
-                        content: f.content.clone(),
-                        mode: f.mode,
-                    })
-                    .collect(),
-            })
-            .collect();
+        let volumes = proto_volumes_to_info(&req.volumes);
         let pid = mgr
             .run(
                 &req.container_id,
