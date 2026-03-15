@@ -14,6 +14,29 @@ use crate::container::ContainerManager;
 
 // --- AgentService implementation ---
 
+/// Convert proto VolumeMount list to VolumeInfo for the container manager.
+fn proto_volumes_to_info(volumes: &[VolumeMount]) -> Vec<crate::container::VolumeInfo> {
+    volumes
+        .iter()
+        .map(|v| crate::container::VolumeInfo {
+            destination: v.destination.clone(),
+            source: v.source.clone(),
+            readonly: v.readonly,
+            is_block: v.volume_type == crate::proto::agent::VolumeType::BLOCK.into(),
+            fs_type: v.fs_type.clone(),
+            inline_files: v
+                .files
+                .iter()
+                .map(|f| crate::container::InlineFileInfo {
+                    path: f.path.clone(),
+                    content: f.content.clone(),
+                    mode: f.mode,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 struct AgentServiceHandler {
     container_manager: Arc<tokio::sync::Mutex<ContainerManager>>,
 }
@@ -27,32 +50,14 @@ impl AgentService for AgentServiceHandler {
     ) -> ttrpc::Result<CreateContainerResponse> {
         info!("RPC: create_container id={}", req.container_id);
         let mut mgr = self.container_manager.lock().await;
-        let volumes: Vec<crate::container::VolumeInfo> = req
-            .volumes
-            .iter()
-            .map(|v| crate::container::VolumeInfo {
-                destination: v.destination.clone(),
-                source: v.source.clone(),
-                readonly: v.readonly,
-                is_block: v.volume_type == crate::proto::agent::VolumeType::BLOCK.into(),
-                fs_type: v.fs_type.clone(),
-                inline_files: v
-                    .files
-                    .iter()
-                    .map(|f| crate::container::InlineFileInfo {
-                        path: f.path.clone(),
-                        content: f.content.clone(),
-                        mode: f.mode,
-                    })
-                    .collect(),
-            })
-            .collect();
+        let volumes = proto_volumes_to_info(&req.volumes);
         let pid = mgr
             .create(
                 &req.container_id,
                 &req.bundle_path,
                 &volumes,
                 &req.config_json,
+                req.rootfs_preattached,
             )
             .await
             .map_err(|e| ttrpc::Error::Others(format!("create_container failed: {e:#}")))?;
@@ -72,6 +77,29 @@ impl AgentService for AgentServiceHandler {
             .start(&req.container_id)
             .await
             .map_err(|e| ttrpc::Error::Others(format!("start_container failed: {e}")))?;
+        let mut resp = StartContainerResponse::new();
+        resp.pid = pid;
+        Ok(resp)
+    }
+
+    async fn run_container(
+        &self,
+        _ctx: &TtrpcContext,
+        req: CreateContainerRequest,
+    ) -> ttrpc::Result<StartContainerResponse> {
+        info!("RPC: run_container id={}", req.container_id);
+        let mut mgr = self.container_manager.lock().await;
+        let volumes = proto_volumes_to_info(&req.volumes);
+        let pid = mgr
+            .run(
+                &req.container_id,
+                &req.bundle_path,
+                &volumes,
+                &req.config_json,
+                req.rootfs_preattached,
+            )
+            .await
+            .map_err(|e| ttrpc::Error::Others(format!("run_container failed: {e:#}")))?;
         let mut resp = StartContainerResponse::new();
         resp.pid = pid;
         Ok(resp)

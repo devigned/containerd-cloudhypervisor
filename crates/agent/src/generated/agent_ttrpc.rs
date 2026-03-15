@@ -41,6 +41,11 @@ impl AgentServiceClient {
         ::ttrpc::async_client_request!(self, ctx, req, "cloudhv.agent.AgentService", "StartContainer", cres);
     }
 
+    pub async fn run_container(&self, ctx: ttrpc::context::Context, req: &super::agent::CreateContainerRequest) -> ::ttrpc::Result<super::agent::StartContainerResponse> {
+        let mut cres = super::agent::StartContainerResponse::new();
+        ::ttrpc::async_client_request!(self, ctx, req, "cloudhv.agent.AgentService", "RunContainer", cres);
+    }
+
     pub async fn kill_container(&self, ctx: ttrpc::context::Context, req: &super::agent::KillContainerRequest) -> ::ttrpc::Result<super::agent::KillContainerResponse> {
         let mut cres = super::agent::KillContainerResponse::new();
         ::ttrpc::async_client_request!(self, ctx, req, "cloudhv.agent.AgentService", "KillContainer", cres);
@@ -96,6 +101,17 @@ struct StartContainerMethod {
 impl ::ttrpc::r#async::MethodHandler for StartContainerMethod {
     async fn handler(&self, ctx: ::ttrpc::r#async::TtrpcContext, req: ::ttrpc::Request) -> ::ttrpc::Result<::ttrpc::Response> {
         ::ttrpc::async_request_handler!(self, ctx, req, agent, StartContainerRequest, start_container);
+    }
+}
+
+struct RunContainerMethod {
+    service: Arc<dyn AgentService + Send + Sync>,
+}
+
+#[async_trait]
+impl ::ttrpc::r#async::MethodHandler for RunContainerMethod {
+    async fn handler(&self, ctx: ::ttrpc::r#async::TtrpcContext, req: ::ttrpc::Request) -> ::ttrpc::Result<::ttrpc::Response> {
+        ::ttrpc::async_request_handler!(self, ctx, req, agent, CreateContainerRequest, run_container);
     }
 }
 
@@ -184,6 +200,9 @@ pub trait AgentService: Sync {
     async fn start_container(&self, _ctx: &::ttrpc::r#async::TtrpcContext, _: super::agent::StartContainerRequest) -> ::ttrpc::Result<super::agent::StartContainerResponse> {
         Err(::ttrpc::Error::RpcStatus(::ttrpc::get_status(::ttrpc::Code::NOT_FOUND, "/cloudhv.agent.AgentService/StartContainer is not supported".to_string())))
     }
+    async fn run_container(&self, _ctx: &::ttrpc::r#async::TtrpcContext, _: super::agent::CreateContainerRequest) -> ::ttrpc::Result<super::agent::StartContainerResponse> {
+        Err(::ttrpc::Error::RpcStatus(::ttrpc::get_status(::ttrpc::Code::NOT_FOUND, "/cloudhv.agent.AgentService/RunContainer is not supported".to_string())))
+    }
     async fn kill_container(&self, _ctx: &::ttrpc::r#async::TtrpcContext, _: super::agent::KillContainerRequest) -> ::ttrpc::Result<super::agent::KillContainerResponse> {
         Err(::ttrpc::Error::RpcStatus(::ttrpc::get_status(::ttrpc::Code::NOT_FOUND, "/cloudhv.agent.AgentService/KillContainer is not supported".to_string())))
     }
@@ -217,6 +236,9 @@ pub fn create_agent_service(service: Arc<dyn AgentService + Send + Sync>) -> Has
 
     methods.insert("StartContainer".to_string(),
                     Box::new(StartContainerMethod{service: service.clone()}) as Box<dyn ::ttrpc::r#async::MethodHandler + Send + Sync>);
+
+    methods.insert("RunContainer".to_string(),
+                    Box::new(RunContainerMethod{service: service.clone()}) as Box<dyn ::ttrpc::r#async::MethodHandler + Send + Sync>);
 
     methods.insert("KillContainer".to_string(),
                     Box::new(KillContainerMethod{service: service.clone()}) as Box<dyn ::ttrpc::r#async::MethodHandler + Send + Sync>);

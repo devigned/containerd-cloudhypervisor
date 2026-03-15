@@ -176,10 +176,15 @@ impl VmManager {
     /// If `tap_device` is provided, a virtio-net device is attached to the
     /// VM using the named TAP device. The kernel cmdline should include
     /// `ip=...` parameters for network configuration.
+    ///
+    /// `extra_disks` allows pre-attaching additional disks (e.g., container
+    /// rootfs) at boot time so they are available from the instant the
+    /// kernel starts, avoiding post-boot hot-plug discovery latency.
     pub async fn create_and_boot_vm(
         &self,
         tap_device: Option<&str>,
         tap_mac: Option<&str>,
+        extra_disks: Vec<VmDisk>,
     ) -> Result<()> {
         let net = match tap_device {
             Some(tap) => vec![VmNet {
@@ -219,11 +224,15 @@ impl VmManager {
                     None
                 },
             },
-            disks: vec![VmDisk {
-                path: self.config.rootfs_path.clone(),
-                readonly: false,
-                id: None,
-            }],
+            disks: {
+                let mut disks = vec![VmDisk {
+                    path: self.config.rootfs_path.clone(),
+                    readonly: false,
+                    id: None,
+                }];
+                disks.extend(extra_disks);
+                disks
+            },
             net,
             fs: vec![],
             vsock: Some(VmVsock {

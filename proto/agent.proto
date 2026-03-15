@@ -13,6 +13,9 @@ service AgentService {
     // StartContainer starts a previously created container.
     rpc StartContainer(StartContainerRequest) returns (StartContainerResponse);
 
+    // RunContainer creates and starts a container atomically (create + start in one call).
+    rpc RunContainer(CreateContainerRequest) returns (StartContainerResponse);
+
     // KillContainer sends a signal to a running container.
     rpc KillContainer(KillContainerRequest) returns (KillContainerResponse);
 
@@ -59,6 +62,9 @@ message CreateContainerRequest {
     // When non-empty, the agent writes this to the container's bundle
     // directory on the mounted rootfs disk, overriding any on-disk copy.
     bytes config_json = 8;
+    // When true, the rootfs disk was pre-attached at VM boot time and is
+    // available at /dev/vdb. Skip discover_and_mount_new_disk polling.
+    bool rootfs_preattached = 10;
 }
 
 // A volume mount to inject into the container's OCI spec.

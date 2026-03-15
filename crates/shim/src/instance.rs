@@ -10,6 +10,8 @@ use containerd_shimkit::sandbox::Error;
 use log::info;
 use tokio::sync::OnceCell;
 
+use cloudhv_common::types::VmDisk;
+
 use crate::config::load_config;
 use crate::vm::VmManager;
 
@@ -44,6 +46,19 @@ fn get_vm(sandbox_id: &str) -> Option<Arc<SharedVmState>> {
         .cloned()
 }
 
+/// Tracks the VM boot lifecycle so concurrent containers can synchronize.
+#[derive(Debug, Clone, PartialEq)]
+enum BootState {
+    /// VM process is running but vm.create/boot has not been called yet.
+    NotBooted,
+    /// First container is currently booting the VM.
+    Booting,
+    /// VM booted and agent connected successfully.
+    Booted,
+    /// VM boot failed — subsequent containers should not proceed.
+    Failed(String),
+}
+
 /// Shared state for a running VM (one per pod).
 struct SharedVmState {
     vm: VmManager,
@@ -52,6 +67,12 @@ struct SharedVmState {
     shared_dir: PathBuf,
     container_count: AtomicUsize,
     api_socket: PathBuf,
+    boot_state: tokio::sync::Mutex<BootState>,
+    boot_complete: tokio::sync::Notify,
+    // Store sandbox boot config for deferred boot
+    tap_name: Option<String>,
+    tap_mac: Option<String>,
+    cgroups_path: Option<String>,
 }
 
 /// Lazily connect to the guest agent over vsock, caching the client in the
@@ -282,29 +303,15 @@ impl CloudHvInstance {
 
         vm.wait_vmm_ready().await.ctx("vmm")?;
 
-        vm.create_and_boot_vm(tap_name.as_deref(), tap_mac.as_deref())
-            .await
-            .ctx("boot")?;
-
-        // Agent connection is deferred until the first container needs it
-        // (see get_or_connect_agent). This removes wait_for_agent and
-        // connect_ttrpc from the critical sandbox-start path.
+        // VM boot is deferred to start_container() — the CH process is
+        // spawned and listening on the API socket, but the VM is not yet
+        // created/booted.  The first container's rootfs will be pre-attached
+        // at boot time as /dev/vdb, eliminating hot-plug discovery latency.
 
         let vsock_socket = vm.vsock_socket().to_path_buf();
         let shared_dir = vm.shared_dir().to_path_buf();
         let api_socket = vm.api_socket_path().to_path_buf();
         let ch_pid = vm.ch_pid().unwrap_or(std::process::id());
-
-        // Place the Cloud Hypervisor process into the pod's cgroup so that
-        // kubectl top, HPA, and cAdvisor see the full VM resource usage
-        // (VMM process RSS, vCPU thread CPU time, mmap'd guest memory).
-        if let Some(ref cg_path) = sandbox_spec.cgroups_path {
-            if let Err(e) = place_in_pod_cgroup(ch_pid, cg_path) {
-                info!("cgroup placement failed (non-fatal): {e}");
-            } else {
-                info!("CH pid {ch_pid} placed in pod cgroup: {cg_path}");
-            }
-        }
 
         // Start memory monitor if hotplug is configured
         if config.hotplug_memory_mb > 0 {
@@ -334,6 +341,11 @@ impl CloudHvInstance {
             shared_dir,
             container_count: AtomicUsize::new(1), // sandbox itself counts
             api_socket,
+            boot_state: tokio::sync::Mutex::new(BootState::NotBooted),
+            boot_complete: tokio::sync::Notify::new(),
+            tap_name,
+            tap_mac,
+            cgroups_path: sandbox_spec.cgroups_path.clone(),
         });
 
         VMS.write()
@@ -353,7 +365,6 @@ impl CloudHvInstance {
             Error::Any(anyhow::anyhow!("sandbox VM not found: {}", self.sandbox_id))
         })?;
 
-        let agent = get_or_connect_agent(&vm_state).await?;
         let shared_dir = &vm_state.shared_dir;
 
         let rootfs_path = self.bundle.join("rootfs");
@@ -365,8 +376,6 @@ impl CloudHvInstance {
         let volumes = extract_volumes(&spec_path).ctx("extract volumes")?;
 
         // Check if rootfs is backed by a block device (devmapper snapshotter).
-        // With devmapper, containerd mounts a thin snapshot at the rootfs path.
-        // We can pass the backing block device directly to the VM — zero image creation.
         let rootfs_block_dev = detect_block_backing(&rootfs_path);
 
         let rootfs_disk_path = if let Some(block_dev) = &rootfs_block_dev {
@@ -380,9 +389,6 @@ impl CloudHvInstance {
             // Tier 2: create ext4 cache image from overlayfs directory
             let disk_path = parent_dir.join(format!("{disk_id}.img"));
 
-            // Rootfs image cache: cache per unique rootfs content, clone for each container.
-            // Config.json and volume data are sent inline via the RPC and the
-            // agent writes them to tmpfs inside the VM.
             let cache_dir = std::path::PathBuf::from("/opt/cloudhv/cache");
             let rootfs_clone = rootfs_path.clone();
 
@@ -394,15 +400,11 @@ impl CloudHvInstance {
             let cached_img = cache_dir.join(format!("{cache_key}.img"));
             let rootfs_disk_path = parent_dir.join(format!("{disk_id}.img"));
 
-            // Ensure rootfs base image is cached (one-time cost per container image).
-            // Multiple shim processes may race here — use a lock file to serialize
-            // cache creation for the same hash.
             if !cached_img.exists() {
                 info!("rootfs cache miss for {cache_key}, creating base image");
                 let rootfs_for_cache = rootfs_path.clone();
                 let cached_img_clone = cached_img.clone();
                 tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                    // Ensure cache directory exists before creating lock file
                     if let Some(parent) = cached_img_clone.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
@@ -411,7 +413,6 @@ impl CloudHvInstance {
                     let lock_file = std::fs::File::create(&lock_path)
                         .map_err(|e| anyhow::anyhow!("create cache lock: {e}"))?;
 
-                    // Exclusive flock — blocks until we own the lock
                     let fd = std::os::unix::io::AsRawFd::as_raw_fd(&lock_file);
                     let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
                     if ret != 0 {
@@ -421,7 +422,6 @@ impl CloudHvInstance {
                         ));
                     }
 
-                    // Re-check after acquiring lock (another process may have created it)
                     if cached_img_clone.exists() {
                         log::info!(
                             "cache populated by another process: {}",
@@ -430,11 +430,9 @@ impl CloudHvInstance {
                         return Ok(());
                     }
 
-                    // Write to a temp file then atomic-rename
                     let tmp_path = cached_img_clone.with_extension("img.tmp");
                     create_cached_rootfs_image(&rootfs_for_cache, &tmp_path)?;
 
-                    // fsync the temp file to ensure it's fully flushed to disk
                     let f = std::fs::File::open(&tmp_path)?;
                     f.sync_all()?;
                     drop(f);
@@ -444,7 +442,6 @@ impl CloudHvInstance {
                         anyhow::anyhow!("cache rename failed: {e}")
                     })?;
 
-                    // Flush lock file (drop releases the flock)
                     drop(lock_file);
                     std::fs::remove_file(&lock_path).ok();
                     Ok(())
@@ -456,7 +453,6 @@ impl CloudHvInstance {
                 info!("rootfs cache hit for {cache_key}");
             }
 
-            // Clone cached rootfs image (fast cp)
             let cached_src = cached_img.clone();
             let rootfs_dst = rootfs_disk_path.clone();
             tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
@@ -468,25 +464,123 @@ impl CloudHvInstance {
             .ctx("copy cached rootfs")?;
 
             disk_path
-        }; // end of block device vs image creation branch
+        };
 
-        // Hot-plug the rootfs disk into the VM
-        let readonly = false; // devmapper snapshots are COW
+        // Determine boot role: first container boots the VM, others wait.
+        enum BootRole {
+            First,
+            Subsequent,
+        }
+
+        let boot_role = {
+            let mut state = vm_state.boot_state.lock().await;
+            match &*state {
+                BootState::NotBooted => {
+                    *state = BootState::Booting;
+                    BootRole::First
+                }
+                BootState::Booting => BootRole::Subsequent,
+                BootState::Booted => BootRole::Subsequent,
+                BootState::Failed(msg) => {
+                    return Err(Error::Any(anyhow::anyhow!(
+                        "VM boot previously failed: {msg}"
+                    )));
+                }
+            }
+        };
+        let is_first_container = matches!(boot_role, BootRole::First);
+
+        match boot_role {
+            BootRole::First => {
+                // First container — boot VM with rootfs pre-attached as /dev/vdb
+                let extra_disk = VmDisk {
+                    path: rootfs_disk_path.to_string_lossy().to_string(),
+                    readonly: false,
+                    id: Some(disk_id.clone()),
+                };
+                let boot_result = vm_state
+                    .vm
+                    .create_and_boot_vm(
+                        vm_state.tap_name.as_deref(),
+                        vm_state.tap_mac.as_deref(),
+                        vec![extra_disk],
+                    )
+                    .await;
+
+                if let Err(e) = boot_result {
+                    let msg = format!("{e:#}");
+                    *vm_state.boot_state.lock().await = BootState::Failed(msg.clone());
+                    vm_state.boot_complete.notify_waiters();
+                    return Err(Error::Any(anyhow::anyhow!("boot with rootfs: {msg}")));
+                }
+                info!("VM booted with pre-attached rootfs: {disk_id}");
+
+                // Connect to agent — confirms VM is fully booted and agent is responsive
+                match get_or_connect_agent(&vm_state).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        *vm_state.boot_state.lock().await = BootState::Failed(msg.clone());
+                        vm_state.boot_complete.notify_waiters();
+                        return Err(Error::Any(anyhow::anyhow!(
+                            "agent connect after boot: {msg}"
+                        )));
+                    }
+                }
+
+                // Mark boot as complete and wake any waiting containers
+                *vm_state.boot_state.lock().await = BootState::Booted;
+                vm_state.boot_complete.notify_waiters();
+
+                // Place CH in pod cgroup now that the VM is running
+                if let Some(ref cg) = vm_state.cgroups_path {
+                    let ch_pid = vm_state.vm.ch_pid().unwrap_or(std::process::id());
+                    if let Err(e) = place_in_pod_cgroup(ch_pid, cg) {
+                        info!("cgroup placement failed (non-fatal): {e}");
+                    } else {
+                        info!("CH pid {ch_pid} placed in pod cgroup: {cg}");
+                    }
+                }
+            }
+            BootRole::Subsequent => {
+                // Wait for boot to complete (first container drives boot)
+                loop {
+                    let state = vm_state.boot_state.lock().await.clone();
+                    match state {
+                        BootState::Booted => break,
+                        BootState::Failed(msg) => {
+                            return Err(Error::Any(anyhow::anyhow!(
+                                "VM boot previously failed: {msg}"
+                            )));
+                        }
+                        _ => {
+                            // Still booting — wait for notification
+                            vm_state.boot_complete.notified().await;
+                        }
+                    }
+                }
+
+                // Hot-plug disk for this container
+                let api_socket = vm_state.api_socket.clone();
+                let disk_json = serde_json::json!({
+                    "path": rootfs_disk_path.to_string_lossy(),
+                    "readonly": false,
+                    "id": &disk_id,
+                });
+                VmManager::api_request_to_socket(
+                    &api_socket,
+                    "PUT",
+                    "/api/v1/vm.add-disk",
+                    Some(&disk_json.to_string()),
+                )
+                .await
+                .ctx("hot-plug rootfs disk")?;
+                info!("rootfs disk hot-plugged: {disk_id}");
+            }
+        }
+
+        let agent = get_or_connect_agent(&vm_state).await?;
         let api_socket = vm_state.api_socket.clone();
-        let disk_json = serde_json::json!({
-            "path": rootfs_disk_path.to_string_lossy(),
-            "readonly": readonly,
-            "id": &disk_id,
-        });
-        VmManager::api_request_to_socket(
-            &api_socket,
-            "PUT",
-            "/api/v1/vm.add-disk",
-            Some(&disk_json.to_string()),
-        )
-        .await
-        .ctx("hot-plug rootfs disk")?;
-        info!("rootfs disk hot-plugged: {disk_id}");
 
         // Hot-plug separate empty disks for emptyDir volumes.
         for vol in &volumes {
@@ -530,56 +624,59 @@ impl CloudHvInstance {
         let config_json_bytes =
             std::fs::read(&spec_path).ctx("read config.json for inline delivery")?;
 
-        // Read filesystem volume files to send inline
-        // (ConfigMaps/Secrets are small — K8s caps at 1MB)
-        {
-            let mut create_req = cloudhv_proto::CreateContainerRequest::new();
-            create_req.container_id = container_id.to_string();
-            create_req.bundle_path = bundle_guest.clone();
-            create_req.config_json = config_json_bytes;
-            for vol in &volumes {
-                let mut vm = cloudhv_proto::VolumeMount::new();
-                vm.destination = vol.destination.clone();
-                if vol.is_block || vol.is_empty_dir {
-                    vm.source = vol.source.clone();
-                    vm.volume_type = cloudhv_proto::VolumeType::BLOCK.into();
-                    vm.fs_type = if vol.is_empty_dir {
-                        "ext4".to_string()
-                    } else {
-                        vol.fs_type.clone()
-                    };
+        // Build the CreateContainerRequest
+        let mut create_req = cloudhv_proto::CreateContainerRequest::new();
+        create_req.container_id = container_id.to_string();
+        create_req.bundle_path = bundle_guest.clone();
+        create_req.config_json = config_json_bytes;
+        create_req.rootfs_preattached = is_first_container;
+        for vol in &volumes {
+            let mut vm = cloudhv_proto::VolumeMount::new();
+            vm.destination = vol.destination.clone();
+            if vol.is_block || vol.is_empty_dir {
+                vm.source = vol.source.clone();
+                vm.volume_type = cloudhv_proto::VolumeType::BLOCK.into();
+                vm.fs_type = if vol.is_empty_dir {
+                    "ext4".to_string()
                 } else {
-                    // Filesystem volume: send files inline, agent writes to tmpfs
-                    vm.source = format!("{}/volumes/{}", bundle_guest, vol.volume_id);
-                    vm.volume_type = cloudhv_proto::VolumeType::FILESYSTEM.into();
-                    // Read all files from the volume source directory
-                    let src = std::path::Path::new(&vol.source);
-                    let entries =
-                        read_volume_files(src).ctx("read volume files for inline delivery")?;
-                    for (rel_path, content, mode) in entries {
-                        let mut inline_file = cloudhv_proto::InlineFile::new();
-                        inline_file.path = rel_path;
-                        inline_file.content = content;
-                        inline_file.mode = mode;
-                        vm.files.push(inline_file);
-                    }
+                    vol.fs_type.clone()
+                };
+            } else {
+                // Filesystem volume: send files inline, agent writes to tmpfs
+                vm.source = format!("{}/volumes/{}", bundle_guest, vol.volume_id);
+                vm.volume_type = cloudhv_proto::VolumeType::FILESYSTEM.into();
+                let src = std::path::Path::new(&vol.source);
+                let entries =
+                    read_volume_files(src).ctx("read volume files for inline delivery")?;
+                for (rel_path, content, mode) in entries {
+                    let mut inline_file = cloudhv_proto::InlineFile::new();
+                    inline_file.path = rel_path;
+                    inline_file.content = content;
+                    inline_file.mode = mode;
+                    vm.files.push(inline_file);
                 }
-                vm.readonly = vol.readonly;
-                create_req.volumes.push(vm);
             }
-            let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
-            agent.create_container(ctx, &create_req).await
+            vm.readonly = vol.readonly;
+            create_req.volumes.push(vm);
         }
-        .ctx("CreateContainer RPC error")?;
 
-        // Start the container
-        let start_resp = {
+        let start_resp = if is_first_container {
+            // First container — use RunContainer (create + start atomically)
+            let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
+            agent.run_container(ctx, &create_req).await
+        } else {
+            // Subsequent containers — create then start separately
+            {
+                let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
+                agent.create_container(ctx, &create_req).await
+            }
+            .ctx("CreateContainer RPC error")?;
             let mut start_req = cloudhv_proto::StartContainerRequest::new();
             start_req.container_id = container_id.to_string();
             let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
             agent.start_container(ctx, &start_req).await
         }
-        .ctx("StartContainer RPC error")?;
+        .ctx("start container RPC error")?;
 
         vm_state.container_count.fetch_add(1, Ordering::SeqCst);
 
@@ -795,48 +892,27 @@ fn to_systemd_cgroup_path(cgroups_path: &str) -> String {
 
 /// Detect if a directory is backed by a block device (e.g., devmapper snapshot).
 ///
-/// Uses `findmnt` to check the mount source. If the source is a block device
-/// (or a symlink to one, like `/dev/mapper/containerd-pool-snap-N`), returns
-/// the resolved path. Returns None for overlayfs or other non-block mounts.
+/// Parses `/proc/self/mountinfo` to find the mount source. If the source is a
+/// devmapper device (`/dev/mapper/*` or `/dev/dm-*`), returns the path.
+/// Returns None for overlayfs, tmpfs, or other non-devmapper mounts.
 fn detect_block_backing(path: &std::path::Path) -> Option<std::path::PathBuf> {
-    let output = std::process::Command::new("findmnt")
-        .args(["-n", "-o", "SOURCE"])
-        .arg(path)
-        .output()
-        .ok()?;
-
-    let source = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if source.is_empty() || source == "overlay" || source == "tmpfs" {
-        return None;
-    }
-
-    let source_path = std::path::PathBuf::from(&source);
-    // Resolve symlinks (e.g., /dev/mapper/containerd-pool-snap-N → /dev/dm-1)
-    let resolved = std::fs::canonicalize(&source_path).unwrap_or(source_path.clone());
-
-    // Verify it's actually a block device
-    if resolved
-        .metadata()
-        .map(|m| {
-            use std::os::unix::fs::FileTypeExt;
-            m.file_type().is_block_device()
-        })
-        .unwrap_or(false)
-    {
-        // Only pass through devmapper devices — other block-backed snapshotters
-        // (btrfs, zfs) report their backing device which is the host filesystem,
-        // not a per-container snapshot.
-        let source_str = source_path.to_string_lossy();
-        if !source_str.starts_with("/dev/mapper/") && !source_str.starts_with("/dev/dm-") {
-            return None;
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let path_str = path.to_string_lossy();
+    for line in mountinfo.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        // mountinfo format: id parent major:minor root mount_point options ... - fs_type source super_options
+        if parts.len() > 4 && parts[4] == path_str.as_ref() {
+            if let Some(sep) = parts.iter().position(|&p| p == "-") {
+                if parts.len() > sep + 2 {
+                    let src = parts[sep + 2];
+                    if src.starts_with("/dev/mapper/") || src.starts_with("/dev/dm-") {
+                        return Some(std::path::PathBuf::from(src));
+                    }
+                }
+            }
         }
-
-        // Return the original path (symlink), not the resolved one,
-        // because CH needs a stable path
-        Some(source_path)
-    } else {
-        None
     }
+    None
 }
 
 /// Parsed sandbox configuration from the OCI spec.
