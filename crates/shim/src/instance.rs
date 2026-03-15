@@ -177,12 +177,14 @@ impl Instance for CloudHvInstance {
         let vm_state = get_vm(&self.sandbox_id);
 
         if let Some(vm_state) = vm_state {
-            // Best-effort delete RPC (skip if agent never connected)
+            // Best-effort delete RPC — use a short timeout since the VM may
+            // already be dead (crash, liveness probe kill). A long timeout here
+            // blocks containerd's snapshot cleanup, causing "device busy" loops.
             if let Some(agent) = vm_state.agent.get() {
                 let cid = self.id.clone();
                 let mut del_req = cloudhv_proto::DeleteContainerRequest::new();
                 del_req.container_id = cid;
-                let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(10));
+                let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(2));
                 let _ = agent.delete_container(ctx, &del_req).await;
             }
 
