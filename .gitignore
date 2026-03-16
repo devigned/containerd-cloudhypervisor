@@ -1,6 +1,11 @@
 # Build artifacts
 /target/
 **/target/
+_build/
+vmlinux*
+root.erofs
+cloudhv-agent
+containerd-shim-cloudhv-v1
 
 # Cargo lock for binaries is committed
 # Cargo.lock

@@ -152,7 +152,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.rootfs_artifact }}
-          path: guest/rootfs/rootfs.ext4
+          path: guest/rootfs/rootfs.erofs
 
   build-installer-image:
     name: Build Installer Image
@@ -203,7 +203,7 @@ jobs:
           cp /tmp/artifacts/containerd-shim-cloudhv-v1-x86_64-unknown-linux-musl/containerd-shim-cloudhv-v1 \
             /tmp/image-root-amd64/opt/cloudhv/
           cp /tmp/artifacts/vmlinux-x86_64/vmlinux /tmp/image-root-amd64/opt/cloudhv/
-          cp /tmp/artifacts/rootfs-x86_64/rootfs.ext4 /tmp/image-root-amd64/opt/cloudhv/
+          cp /tmp/artifacts/rootfs-x86_64/rootfs.erofs /tmp/image-root-amd64/opt/cloudhv/
           cp installer/install.sh /tmp/image-root-amd64/opt/cloudhv/
           chmod +x /tmp/image-root-amd64/opt/cloudhv/containerd-shim-cloudhv-v1
           chmod +x /tmp/image-root-amd64/opt/cloudhv/install.sh
@@ -215,7 +215,7 @@ jobs:
           cp /tmp/artifacts/containerd-shim-cloudhv-v1-aarch64-unknown-linux-musl/containerd-shim-cloudhv-v1 \
             /tmp/image-root-arm64/opt/cloudhv/
           cp /tmp/artifacts/vmlinux-aarch64/vmlinux /tmp/image-root-arm64/opt/cloudhv/
-          cp /tmp/artifacts/rootfs-aarch64/rootfs.ext4 /tmp/image-root-arm64/opt/cloudhv/
+          cp /tmp/artifacts/rootfs-aarch64/rootfs.erofs /tmp/image-root-arm64/opt/cloudhv/
           cp installer/install.sh /tmp/image-root-arm64/opt/cloudhv/
           chmod +x /tmp/image-root-arm64/opt/cloudhv/containerd-shim-cloudhv-v1
           chmod +x /tmp/image-root-arm64/opt/cloudhv/install.sh
@@ -336,7 +336,7 @@ jobs:
           cp /tmp/artifacts/cloudhv-agent-x86_64-unknown-linux-musl/cloudhv-agent \
             /tmp/release/cloudhv-agent-linux-amd64
           cp /tmp/artifacts/vmlinux-x86_64/vmlinux /tmp/release/vmlinux-amd64
-          cp /tmp/artifacts/rootfs-x86_64/rootfs.ext4 /tmp/release/rootfs-amd64.ext4
+          cp /tmp/artifacts/rootfs-x86_64/rootfs.erofs /tmp/release/rootfs-amd64.erofs
           chmod +x /tmp/release/containerd-shim-cloudhv-v1-linux-amd64
           chmod +x /tmp/release/cloudhv-agent-linux-amd64
           # aarch64
@@ -345,7 +345,7 @@ jobs:
           cp /tmp/artifacts/cloudhv-agent-aarch64-unknown-linux-musl/cloudhv-agent \
             /tmp/release/cloudhv-agent-linux-arm64
           cp /tmp/artifacts/vmlinux-aarch64/vmlinux /tmp/release/vmlinux-arm64
-          cp /tmp/artifacts/rootfs-aarch64/rootfs.ext4 /tmp/release/rootfs-arm64.ext4
+          cp /tmp/artifacts/rootfs-aarch64/rootfs.erofs /tmp/release/rootfs-arm64.erofs
           chmod +x /tmp/release/containerd-shim-cloudhv-v1-linux-arm64
           chmod +x /tmp/release/cloudhv-agent-linux-arm64
           # Generate checksums
@@ -410,7 +410,7 @@ jobs:
           ```bash
           sudo install -m 755 containerd-shim-cloudhv-v1-linux-amd64 /usr/local/bin/containerd-shim-cloudhv-v1
           sudo mkdir -p /opt/cloudhv
-          sudo cp vmlinux rootfs.ext4 /opt/cloudhv/
+          sudo cp vmlinux rootfs.erofs /opt/cloudhv/
           ```
 
           ### Helm Chart (Kubernetes)

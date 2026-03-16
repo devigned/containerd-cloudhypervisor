@@ -14,7 +14,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CH_VERSION: "v44.0"
-  KERNEL_VERSION: "6.12.8"
+  KERNEL_VERSION: "6.18.16"
 
 jobs:
   lint:
@@ -142,6 +142,26 @@ jobs:
           name: ${{ matrix.artifact }}-${{ matrix.target }}
           path: /tmp/${{ matrix.artifact }}
 
+  containerised-build:
+    name: Container Build guest for ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y bash ash
+
+      - name: Build
+        run: |
+          bash hacks/build-guest.sh
+
   integration-test:
     name: Integration Tests (x86_64, KVM)
     runs-on: ubuntu-latest
@@ -163,7 +183,7 @@ jobs:
           sudo apt-get install -y \
             protobuf-compiler musl-tools \
             flex bison libelf-dev bc \
-            iproute2 util-linux e2fsprogs curl
+            iproute2 util-linux e2fsprogs curl erofs-utils
 
       - name: Enable KVM
         run: |
@@ -231,7 +251,7 @@ jobs:
           sudo bash build-rootfs.sh /tmp/agent/cloudhv-agent
           # Verify rootfs contains crun
           MOUNT_DIR=$(mktemp -d)
-          sudo mount -o loop,ro rootfs.ext4 "$MOUNT_DIR"
+          sudo mount -o loop,ro rootfs.erofs "$MOUNT_DIR"
           echo "Rootfs contents:"
           ls -la "$MOUNT_DIR"/bin/
           file "$MOUNT_DIR"/bin/crun || echo "WARNING: crun not found in rootfs!"
@@ -244,7 +264,7 @@ jobs:
         run: |
           sudo -E env "PATH=$PATH" \
             CLOUDHV_TEST_KERNEL="$PWD/guest/kernel/vmlinux" \
-            CLOUDHV_TEST_ROOTFS="$PWD/guest/rootfs/rootfs.ext4" \
+            CLOUDHV_TEST_ROOTFS="$PWD/guest/rootfs/rootfs.erofs" \
             CLOUDHV_TEST_CH_BIN="/usr/local/bin/cloud-hypervisor" \
             CLOUDHV_TEST_HTTP_ECHO="/usr/local/bin/http-echo" \
             cargo test -p containerd-shim-cloudhv --test integration -- --nocapture --test-threads=1
@@ -338,7 +358,7 @@ jobs:
           cd guest/rootfs
           sudo bash build-rootfs.sh /tmp/agent/cloudhv-agent
           MOUNT_DIR=$(mktemp -d)
-          sudo mount -o loop,ro rootfs.ext4 "$MOUNT_DIR"
+          sudo mount -o loop,ro rootfs.erofs "$MOUNT_DIR"
           echo "Rootfs contents:"
           ls -la "$MOUNT_DIR"/bin/
           file "$MOUNT_DIR"/bin/crun || echo "WARNING: crun not found in rootfs!"
@@ -351,7 +371,7 @@ jobs:
         run: |
           sudo -E env "PATH=$PATH" \
             CLOUDHV_TEST_KERNEL="$PWD/guest/kernel/vmlinux" \
-            CLOUDHV_TEST_ROOTFS="$PWD/guest/rootfs/rootfs.ext4" \
+            CLOUDHV_TEST_ROOTFS="$PWD/guest/rootfs/rootfs.erofs" \
             CLOUDHV_TEST_CH_BIN="/usr/local/bin/cloud-hypervisor" \
             CLOUDHV_TEST_HTTP_ECHO="/usr/local/bin/http-echo" \
             cargo test -p containerd-shim-cloudhv --test integration -- --nocapture --test-threads=1
