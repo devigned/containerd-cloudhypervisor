@@ -93,22 +93,12 @@ else
   ' "$CONTAINERD_CONFIG" > "${CONTAINERD_CONFIG}.tmp" && mv "${CONTAINERD_CONFIG}.tmp" "$CONTAINERD_CONFIG"
   chmod "$ORIG_MODE" "$CONTAINERD_CONFIG" 2>/dev/null || true
 
-  # Add erofs snapshotter + differ config (if not already present)
+  # Add erofs snapshotter config (if not already present)
   if ! grep -q 'snapshotter.v1.erofs' "$CONTAINERD_CONFIG" 2>/dev/null; then
-    # Remove any existing diff-service sections before adding ours
-    awk '
-      /^\[.*diff-service/ { skip=1; next }
-      skip && /^\[/ && !/diff-service/ { skip=0 }
-      !skip { print }
-    ' "$CONTAINERD_CONFIG" > "${CONTAINERD_CONFIG}.tmp" && mv "${CONTAINERD_CONFIG}.tmp" "$CONTAINERD_CONFIG"
-
     cat >> "$CONTAINERD_CONFIG" << 'EROFS'
 
 # CloudHV erofs snapshotter for direct image layer passthrough
 [plugins."io.containerd.snapshotter.v1.erofs"]
-
-[plugins."io.containerd.service.v1.diff-service"]
-  default = ["erofs","walking"]
 EROFS
     echo "[cloudhv] erofs snapshotter configured"
   fi

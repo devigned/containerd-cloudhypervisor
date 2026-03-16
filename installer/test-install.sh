@@ -62,19 +62,16 @@ TOML="${TOML}
 # CloudHV erofs snapshotter for direct image layer passthrough
 [plugins.\"io.containerd.snapshotter.v1.erofs\"]
 
-[plugins.\"io.containerd.service.v1.diff-service\"]
-  default = [\"erofs\",\"walking\"]
-
 # Cloud Hypervisor VM-isolated runtime
 [plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.cloudhv]
   runtime_type = \"io.containerd.cloudhv.v1\"
   snapshotter = \"erofs\""
 
 assert_contains "erofs snapshotter" "snapshotter.v1.erofs" "$TOML"
-assert_contains "erofs differ" 'default = ["erofs","walking"]' "$TOML"
 assert_contains "cloudhv runtime" "runtimes.cloudhv" "$TOML"
 assert_contains "erofs snapshotter on runtime" 'snapshotter = "erofs"' "$TOML"
 assert_not_contains "no devmapper" "devmapper" "$TOML"
+assert_not_contains "no diff-service" "diff-service" "$TOML"
 
 # --- Test 3: single-quote TOML keys ---
 echo ""
