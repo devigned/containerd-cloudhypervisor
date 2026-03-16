@@ -2,8 +2,8 @@
 set -uo pipefail
 
 # CloudHV installer — runs inside the DaemonSet pod with the host
-# filesystem mounted at /host. Copies shim artifacts, configures the
-# erofs snapshotter, and restarts containerd.
+# filesystem mounted at /host. Copies shim artifacts, installs
+# dependencies, and restarts containerd.
 
 ARTIFACTS=/opt/cloudhv
 HOST=/host
@@ -118,23 +118,13 @@ else
   ' "$CONTAINERD_CONFIG" > "${CONTAINERD_CONFIG}.tmp" && mv "${CONTAINERD_CONFIG}.tmp" "$CONTAINERD_CONFIG"
   chmod "$ORIG_MODE" "$CONTAINERD_CONFIG" 2>/dev/null || true
 
-  # Add erofs snapshotter config (if not already present)
-  if ! grep -q 'snapshotter.v1.erofs' "$CONTAINERD_CONFIG" 2>/dev/null; then
-    cat >> "$CONTAINERD_CONFIG" << 'EROFS'
-
-# CloudHV erofs snapshotter for direct image layer passthrough
-[plugins."io.containerd.snapshotter.v1.erofs"]
-EROFS
-    echo "[cloudhv] erofs snapshotter configured"
-  fi
-
-  # Add cloudhv runtime handler with erofs snapshotter
+  # Add cloudhv runtime handler (uses default overlayfs snapshotter;
+  # shim converts rootfs to erofs via mkfs.erofs)
   {
     echo ""
     echo "# Cloud Hypervisor VM-isolated runtime"
     echo '[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.cloudhv]'
     echo '  runtime_type = "io.containerd.cloudhv.v1"'
-    echo '  snapshotter = "erofs"'
   } >> "$CONTAINERD_CONFIG"
   echo "[cloudhv] Runtime handler added"
 fi

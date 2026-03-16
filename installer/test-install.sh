@@ -53,25 +53,20 @@ assert_contains "kata preserved" "runtimes.kata" "$RESULT"
 assert_not_contains "cloudhv removed" "runtimes.cloudhv" "$RESULT"
 assert_not_contains "devmapper removed" "devmapper" "$RESULT"
 
-# --- Test 2: erofs config is added ---
+# --- Test 2: runtime config is added (default snapshotter, no erofs plugin) ---
 echo ""
-echo "=== Test 2: erofs config is added ==="
+echo "=== Test 2: runtime config is added ==="
 TOML=$(printf '%s\n' "$RESULT")
 TOML="${TOML}
 
-# CloudHV erofs snapshotter for direct image layer passthrough
-[plugins.\"io.containerd.snapshotter.v1.erofs\"]
-
 # Cloud Hypervisor VM-isolated runtime
 [plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.cloudhv]
-  runtime_type = \"io.containerd.cloudhv.v1\"
-  snapshotter = \"erofs\""
+  runtime_type = \"io.containerd.cloudhv.v1\""
 
-assert_contains "erofs snapshotter" "snapshotter.v1.erofs" "$TOML"
 assert_contains "cloudhv runtime" "runtimes.cloudhv" "$TOML"
-assert_contains "erofs snapshotter on runtime" 'snapshotter = "erofs"' "$TOML"
 assert_not_contains "no devmapper" "devmapper" "$TOML"
-assert_not_contains "no diff-service" "diff-service" "$TOML"
+assert_not_contains "no erofs snapshotter" "snapshotter.v1.erofs" "$TOML"
+assert_not_contains "no erofs on runtime" 'snapshotter = "erofs"' "$TOML"
 
 # --- Test 3: single-quote TOML keys ---
 echo ""

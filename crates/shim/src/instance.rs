@@ -377,58 +377,34 @@ impl CloudHvInstance {
         let spec_path = self.bundle.join("config.json");
         let volumes = extract_volumes(&spec_path).ctx("extract volumes")?;
 
-        // Find erofs layer blobs backing the rootfs.
-        // Path 1: erofs snapshotter (containerd 2.1+) — layer.erofs files exist
-        // Path 2: overlayfs snapshotter (containerd 2.0) — convert rootfs dir to erofs
-        let erofs_layers = find_erofs_layers(&rootfs_path);
-        let rootfs_disks: Vec<(std::path::PathBuf, String, bool)> = if !erofs_layers.is_empty() {
-            // Path 1: erofs snapshotter — pass layer.erofs blobs directly
-            info!(
-                "rootfs backed by {} erofs layer(s), using direct passthrough",
-                erofs_layers.len()
-            );
-            for (i, layer) in erofs_layers.iter().enumerate() {
-                let size = std::fs::metadata(layer).map(|m| m.len()).unwrap_or(0);
-                info!("  erofs layer {}: {} ({} bytes)", i, layer.display(), size);
+        // Convert rootfs directory to erofs image. The overlayfs snapshotter
+        // provides a directory at bundle/rootfs — we create a read-only erofs
+        // image from it and pass it to the VM as a virtio-blk device.
+        let erofs_path = parent_dir.join(format!("{disk_id}.erofs"));
+        let rootfs_for_erofs = rootfs_path.clone();
+        let erofs_dst = erofs_path.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let status = std::process::Command::new("mkfs.erofs")
+                .arg("--quiet")
+                .arg(&erofs_dst)
+                .arg(&rootfs_for_erofs)
+                .status()
+                .map_err(|e| anyhow::anyhow!("mkfs.erofs: {e}"))?;
+            if !status.success() {
+                anyhow::bail!("mkfs.erofs failed: {status}");
             }
-            erofs_layers
-                .iter()
-                .enumerate()
-                .map(|(i, path)| {
-                    let id = format!("{disk_id}-layer{i}");
-                    (path.clone(), id, true)
-                })
-                .collect()
-        } else {
-            // Path 2: overlayfs snapshotter — create erofs image from rootfs directory
-            info!("no erofs snapshotter layers, converting rootfs to erofs image");
-            let erofs_path = parent_dir.join(format!("{disk_id}.erofs"));
-            let rootfs_for_erofs = rootfs_path.clone();
-            let erofs_dst = erofs_path.clone();
-            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let status = std::process::Command::new("mkfs.erofs")
-                    .arg("--quiet")
-                    .arg(&erofs_dst)
-                    .arg(&rootfs_for_erofs)
-                    .status()
-                    .map_err(|e| anyhow::anyhow!("mkfs.erofs: {e}"))?;
-                if !status.success() {
-                    anyhow::bail!("mkfs.erofs failed: {status}");
-                }
-                Ok(())
-            })
-            .await
-            .map_err(|_| Error::Any(anyhow::anyhow!("erofs conversion panicked")))?
-            .ctx("convert rootfs to erofs")?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| Error::Any(anyhow::anyhow!("erofs conversion panicked")))?
+        .ctx("convert rootfs to erofs")?;
 
-            let size = std::fs::metadata(&erofs_path).map(|m| m.len()).unwrap_or(0);
-            info!(
-                "erofs image created: {} ({} bytes)",
-                erofs_path.display(),
-                size
-            );
-            vec![(erofs_path, disk_id.clone(), true)]
-        };
+        let erofs_size = std::fs::metadata(&erofs_path).map(|m| m.len()).unwrap_or(0);
+        info!(
+            "erofs image: {} ({} bytes)",
+            erofs_path.display(),
+            erofs_size
+        );
 
         // Determine boot role: first container boots the VM, others wait.
         enum BootRole {
@@ -456,21 +432,18 @@ impl CloudHvInstance {
 
         match boot_role {
             BootRole::First => {
-                // First container — boot VM with rootfs disks pre-attached
-                let extra_disks: Vec<VmDisk> = rootfs_disks
-                    .iter()
-                    .map(|(path, id, readonly)| VmDisk {
-                        path: path.to_string_lossy().to_string(),
-                        readonly: *readonly,
-                        id: Some(id.clone()),
-                    })
-                    .collect();
+                // First container — boot VM with erofs rootfs pre-attached
+                let extra_disk = VmDisk {
+                    path: erofs_path.to_string_lossy().to_string(),
+                    readonly: true,
+                    id: Some(disk_id.clone()),
+                };
                 let boot_result = vm_state
                     .vm
                     .create_and_boot_vm(
                         vm_state.tap_name.as_deref(),
                         vm_state.tap_mac.as_deref(),
-                        extra_disks,
+                        vec![extra_disk],
                     )
                     .await;
 
@@ -527,24 +500,22 @@ impl CloudHvInstance {
                     }
                 }
 
-                // Hot-plug disks for this container
+                // Hot-plug erofs rootfs disk
                 let api_socket = vm_state.api_socket.clone();
-                for (path, id, readonly) in &rootfs_disks {
-                    let disk_json = serde_json::json!({
-                        "path": path.to_string_lossy(),
-                        "readonly": *readonly,
-                        "id": id,
-                    });
-                    VmManager::api_request_to_socket(
-                        &api_socket,
-                        "PUT",
-                        "/api/v1/vm.add-disk",
-                        Some(&disk_json.to_string()),
-                    )
-                    .await
-                    .ctx("hot-plug rootfs disk")?;
-                    info!("rootfs disk hot-plugged: {id}");
-                }
+                let disk_json = serde_json::json!({
+                    "path": erofs_path.to_string_lossy(),
+                    "readonly": true,
+                    "id": &disk_id,
+                });
+                VmManager::api_request_to_socket(
+                    &api_socket,
+                    "PUT",
+                    "/api/v1/vm.add-disk",
+                    Some(&disk_json.to_string()),
+                )
+                .await
+                .ctx("hot-plug rootfs disk")?;
+                info!("rootfs disk hot-plugged: {disk_id}");
             }
         }
 
@@ -599,7 +570,7 @@ impl CloudHvInstance {
         create_req.bundle_path = bundle_guest.clone();
         create_req.config_json = config_json_bytes;
         create_req.rootfs_preattached = is_first_container;
-        create_req.erofs_layers = rootfs_disks.len() as u32;
+        create_req.erofs_layers = 1;
         for vol in &volumes {
             let mut vm = cloudhv_proto::VolumeMount::new();
             vm.destination = vol.destination.clone();
@@ -858,76 +829,6 @@ fn to_systemd_cgroup_path(cgroups_path: &str) -> String {
         }
     }
     result
-}
-
-/// Find erofs layer blobs backing the container's rootfs.
-///
-/// When the erofs snapshotter is active, containerd mounts the rootfs as
-/// overlayfs with erofs lower layers.  We parse `/proc/self/mountinfo` to
-/// find the overlay mount at `rootfs_path`, extract its `lowerdir` entries,
-/// then find the erofs source files backing those mounts.
-///
-/// Returns the layer.erofs file paths in overlayfs lowerdir order
-/// (leftmost = top/highest precedence), or an empty
-/// vec if the rootfs is not backed by erofs (e.g., plain overlayfs).
-fn find_erofs_layers(rootfs_path: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mountinfo = match std::fs::read_to_string("/proc/self/mountinfo") {
-        Ok(m) => m,
-        Err(_) => return Vec::new(),
-    };
-    let path_str = rootfs_path.to_string_lossy();
-
-    // Step 1: find the overlay mount at rootfs_path and extract lowerdirs
-    let mut lowerdirs: Vec<String> = Vec::new();
-    for line in mountinfo.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() > 4 && parts[4] == path_str.as_ref() {
-            if let Some(sep) = parts.iter().position(|&p| p == "-") {
-                if parts.len() > sep + 1 && parts[sep + 1] == "overlay" {
-                    // Found the overlay mount — extract lowerdir from options
-                    let super_opts = parts.get(sep + 3).unwrap_or(&"");
-                    for opt in super_opts.split(',') {
-                        if let Some(dirs) = opt.strip_prefix("lowerdir=") {
-                            lowerdirs = dirs.split(':').map(String::from).collect();
-                            break;
-                        }
-                    }
-                    // Also check mount options before the separator
-                    for part in parts.iter().take(sep).skip(5) {
-                        if let Some(dirs) = part.strip_prefix("lowerdir=") {
-                            lowerdirs = dirs.split(':').map(String::from).collect();
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if lowerdirs.is_empty() {
-        return Vec::new();
-    }
-
-    // Step 2: for each lowerdir, find the erofs source file from mountinfo
-    let mut erofs_layers: Vec<std::path::PathBuf> = Vec::new();
-    for ldir in &lowerdirs {
-        for line in mountinfo.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() > 4 && parts[4] == ldir.as_str() {
-                if let Some(sep) = parts.iter().position(|&p| p == "-") {
-                    if parts.len() > sep + 2 && parts[sep + 1] == "erofs" {
-                        let src = parts[sep + 2];
-                        let path = std::path::PathBuf::from(src);
-                        if path.exists() {
-                            erofs_layers.push(path);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    erofs_layers
 }
 
 /// Parsed sandbox configuration from the OCI spec.
