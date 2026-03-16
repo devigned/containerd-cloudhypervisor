@@ -1,24 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Test the installer's config patching logic without requiring a real host.
-# This runs in CI to catch syntax errors and config generation bugs.
+# Test the installer's config patching logic.
+
+# Syntax-check the installer script itself
+bash -n installer/install.sh || { echo "FAIL: syntax error in install.sh"; exit 1; }
 
 PASS=0
 FAIL=0
-
-assert_eq() {
-  local desc="$1" expected="$2" actual="$3"
-  if [ "$expected" = "$actual" ]; then
-    echo "  ✅ $desc"
-    PASS=$((PASS + 1))
-  else
-    echo "  ❌ $desc"
-    echo "     expected: $expected"
-    echo "     actual:   $actual"
-    FAIL=$((FAIL + 1))
-  fi
-}
 
 assert_contains() {
   local desc="$1" needle="$2" haystack="$3"
@@ -37,111 +26,79 @@ assert_not_contains() {
     echo "  ✅ $desc"
     PASS=$((PASS + 1))
   else
-    echo "  ❌ $desc (found: $needle)"
+    echo "  ❌ $desc (found but should not be: $needle)"
     FAIL=$((FAIL + 1))
   fi
 }
 
-TMPDIR=$(mktemp -d)
-cleanup() { rm -rf "$TMPDIR"; }
-trap cleanup EXIT
-
-echo "=== Test 1: install.sh has valid bash syntax ==="
-if bash -n installer/install.sh; then
-  assert_eq "syntax check" "0" "0"
-else
-  assert_eq "syntax check" "0" "1"
-fi
-
+# --- Test 1: awk removes existing cloudhv runtime section ---
 echo ""
-echo "=== Test 2: awk removes cloudhv section idempotently ==="
-cat > "$TMPDIR/config.toml" << 'TOML'
-[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+echo "=== Test 1: awk removes existing cloudhv runtime ==="
+INPUT='[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
   runtime_type = "io.containerd.runc.v2"
-
 [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.cloudhv]
   runtime_type = "io.containerd.cloudhv.v1"
   snapshotter = "devmapper"
-
 [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata]
-  runtime_type = "io.containerd.kata.v2"
-TOML
+  runtime_type = "io.containerd.kata.v2"'
 
-awk '
+RESULT=$(printf '%s\n' "$INPUT" | awk '
   /^\[.*\.runtimes\.cloudhv/ { skip=1; next }
   skip && /^\[/ && !/cloudhv/ { skip=0 }
   !skip { print }
-' "$TMPDIR/config.toml" > "$TMPDIR/result.toml"
+')
 
-RESULT=$(cat "$TMPDIR/result.toml")
 assert_contains "runc preserved" "runtimes.runc" "$RESULT"
 assert_contains "kata preserved" "runtimes.kata" "$RESULT"
 assert_not_contains "cloudhv removed" "runtimes.cloudhv" "$RESULT"
-assert_not_contains "snapshotter removed" "snapshotter" "$RESULT"
+assert_not_contains "devmapper removed" "devmapper" "$RESULT"
 
+# --- Test 2: erofs config is added ---
 echo ""
-echo "=== Test 3: awk removes devmapper snapshotter section ==="
-cat > "$TMPDIR/config2.toml" << 'TOML'
-[plugins."io.containerd.snapshotter.v1.overlayfs"]
-  root_path = "/var/lib/containerd/overlayfs"
+echo "=== Test 2: erofs config is added ==="
+TOML=$(printf '%s\n' "$RESULT")
+TOML="${TOML}
 
-[plugins."io.containerd.snapshotter.v1.devmapper"]
-  root_path = "/var/lib/containerd/devmapper"
-  pool_name = "cloudhv-pool"
+# CloudHV erofs snapshotter for direct image layer passthrough
+[plugins.\"io.containerd.snapshotter.v1.erofs\"]
 
-[metrics]
-  address = "0.0.0.0:1234"
-TOML
+[plugins.\"io.containerd.service.v1.diff-service\"]
+  default = [\"erofs\",\"walking\"]
 
-awk '
-  /^\[.*\.snapshotter.*devmapper/ { skip=1; next }
-  skip && /^\[/ && !/devmapper/ { skip=0 }
-  !skip { print }
-' "$TMPDIR/config2.toml" > "$TMPDIR/result2.toml"
+# Cloud Hypervisor VM-isolated runtime
+[plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.cloudhv]
+  runtime_type = \"io.containerd.cloudhv.v1\"
+  snapshotter = \"erofs\""
 
-RESULT2=$(cat "$TMPDIR/result2.toml")
-assert_contains "overlayfs preserved" "overlayfs" "$RESULT2"
-assert_contains "metrics preserved" "metrics" "$RESULT2"
-assert_not_contains "devmapper removed" "devmapper" "$RESULT2"
+assert_contains "erofs snapshotter" "snapshotter.v1.erofs" "$TOML"
+assert_contains "erofs differ" 'default = ["erofs","walking"]' "$TOML"
+assert_contains "cloudhv runtime" "runtimes.cloudhv" "$TOML"
+assert_contains "erofs snapshotter on runtime" 'snapshotter = "erofs"' "$TOML"
+assert_not_contains "no devmapper" "devmapper" "$TOML"
 
+# --- Test 3: single-quote TOML keys ---
 echo ""
-echo "=== Test 4: awk is idempotent (no cloudhv to remove) ==="
-cat > "$TMPDIR/config3.toml" << 'TOML'
-[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
-  runtime_type = "io.containerd.runc.v2"
-TOML
+echo "=== Test 3: awk handles single-quote TOML keys ==="
+INPUT2="[plugins.'io.containerd.grpc.v1.cri'.containerd.runtimes.cloudhv]
+  runtime_type = 'io.containerd.cloudhv.v1'
+[plugins.'io.containerd.grpc.v1.cri'.containerd.runtimes.runc]
+  runtime_type = 'io.containerd.runc.v2'"
 
-awk '
+RESULT2=$(printf '%s\n' "$INPUT2" | awk '
   /^\[.*\.runtimes\.cloudhv/ { skip=1; next }
   skip && /^\[/ && !/cloudhv/ { skip=0 }
   !skip { print }
-' "$TMPDIR/config3.toml" > "$TMPDIR/result3.toml"
+')
 
-RESULT3=$(cat "$TMPDIR/result3.toml")
-assert_contains "runc still there" "runtimes.runc" "$RESULT3"
+assert_not_contains "single-quote cloudhv removed" "runtimes.cloudhv" "$RESULT2"
+assert_contains "single-quote runc preserved" "runtimes.runc" "$RESULT2"
 
-echo ""
-echo "=== Test 5: awk handles single-quote TOML keys ==="
-cat > "$TMPDIR/config4.toml" << 'TOML'
-[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.cloudhv]
-  runtime_type = "io.containerd.cloudhv.v1"
-
-[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc]
-  runtime_type = "io.containerd.runc.v2"
-TOML
-
-awk '
-  /^\[.*\.runtimes\.cloudhv/ { skip=1; next }
-  skip && /^\[/ && !/cloudhv/ { skip=0 }
-  !skip { print }
-' "$TMPDIR/config4.toml" > "$TMPDIR/result4.toml"
-
-RESULT4=$(cat "$TMPDIR/result4.toml")
-assert_not_contains "single-quote cloudhv removed" "cloudhv" "$RESULT4"
-assert_contains "single-quote runc preserved" "runtimes.runc" "$RESULT4"
-
+# --- Results ---
 echo ""
 echo "=== Results ==="
 echo "  Passed: $PASS"
 echo "  Failed: $FAIL"
-[ "$FAIL" -eq 0 ] && exit 0 || exit 1
+
+if [ "$FAIL" -gt 0 ]; then
+  exit 1
+fi

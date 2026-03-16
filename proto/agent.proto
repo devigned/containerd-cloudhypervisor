@@ -65,6 +65,13 @@ message CreateContainerRequest {
     // When true, the rootfs disk was pre-attached at VM boot time and is
     // available at /dev/vdb. Skip discover_and_mount_new_disk polling.
     bool rootfs_preattached = 10;
+    // Number of erofs layer disks attached for this container.
+    // When > 0, the agent mounts each as erofs (read-only) and composes
+    // them with overlayfs + tmpfs upper layer for the container rootfs.
+    // Device names are deterministic only for pre-attached layers (first
+    // container at VM boot): sequential from /dev/vdb. For hot-plugged
+    // containers, the agent should discover devices via /sys/block.
+    uint32 erofs_layers = 11;
 }
 
 // A volume mount to inject into the container's OCI spec.

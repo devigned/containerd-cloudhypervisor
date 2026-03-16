@@ -503,7 +503,7 @@ fn test_container_logs_captured() {
         return;
     }
 
-    for tool in ["mkfs.ext4", "mount", "umount"] {
+    for tool in ["mkfs.erofs"] {
         if std::process::Command::new("which")
             .arg(tool)
             .output()
@@ -545,8 +545,8 @@ fn test_container_logs_captured() {
         let vsock_client = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
         let (agent, _health) = vsock_client.connect_ttrpc().await.expect("ttrpc");
 
-        // ── Create disk image with a script that writes to both fds ───
-        let disk_path = create_script_disk_image(
+        // ── Create erofs disk image with a script that writes to both fds ─
+        let (disk_path, config_json_bytes) = create_script_disk_image(
             vm.state_dir(),
             &shell_src,
             &container_id,
@@ -562,6 +562,8 @@ fn test_container_logs_captured() {
         let mut create_req = cloudhv_proto::CreateContainerRequest::new();
         create_req.container_id = container_id.clone();
         create_req.bundle_path = format!("/run/containers/{}", container_id);
+        create_req.config_json = config_json_bytes;
+        create_req.erofs_layers = 1;
         let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
         agent
             .create_container(ctx, &create_req)
@@ -629,17 +631,17 @@ fn test_container_logs_captured() {
     });
 }
 
-/// Create an ext4 disk image containing an OCI bundle that runs a shell command.
+/// Create an erofs disk image containing a container rootfs that runs a shell command.
 ///
-/// Similar to [`create_echo_disk_image`] but takes arbitrary args and uses
-/// busybox/sh instead of a dedicated binary. The disk is 32 MB.
+/// Returns (disk_path, config_json_bytes). The config.json is delivered
+/// inline via the CreateContainerRequest rather than baked into the image.
 fn create_script_disk_image(
     state_dir: &std::path::Path,
     shell_src: &std::path::Path,
     name: &str,
     args: &[&str],
-) -> std::path::PathBuf {
-    let disk_path = state_dir.join(format!("{name}.img"));
+) -> (std::path::PathBuf, Vec<u8>) {
+    let disk_path = state_dir.join(format!("{name}.erofs"));
     let bundle_tmp = state_dir.join(format!("{name}-bundle"));
     let rootfs_tmp = bundle_tmp.join("rootfs");
     let bin_dir = rootfs_tmp.join("bin");
@@ -659,7 +661,7 @@ fn create_script_disk_image(
         }
     }
 
-    // Write OCI config.json
+    // Build OCI config.json (returned for inline delivery, not baked in)
     let oci_args: Vec<serde_json::Value> = args
         .iter()
         .map(|a| serde_json::Value::String(a.to_string()))
@@ -676,52 +678,23 @@ fn create_script_disk_image(
         "root": { "path": "rootfs", "readonly": false },
         "linux": { "namespaces": [{"type": "pid"}, {"type": "mount"}] }
     });
-    std::fs::write(
-        bundle_tmp.join("config.json"),
-        serde_json::to_string_pretty(&oci_config).unwrap(),
-    )
-    .expect("write config.json");
+    let config_json_bytes = serde_json::to_vec_pretty(&oci_config).unwrap();
 
-    // Create 32 MB ext4 disk image
-    let f = std::fs::File::create(&disk_path).expect("create disk");
-    f.set_len(32 * 1024 * 1024).expect("set_len");
-    drop(f);
-    assert!(run_cmd_status(
-        "mkfs.ext4",
-        &["-q", "-F", &disk_path.to_string_lossy()]
-    ));
-    let mount_dir = disk_path.with_extension("mnt");
-    std::fs::create_dir_all(&mount_dir).expect("mkdir mount");
-    assert!(run_cmd_status(
-        "mount",
-        &[
-            "-o",
-            "loop",
-            &disk_path.to_string_lossy(),
-            &mount_dir.to_string_lossy()
-        ]
-    ));
-    let img_rootfs = mount_dir.join("rootfs");
-    std::fs::create_dir_all(&img_rootfs).expect("mkdir img rootfs");
-    assert!(run_cmd_status(
-        "cp",
-        &[
-            "-a",
-            "--",
-            &format!("{}/.", rootfs_tmp.display()),
-            &img_rootfs.to_string_lossy()
-        ]
-    ));
-    std::fs::copy(
-        bundle_tmp.join("config.json"),
-        mount_dir.join("config.json"),
-    )
-    .expect("cp config.json");
-    assert!(run_cmd_status("umount", &[&mount_dir.to_string_lossy()]));
-    std::fs::remove_dir(&mount_dir).ok();
+    // Create erofs disk image from rootfs directory
+    assert!(
+        run_cmd_status(
+            "mkfs.erofs",
+            &[
+                "--quiet",
+                &disk_path.to_string_lossy(),
+                &rootfs_tmp.to_string_lossy()
+            ]
+        ),
+        "mkfs.erofs failed"
+    );
     std::fs::remove_dir_all(&bundle_tmp).ok();
 
-    disk_path
+    (disk_path, config_json_bytes)
 }
 
 /// End-to-end test: boot a VM with networking, start an HTTP echo container,
@@ -761,7 +734,7 @@ fn test_echo_container_with_networking() {
     }
 
     // Check that networking tools are available
-    for tool in ["nsenter", "ip", "tc", "curl", "mkfs.ext4"] {
+    for tool in ["nsenter", "ip", "tc", "curl", "mkfs.erofs"] {
         if std::process::Command::new("which")
             .arg(tool)
             .output()
@@ -953,11 +926,11 @@ fn test_echo_container_with_networking() {
             .expect("agent health");
         eprintln!("           │ VM booted, agent healthy");
 
-        // ── Phase 3: Create disk image with http-echo ─────────────────
+        // ── Phase 3: Create erofs disk image with http-echo ────────────
         eprintln!("  Phase 3 │ Creating container disk image");
-        let disk_path = vm.state_dir().join("echo-container.img");
+        let disk_path = vm.state_dir().join("echo-container.erofs");
 
-        // Build an OCI bundle with http-echo
+        // Build rootfs with http-echo
         let bundle_tmp = vm.state_dir().join("echo-bundle");
         let rootfs_tmp = bundle_tmp.join("rootfs");
         std::fs::create_dir_all(&rootfs_tmp).expect("mkdir rootfs");
@@ -969,7 +942,7 @@ fn test_echo_container_with_networking() {
             .status()
             .expect("chmod");
 
-        // Write OCI config.json
+        // Build OCI config.json (delivered inline, not baked in)
         let oci_config = serde_json::json!({
             "ociVersion": "1.0.2",
             "process": {
@@ -986,63 +959,21 @@ fn test_echo_container_with_networking() {
             "root": { "path": "rootfs", "readonly": false },
             "linux": { "namespaces": [{"type": "pid"}, {"type": "mount"}] }
         });
-        std::fs::write(
-            bundle_tmp.join("config.json"),
-            serde_json::to_string_pretty(&oci_config).unwrap(),
-        )
-        .expect("write config.json");
+        let config_json_bytes = serde_json::to_vec_pretty(&oci_config).unwrap();
 
-        // Create ext4 disk image (64MB, sparse)
-        let f = std::fs::File::create(&disk_path).expect("create disk");
-        f.set_len(64 * 1024 * 1024).expect("set_len");
-        drop(f);
-
-        assert!(
-            run_cmd_status("mkfs.ext4", &["-q", "-F", &disk_path.to_string_lossy()]),
-            "mkfs.ext4 failed"
-        );
-
-        let mount_dir = disk_path.with_extension("mnt");
-        std::fs::create_dir_all(&mount_dir).expect("mkdir mount");
+        // Create erofs disk image from rootfs directory
         assert!(
             run_cmd_status(
-                "mount",
+                "mkfs.erofs",
                 &[
-                    "-o",
-                    "loop",
+                    "--quiet",
                     &disk_path.to_string_lossy(),
-                    &mount_dir.to_string_lossy()
+                    &rootfs_tmp.to_string_lossy()
                 ]
             ),
-            "mount failed"
+            "mkfs.erofs failed"
         );
-
-        // Copy rootfs and config.json into the disk image
-        let img_rootfs = mount_dir.join("rootfs");
-        std::fs::create_dir_all(&img_rootfs).expect("mkdir img rootfs");
-        assert!(
-            run_cmd_status(
-                "cp",
-                &[
-                    "-a",
-                    "--",
-                    &format!("{}/.", rootfs_tmp.display()),
-                    &img_rootfs.to_string_lossy(),
-                ]
-            ),
-            "cp rootfs failed"
-        );
-        std::fs::copy(
-            bundle_tmp.join("config.json"),
-            mount_dir.join("config.json"),
-        )
-        .expect("cp config.json");
-
-        assert!(
-            run_cmd_status("umount", &[&mount_dir.to_string_lossy()]),
-            "umount failed"
-        );
-        std::fs::remove_dir(&mount_dir).ok();
+        std::fs::remove_dir_all(&bundle_tmp).ok();
 
         eprintln!("           │ disk image: {}", disk_path.display());
 
@@ -1070,6 +1001,8 @@ fn test_echo_container_with_networking() {
         let mut create_req = cloudhv_proto::CreateContainerRequest::new();
         create_req.container_id = container_id.clone();
         create_req.bundle_path = format!("/run/containers/{}", container_id);
+        create_req.config_json = config_json_bytes;
+        create_req.erofs_layers = 1;
 
         let ctx = ttrpc::context::with_duration(Duration::from_secs(30));
         let create_resp = agent
@@ -1181,16 +1114,16 @@ fn run_cmd_status(cmd: &str, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-/// Helper: create an ext4 disk image containing an http-echo binary + OCI config.
-/// Returns the disk image path.
+/// Helper: create an erofs disk image containing an http-echo binary + OCI config.
+/// Returns (disk_path, config_json_bytes).
 fn create_echo_disk_image(
     state_dir: &std::path::Path,
     http_echo_path: &std::path::Path,
     name: &str,
     text: &str,
     port: u16,
-) -> std::path::PathBuf {
-    let disk_path = state_dir.join(format!("{name}.img"));
+) -> (std::path::PathBuf, Vec<u8>) {
+    let disk_path = state_dir.join(format!("{name}.erofs"));
     let bundle_tmp = state_dir.join(format!("{name}-bundle"));
     let rootfs_tmp = bundle_tmp.join("rootfs");
     std::fs::create_dir_all(&rootfs_tmp).expect("mkdir rootfs");
@@ -1212,52 +1145,23 @@ fn create_echo_disk_image(
         "root": { "path": "rootfs", "readonly": false },
         "linux": { "namespaces": [{"type": "pid"}, {"type": "mount"}] }
     });
-    std::fs::write(
-        bundle_tmp.join("config.json"),
-        serde_json::to_string_pretty(&oci_config).unwrap(),
-    )
-    .expect("write config.json");
+    let config_json_bytes = serde_json::to_vec_pretty(&oci_config).unwrap();
 
-    // Create ext4 disk image
-    let f = std::fs::File::create(&disk_path).expect("create disk");
-    f.set_len(64 * 1024 * 1024).expect("set_len");
-    drop(f);
-    assert!(run_cmd_status(
-        "mkfs.ext4",
-        &["-q", "-F", &disk_path.to_string_lossy()]
-    ));
-    let mount_dir = disk_path.with_extension("mnt");
-    std::fs::create_dir_all(&mount_dir).expect("mkdir mount");
-    assert!(run_cmd_status(
-        "mount",
-        &[
-            "-o",
-            "loop",
-            &disk_path.to_string_lossy(),
-            &mount_dir.to_string_lossy()
-        ]
-    ));
-    let img_rootfs = mount_dir.join("rootfs");
-    std::fs::create_dir_all(&img_rootfs).expect("mkdir img rootfs");
-    assert!(run_cmd_status(
-        "cp",
-        &[
-            "-a",
-            "--",
-            &format!("{}/.", rootfs_tmp.display()),
-            &img_rootfs.to_string_lossy()
-        ]
-    ));
-    std::fs::copy(
-        bundle_tmp.join("config.json"),
-        mount_dir.join("config.json"),
-    )
-    .expect("cp config.json");
-    assert!(run_cmd_status("umount", &[&mount_dir.to_string_lossy()]));
-    std::fs::remove_dir(&mount_dir).ok();
+    // Create erofs disk image from rootfs directory
+    assert!(
+        run_cmd_status(
+            "mkfs.erofs",
+            &[
+                "--quiet",
+                &disk_path.to_string_lossy(),
+                &rootfs_tmp.to_string_lossy()
+            ]
+        ),
+        "mkfs.erofs failed"
+    );
     std::fs::remove_dir_all(&bundle_tmp).ok();
 
-    disk_path
+    (disk_path, config_json_bytes)
 }
 
 /// Test that two containers can run simultaneously inside the same VM.
@@ -1282,7 +1186,7 @@ fn test_two_containers_in_one_vm() {
         eprintln!("SKIPPING: http-echo not found (set CLOUDHV_TEST_HTTP_ECHO)");
         return;
     }
-    for tool in ["nsenter", "ip", "tc", "curl", "mkfs.ext4"] {
+    for tool in ["nsenter", "ip", "tc", "curl", "mkfs.erofs"] {
         if !run_cmd_status("which", &[tool]) {
             eprintln!("SKIPPING: {tool} not found");
             return;
@@ -1454,7 +1358,7 @@ fn test_two_containers_in_one_vm() {
         // ── Phase 2: Hot-plug and start container A (port 5678) ───────
         eprintln!("  Phase 2 │ Starting container A (port 5678)");
         let ctr_a_id = format!("ctr-a-{}", std::process::id());
-        let disk_a = create_echo_disk_image(
+        let (disk_a, config_json_a) = create_echo_disk_image(
             vm.state_dir(),
             &http_echo_path,
             "ctr-a",
@@ -1470,6 +1374,8 @@ fn test_two_containers_in_one_vm() {
         let mut req_a = cloudhv_proto::CreateContainerRequest::new();
         req_a.container_id = ctr_a_id.clone();
         req_a.bundle_path = format!("/run/containers/{}", ctr_a_id);
+        req_a.config_json = config_json_a;
+        req_a.erofs_layers = 1;
         let ctx = ttrpc::context::with_duration(Duration::from_secs(30));
         agent.create_container(ctx, &req_a).await.expect("create A");
         let mut start_a = cloudhv_proto::StartContainerRequest::new();
@@ -1481,7 +1387,7 @@ fn test_two_containers_in_one_vm() {
         // ── Phase 3: Hot-plug and start container B (port 5679) ───────
         eprintln!("  Phase 3 │ Starting container B (port 5679)");
         let ctr_b_id = format!("ctr-b-{}", std::process::id());
-        let disk_b = create_echo_disk_image(
+        let (disk_b, config_json_b) = create_echo_disk_image(
             vm.state_dir(),
             &http_echo_path,
             "ctr-b",
@@ -1497,6 +1403,8 @@ fn test_two_containers_in_one_vm() {
         let mut req_b = cloudhv_proto::CreateContainerRequest::new();
         req_b.container_id = ctr_b_id.clone();
         req_b.bundle_path = format!("/run/containers/{}", ctr_b_id);
+        req_b.config_json = config_json_b;
+        req_b.erofs_layers = 1;
         let ctx = ttrpc::context::with_duration(Duration::from_secs(30));
         agent.create_container(ctx, &req_b).await.expect("create B");
         let mut start_b = cloudhv_proto::StartContainerRequest::new();
@@ -1771,7 +1679,7 @@ fn test_volume_mounts() {
         return;
     }
 
-    for tool in ["mkfs.ext4", "cp"] {
+    for tool in ["mkfs.erofs", "cp"] {
         if !run_cmd_status("which", &[tool]) {
             eprintln!("SKIPPING: {tool} not found");
             return;
@@ -1808,26 +1716,10 @@ fn test_volume_mounts() {
             .expect("agent");
         eprintln!("           │ VM booted");
 
-        // ── Phase 2: Create disk with baked-in ConfigMap volume ───────
-        eprintln!("  Phase 2 │ Creating disk image with baked-in ConfigMap");
+        // ── Phase 2: Create erofs rootfs + inline volume data ──────────
+        eprintln!("  Phase 2 │ Creating erofs rootfs + inline ConfigMap");
 
-        // Simulate kubelet ConfigMap volume data directory
-        let cm_src = vm.state_dir().join("configmap-data");
-        std::fs::create_dir_all(&cm_src).expect("mkdir configmap");
-        std::fs::write(cm_src.join("app.conf"), "setting=BAKED_VALUE\n").expect("write cm");
-        std::fs::write(cm_src.join("extra.yaml"), "env: production\n").expect("write cm2");
-
-        // Compute volume_id the same way the shim does (djb2 hash)
-        let vol_dest = "/etc/config";
-        let vol_id = {
-            let mut h: u64 = 5381;
-            for b in vol_dest.bytes() {
-                h = h.wrapping_mul(33).wrapping_add(b as u64);
-            }
-            format!("{:x}", h)
-        };
-
-        // Build an OCI bundle with the container command that reads volume data
+        // Build rootfs for the container
         let bundle_dir = vm.state_dir().join(format!("{container_id}-bundle"));
         let rootfs = bundle_dir.join("rootfs");
         let bin_dir = rootfs.join("bin");
@@ -1843,7 +1735,8 @@ fn test_volume_mounts() {
             }
         }
 
-        // The container will cat the baked-in ConfigMap files
+        // OCI config.json (delivered inline)
+        let vol_dest = "/etc/config";
         let oci_config = serde_json::json!({
             "ociVersion": "1.0.2",
             "process": {
@@ -1855,67 +1748,25 @@ fn test_volume_mounts() {
                 "cwd": "/"
             },
             "root": { "path": "rootfs", "readonly": false },
-            "linux": { "namespaces": [{"type": "pid"}, {"type": "mount"}] },
-            "mounts": [
-                {
-                    "destination": vol_dest,
-                    "source": cm_src.to_string_lossy(),
-                    "type": "bind",
-                    "options": ["rbind", "ro"]
-                }
-            ]
+            "linux": { "namespaces": [{"type": "pid"}, {"type": "mount"}] }
         });
-        std::fs::write(
-            bundle_dir.join("config.json"),
-            serde_json::to_string_pretty(&oci_config).unwrap(),
-        )
-        .expect("write config.json");
+        let config_json_bytes = serde_json::to_vec_pretty(&oci_config).unwrap();
 
-        // Stage the disk image: rootfs + volumes/<vol_id>/ (same as create_rootfs_disk_image)
-        let disk_path = vm.state_dir().join(format!("{container_id}.img"));
-        let staging = disk_path.with_extension("staging");
-        std::fs::create_dir_all(staging.join("rootfs")).expect("mkdir staging/rootfs");
-        assert!(run_cmd_status(
-            "cp",
-            &[
-                "-a",
-                "--",
-                &format!("{}/.", rootfs.display()),
-                &staging.join("rootfs").to_string_lossy()
-            ]
-        ));
-        std::fs::copy(bundle_dir.join("config.json"), staging.join("config.json"))
-            .expect("cp config.json");
-
-        // Bake ConfigMap data into volumes/<vol_id>/
-        let vol_staging = staging.join("volumes").join(&vol_id);
-        std::fs::create_dir_all(&vol_staging).expect("mkdir vol staging");
-        assert!(run_cmd_status(
-            "cp",
-            &[
-                "-a",
-                "--",
-                &format!("{}/.", cm_src.display()),
-                &vol_staging.to_string_lossy()
-            ]
-        ));
-
-        // Create ext4 image with mkfs.ext4 -d (no loopback mount)
-        let f = std::fs::File::create(&disk_path).expect("create disk");
-        f.set_len(64 * 1024 * 1024).expect("set_len"); // 64MB
-        drop(f);
-        assert!(run_cmd_status(
-            "mkfs.ext4",
-            &[
-                "-q",
-                "-F",
-                "-d",
-                &staging.to_string_lossy(),
-                &disk_path.to_string_lossy()
-            ]
-        ));
-        std::fs::remove_dir_all(&staging).ok();
-        eprintln!("           │ Disk image with baked ConfigMap created");
+        // Create erofs disk image from rootfs directory
+        let disk_path = vm.state_dir().join(format!("{container_id}.erofs"));
+        assert!(
+            run_cmd_status(
+                "mkfs.erofs",
+                &[
+                    "--quiet",
+                    &disk_path.to_string_lossy(),
+                    &rootfs.to_string_lossy()
+                ]
+            ),
+            "mkfs.erofs failed"
+        );
+        std::fs::remove_dir_all(&bundle_dir).ok();
+        eprintln!("           │ erofs rootfs image created");
 
         // ── Phase 3: Hot-plug disk and run container ─────────────────
         eprintln!("  Phase 3 │ Hot-plugging disk and running container");
@@ -1928,18 +1779,33 @@ fn test_volume_mounts() {
         let vsock = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
         let (agent, _health) = vsock.connect_ttrpc().await.expect("ttrpc");
 
-        // Send CreateContainer with FILESYSTEM volume mount pointing to baked-in data
+        // Send CreateContainer with inline config.json + inline ConfigMap volume
         let bundle_guest = format!("/run/containers/{}", container_id);
         let mut create_req = cloudhv_proto::CreateContainerRequest::new();
         create_req.container_id = container_id.clone();
         create_req.bundle_path = bundle_guest.clone();
+        create_req.config_json = config_json_bytes;
+        create_req.erofs_layers = 1;
 
-        // Add the ConfigMap as a FILESYSTEM volume (baked into disk)
+        // Add the ConfigMap as an inline FILESYSTEM volume
         let mut vol_mount = cloudhv_proto::VolumeMount::new();
         vol_mount.destination = vol_dest.to_string();
-        vol_mount.source = format!("{}/volumes/{}", bundle_guest, vol_id);
+        vol_mount.source = format!("{}/volumes/inline-cm", bundle_guest);
         vol_mount.volume_type = cloudhv_proto::VolumeType::FILESYSTEM.into();
         vol_mount.readonly = true;
+
+        let mut inline_file1 = cloudhv_proto::InlineFile::new();
+        inline_file1.path = "app.conf".to_string();
+        inline_file1.content = b"setting=BAKED_VALUE\n".to_vec();
+        inline_file1.mode = 0o644;
+        vol_mount.files.push(inline_file1);
+
+        let mut inline_file2 = cloudhv_proto::InlineFile::new();
+        inline_file2.path = "extra.yaml".to_string();
+        inline_file2.content = b"env: production\n".to_vec();
+        inline_file2.mode = 0o644;
+        vol_mount.files.push(inline_file2);
+
         create_req.volumes.push(vol_mount);
 
         let ctx = ttrpc::context::with_duration(Duration::from_secs(30));
@@ -2006,7 +1872,6 @@ fn test_volume_mounts() {
         drop(_health);
         vm.cleanup().await.expect("cleanup");
         let _ = std::fs::remove_file(&disk_path);
-        let _ = std::fs::remove_dir_all(&bundle_dir);
 
         eprintln!("╚══════════════════════════════════════════════════════════╝\n");
     });
@@ -2033,7 +1898,7 @@ fn test_inline_metadata_delivery() {
         return;
     }
 
-    for tool in ["mkfs.ext4", "cp"] {
+    for tool in ["mkfs.erofs", "cp"] {
         if !run_cmd_status("which", &[tool]) {
             eprintln!("SKIPPING: {tool} not found");
             return;
@@ -2088,34 +1953,21 @@ fn test_inline_metadata_delivery() {
             }
         }
 
-        // Rootfs-only disk — NO config.json, NO volumes baked in
-        let disk_path = vm.state_dir().join(format!("{container_id}.img"));
-        let staging = disk_path.with_extension("staging");
-        std::fs::create_dir_all(staging.join("rootfs")).expect("mkdir staging/rootfs");
-        assert!(run_cmd_status(
-            "cp",
-            &[
-                "-a",
-                "--",
-                &format!("{}/.", rootfs.display()),
-                &staging.join("rootfs").to_string_lossy()
-            ]
-        ));
-        let f = std::fs::File::create(&disk_path).expect("create disk");
-        f.set_len(64 * 1024 * 1024).expect("set_len");
-        drop(f);
-        assert!(run_cmd_status(
-            "mkfs.ext4",
-            &[
-                "-q",
-                "-F",
-                "-d",
-                &staging.to_string_lossy(),
-                &disk_path.to_string_lossy()
-            ]
-        ));
-        std::fs::remove_dir_all(&staging).ok();
-        eprintln!("           │ Rootfs-only disk created (no config.json baked in)");
+        // Rootfs-only erofs disk — NO config.json, NO volumes baked in
+        let disk_path = vm.state_dir().join(format!("{container_id}.erofs"));
+        assert!(
+            run_cmd_status(
+                "mkfs.erofs",
+                &[
+                    "--quiet",
+                    &disk_path.to_string_lossy(),
+                    &rootfs.to_string_lossy()
+                ]
+            ),
+            "mkfs.erofs failed"
+        );
+        std::fs::remove_dir_all(&bundle_dir).ok();
+        eprintln!("           │ Rootfs-only erofs disk created (no config.json baked in)");
 
         // ── Phase 3: Hot-plug + inline RPC ────────────────────────────
         eprintln!("  Phase 3 │ Hot-plugging disk and sending inline metadata");
@@ -2148,6 +2000,7 @@ fn test_inline_metadata_delivery() {
         create_req.container_id = container_id.clone();
         create_req.bundle_path = bundle_guest.clone();
         create_req.config_json = config_json_bytes;
+        create_req.erofs_layers = 1;
 
         // Inline ConfigMap volume (files delivered via RPC, not on disk)
         let mut vol_mount = cloudhv_proto::VolumeMount::new();
@@ -2222,178 +2075,6 @@ fn test_inline_metadata_delivery() {
         vm.cleanup().await.expect("cleanup");
         let _ = std::fs::remove_file(&disk_path);
         let _ = std::fs::remove_dir_all(&bundle_dir);
-
-        eprintln!("╚══════════════════════════════════════════════════════════╝\n");
-    });
-}
-
-/// Test flat disk layout (simulating devmapper passthrough).
-///
-/// Creates an ext4 image with the container filesystem at the ROOT (no rootfs/
-/// subdirectory), simulating what a devmapper snapshot looks like. The agent
-/// should detect the flat layout and remount at rootfs/.
-#[test]
-fn test_flat_disk_layout() {
-    let fixtures = TestFixtures::resolve().expect("failed to resolve test fixtures");
-    skip_if_missing!(fixtures);
-
-    let shell_src = std::path::PathBuf::from("/bin/busybox");
-    if !shell_src.exists() {
-        eprintln!("SKIPPING: /bin/busybox not found (required for static shell)");
-        return;
-    }
-
-    for tool in ["mkfs.ext4", "cp"] {
-        if !run_cmd_status("which", &[tool]) {
-            eprintln!("SKIPPING: {tool} not found");
-            return;
-        }
-    }
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-
-    rt.block_on(async {
-        let config = fixtures.runtime_config();
-        let vm_id = format!("flat-test-{}", std::process::id());
-        let container_id = format!("flat-ctr-{}", std::process::id());
-
-        eprintln!("\n╔══════════════════════════════════════════════════════════╗");
-        eprintln!("║  Flat Disk Layout (devmapper sim) — Integration Test    ║");
-        eprintln!("╠══════════════════════════════════════════════════════════╣");
-
-        // ── Boot VM
-        eprintln!("  Phase 1 │ Booting VM");
-        let mut vm =
-            containerd_shim_cloudhv::vm::VmManager::new(vm_id.clone(), config).expect("VmManager");
-        vm.prepare().await.expect("prepare");
-        vm.spawn_vmm_in_netns(None).expect("vmm spawn failed");
-        vm.wait_vmm_ready().await.expect("vmm ready failed");
-        vm.create_and_boot_vm(None, None, vec![])
-            .await
-            .expect("boot");
-        tokio::time::timeout(Duration::from_secs(30), vm.wait_for_agent())
-            .await
-            .expect("agent timeout")
-            .expect("agent");
-
-        // ── Create FLAT ext4 disk (container fs at root, no rootfs/ wrapper)
-        eprintln!("  Phase 2 │ Creating flat ext4 disk (no rootfs/ subdirectory)");
-        let rootfs_dir = vm.state_dir().join("flat-rootfs");
-        let bin_dir = rootfs_dir.join("bin");
-        std::fs::create_dir_all(&bin_dir).expect("mkdir bin");
-        std::fs::copy(&shell_src, bin_dir.join("sh")).expect("cp shell");
-        std::process::Command::new("chmod")
-            .args(["755", &bin_dir.join("sh").to_string_lossy()])
-            .status()
-            .expect("chmod");
-        if shell_src.to_string_lossy().contains("busybox") {
-            for applet in &["cat", "echo"] {
-                let _ = std::os::unix::fs::symlink("sh", bin_dir.join(applet));
-            }
-        }
-
-        // Create ext4 with files at ROOT (flat, like devmapper)
-        let disk_path = vm.state_dir().join(format!("{container_id}-flat.img"));
-        let f = std::fs::File::create(&disk_path).expect("create disk");
-        f.set_len(32 * 1024 * 1024).expect("set_len");
-        drop(f);
-        assert!(run_cmd_status(
-            "mkfs.ext4",
-            &[
-                "-q",
-                "-F",
-                "-O",
-                "^has_journal",
-                "-d",
-                &rootfs_dir.to_string_lossy(),
-                &disk_path.to_string_lossy()
-            ]
-        ));
-        eprintln!("           │ Flat disk created (files at root, no rootfs/ subdir)");
-
-        // ── Hot-plug + inline RPC
-        eprintln!("  Phase 3 │ Hot-plugging flat disk");
-        let disk_id = format!("ctr-{}", &container_id[..12.min(container_id.len())]);
-        vm.add_disk(&disk_path.to_string_lossy(), &disk_id, false)
-            .await
-            .expect("add_disk");
-
-        let vsock = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
-        let (agent, _health) = vsock.connect_ttrpc().await.expect("ttrpc");
-
-        let config_json = serde_json::json!({
-            "ociVersion": "1.0.2",
-            "process": {
-                "terminal": false,
-                "user": { "uid": 0, "gid": 0 },
-                "args": ["sh", "-c", "echo FLAT_LAYOUT_WORKS"],
-                "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
-                "cwd": "/"
-            },
-            "root": { "path": "rootfs", "readonly": false },
-            "linux": { "namespaces": [{"type": "pid"}, {"type": "mount"}] }
-        });
-
-        let bundle_guest = format!("/run/containers/{}", container_id);
-        let mut create_req = cloudhv_proto::CreateContainerRequest::new();
-        create_req.container_id = container_id.clone();
-        create_req.bundle_path = bundle_guest.clone();
-        create_req.config_json = serde_json::to_vec_pretty(&config_json).unwrap();
-
-        let ctx = ttrpc::context::with_duration(Duration::from_secs(30));
-        agent
-            .create_container(ctx, &create_req)
-            .await
-            .expect("CreateContainer with flat disk");
-
-        let mut start_req = cloudhv_proto::StartContainerRequest::new();
-        start_req.container_id = container_id.clone();
-        let ctx = ttrpc::context::with_duration(Duration::from_secs(30));
-        agent
-            .start_container(ctx, &start_req)
-            .await
-            .expect("StartContainer");
-
-        let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
-        wait_req.container_id = container_id.clone();
-        let ctx = ttrpc::context::with_duration(Duration::from_secs(60));
-        let wait_resp = agent
-            .wait_container(ctx, &wait_req)
-            .await
-            .expect("WaitContainer");
-        assert_eq!(wait_resp.exit_status, 0, "container should exit 0");
-
-        // ── Verify
-        eprintln!("  Phase 4 │ Verifying flat layout remount worked");
-        let mut log_req = cloudhv_proto::GetContainerLogsRequest::new();
-        log_req.container_id = container_id.clone();
-        let ctx = ttrpc::context::with_duration(Duration::from_secs(5));
-        let log_resp = agent
-            .get_container_logs(ctx, &log_req)
-            .await
-            .expect("GetContainerLogs");
-        let stdout = String::from_utf8_lossy(&log_resp.stdout);
-        assert!(
-            stdout.contains("FLAT_LAYOUT_WORKS"),
-            "stdout should contain FLAT_LAYOUT_WORKS, got: {stdout:?}"
-        );
-        eprintln!("           │ ✅ Flat layout remount worked — container output verified");
-
-        // ── Cleanup
-        eprintln!("  Phase 5 │ Cleaning up");
-        let mut del_req = cloudhv_proto::DeleteContainerRequest::new();
-        del_req.container_id = container_id.clone();
-        let ctx = ttrpc::context::with_duration(Duration::from_secs(10));
-        let _ = agent.delete_container(ctx, &del_req).await;
-
-        drop(agent);
-        drop(_health);
-        vm.cleanup().await.expect("cleanup");
-        let _ = std::fs::remove_file(&disk_path);
-        let _ = std::fs::remove_dir_all(&rootfs_dir);
 
         eprintln!("╚══════════════════════════════════════════════════════════╝\n");
     });

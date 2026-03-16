@@ -58,6 +58,7 @@ impl AgentService for AgentServiceHandler {
                 &volumes,
                 &req.config_json,
                 req.rootfs_preattached,
+                req.erofs_layers,
             )
             .await
             .map_err(|e| ttrpc::Error::Others(format!("create_container failed: {e:#}")))?;
@@ -97,6 +98,7 @@ impl AgentService for AgentServiceHandler {
                 &volumes,
                 &req.config_json,
                 req.rootfs_preattached,
+                req.erofs_layers,
             )
             .await
             .map_err(|e| ttrpc::Error::Others(format!("run_container failed: {e:#}")))?;

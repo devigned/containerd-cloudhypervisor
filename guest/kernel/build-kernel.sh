@@ -82,10 +82,14 @@ if [ -f "../${CONFIG_FILE}" ]; then
     scripts/config --enable PAGE_REPORTING
     scripts/config --enable PSI
     scripts/config --disable PSI_DEFAULT_DISABLED
+    scripts/config --enable EROFS_FS
+    scripts/config --enable EROFS_FS_XATTR
+    scripts/config --enable EROFS_FS_POSIX_ACL
+    scripts/config --enable EROFS_FS_SECURITY
     make olddefconfig
 
     # Verify critical configs (common + arch-specific)
-    VERIFY_OPTS="PCI_MSI VSOCKETS VIRTIO_VSOCKETS BPF_SYSCALL CGROUP_BPF HOTPLUG_PCI VIRTIO_MEM PSI"
+    VERIFY_OPTS="PCI_MSI VSOCKETS VIRTIO_VSOCKETS BPF_SYSCALL CGROUP_BPF HOTPLUG_PCI VIRTIO_MEM PSI EROFS_FS"
     if [ "${HOST_ARCH}" = "x86_64" ]; then
         VERIFY_OPTS="${VERIFY_OPTS} PVH"
     elif [ "${HOST_ARCH}" = "aarch64" ]; then

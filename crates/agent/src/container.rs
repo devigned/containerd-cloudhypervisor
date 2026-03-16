@@ -99,64 +99,6 @@ impl ContainerManager {
             .unwrap_or_default()
     }
 
-    /// Wait for a newly hot-plugged block device to appear, then mount it.
-    /// Returns the device path (e.g., "/dev/vdc").
-    async fn discover_and_mount_new_disk(
-        &mut self,
-        _mount_point: &std::path::Path,
-    ) -> Result<String> {
-        // Poll for a new vdX device to appear (ACPI hot-plug detection)
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        let new_disk = loop {
-            let current = Self::scan_block_devices();
-            let new_devices: Vec<_> = current.difference(&self.known_disks).cloned().collect();
-            if let Some(dev) = new_devices.first() {
-                self.known_disks.insert(dev.clone());
-                break format!("/dev/{dev}");
-            }
-            if tokio::time::Instant::now() > deadline {
-                anyhow::bail!(
-                    "timed out waiting for hot-plugged disk (known: {:?})",
-                    self.known_disks
-                );
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        };
-
-        info!("discovered new disk: {}", new_disk);
-
-        // Mount the disk — retry as the device may not be immediately ready.
-        // ext4 with noatime + nobarrier (ephemeral container disks don't need crash consistency).
-        #[cfg(target_os = "linux")]
-        {
-            use nix::mount::{mount, MsFlags};
-            for attempt in 1..=20 {
-                match mount(
-                    Some(new_disk.as_str()),
-                    _mount_point,
-                    Some("ext4"),
-                    MsFlags::MS_NOATIME,
-                    Some("nobarrier"),
-                ) {
-                    Ok(()) => {
-                        return Ok(new_disk);
-                    }
-                    Err(e) if attempt < 20 => {
-                        debug!("mount attempt {attempt} failed: {e}");
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                    Err(e) => {
-                        anyhow::bail!("mount {} at {}: {e}", new_disk, _mount_point.display())
-                    }
-                }
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        let _ = _mount_point;
-
-        anyhow::bail!("failed to mount disk after retries")
-    }
-
     /// Discover a newly hot-plugged block device by scanning /sys/block.
     /// Returns the device path (e.g., "/dev/vdc") if a new device is found.
     fn discover_block_device(&mut self) -> Option<String> {
@@ -314,14 +256,11 @@ impl ContainerManager {
         Ok(())
     }
 
-    /// Create a new container from a block device.
+    /// Create a new container from erofs block devices.
     ///
-    /// The host shim either hot-plugs a cached rootfs disk or pre-attaches it
-    /// at VM boot time. The OCI config.json and filesystem volume data are
-    /// delivered inline via the RPC and written to tmpfs.
-    ///
-    /// When `rootfs_preattached` is true, the rootfs disk is at `/dev/vdb`
-    /// (deterministic, attached at boot). Skips discover_and_mount_new_disk polling.
+    /// The erofs snapshotter creates layer.erofs blobs per image layer.
+    /// The shim passes these as read-only virtio-blk devices to the VM.
+    /// The agent mounts each as erofs, composes with overlayfs + tmpfs upper.
     pub async fn create(
         &mut self,
         container_id: &str,
@@ -329,119 +268,107 @@ impl ContainerManager {
         volumes: &[VolumeInfo],
         config_json: &[u8],
         rootfs_preattached: bool,
+        erofs_layers: u32,
     ) -> Result<u32> {
-        info!("creating container: id={}", container_id);
+        info!(
+            "creating container: id={} erofs_layers={} preattached={}",
+            container_id, erofs_layers, rootfs_preattached
+        );
+
+        if erofs_layers == 0 {
+            anyhow::bail!("erofs_layers must be > 0: the erofs snapshotter is required");
+        }
 
         let mount_point = PathBuf::from("/run/containers").join(container_id);
         std::fs::create_dir_all(&mount_point)?;
 
-        // Mount the hot-plugged disk at a staging location, then bind-mount
-        // rootfs/ into the bundle. This keeps the bundle directory writable
-        // (for config.json + volume files).
-        let disk_mount = mount_point.join("_disk");
-        std::fs::create_dir_all(&disk_mount)?;
-
-        let disk_path = if rootfs_preattached {
-            // Pre-attached at boot: rootfs is deterministically at /dev/vdb
-            let dev = "/dev/vdb".to_string();
-            info!("rootfs pre-attached at {}", dev);
-
-            #[cfg(target_os = "linux")]
-            {
-                use nix::mount::{mount, MsFlags};
-                for attempt in 1..=20 {
-                    match mount(
-                        Some(dev.as_str()),
-                        &disk_mount,
-                        Some("ext4"),
-                        MsFlags::MS_NOATIME,
-                        Some("nobarrier"),
-                    ) {
-                        Ok(()) => {
-                            info!(
-                                "mounted pre-attached rootfs {} at {}",
-                                dev,
-                                disk_mount.display()
-                            );
-                            break;
-                        }
-                        Err(e) if attempt < 20 => {
-                            debug!("mount attempt {attempt} for pre-attached rootfs failed: {e}");
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        }
-                        Err(e) => {
-                            anyhow::bail!(
-                                "mount pre-attached {} at {}: {e}",
-                                dev,
-                                disk_mount.display()
-                            )
-                        }
-                    }
-                }
-            }
-            #[cfg(not(target_os = "linux"))]
-            let _ = &disk_mount;
-
-            dev
-        } else {
-            // Hot-plugged: discover the new disk by scanning /sys/block
-            self.discover_and_mount_new_disk(&disk_mount)
-                .await
-                .context("discover/mount rootfs disk")?
-        };
-
-        // Determine rootfs location on the disk:
-        //   - Our cached images: rootfs/ exists at top level
-        //   - Devmapper snapshots: container FS is at root (flat layout)
-        let rootfs_on_disk = if disk_mount.join("rootfs").exists() {
-            disk_mount.join("rootfs")
-        } else {
-            disk_mount.clone()
-        };
-
-        // Bind-mount rootfs into the bundle
         let rootfs_dir = mount_point.join("rootfs");
         std::fs::create_dir_all(&rootfs_dir)?;
+
+        // Mount each erofs layer and compose with overlayfs
         #[cfg(target_os = "linux")]
         {
             use nix::mount::{mount, MsFlags};
-            mount(
-                Some(rootfs_on_disk.as_path()),
-                rootfs_dir.as_path(),
-                None::<&str>,
-                MsFlags::MS_BIND,
-                None::<&str>,
-            )
-            .with_context(|| {
-                format!(
-                    "bind-mount rootfs {} -> {}",
-                    rootfs_on_disk.display(),
-                    rootfs_dir.display()
-                )
-            })?;
-        }
-        info!(
-            "mounted rootfs disk {} -> {} -> {}",
-            disk_path,
-            rootfs_on_disk.display(),
-            rootfs_dir.display()
-        );
 
-        // Write config.json: prefer inline RPC data, fall back to disk content
+            let mut lowerdirs: Vec<String> = Vec::new();
+
+            for i in 0..erofs_layers {
+                let dev = if rootfs_preattached {
+                    // Pre-attached: sequential devices from /dev/vdb
+                    format!("/dev/vd{}", (b'b' + i as u8) as char)
+                } else {
+                    // TODO: for multi-container hot-plug, discover devices via /sys/block
+                    format!("/dev/vd{}", (b'b' + i as u8) as char)
+                };
+
+                let layer_mount = mount_point.join(format!("layer{i}"));
+                std::fs::create_dir_all(&layer_mount)?;
+
+                for attempt in 1..=20 {
+                    match mount(
+                        Some(dev.as_str()),
+                        &layer_mount,
+                        Some("erofs"),
+                        MsFlags::MS_RDONLY | MsFlags::MS_NOATIME,
+                        None::<&str>,
+                    ) {
+                        Ok(()) => {
+                            info!("mounted erofs layer {} at {}", dev, layer_mount.display());
+                            break;
+                        }
+                        Err(e) if attempt < 20 => {
+                            debug!("mount attempt {attempt} for erofs {dev} failed: {e}");
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                        Err(e) => {
+                            anyhow::bail!("mount erofs {} at {}: {e}", dev, layer_mount.display());
+                        }
+                    }
+                }
+
+                lowerdirs.push(layer_mount.to_string_lossy().to_string());
+            }
+
+            // Create writable upper + work dirs on tmpfs
+            let upper_dir = mount_point.join("upper");
+            let work_dir = mount_point.join("work");
+            std::fs::create_dir_all(&upper_dir)?;
+            std::fs::create_dir_all(&work_dir)?;
+
+            // Compose overlayfs: erofs layers as lowerdirs, tmpfs as upper
+            let lowerdir_opt = lowerdirs.join(":");
+            let overlay_opts = format!(
+                "lowerdir={},upperdir={},workdir={}",
+                lowerdir_opt,
+                upper_dir.display(),
+                work_dir.display()
+            );
+
+            mount(
+                Some("overlay"),
+                rootfs_dir.as_path(),
+                Some("overlay"),
+                MsFlags::empty(),
+                Some(overlay_opts.as_str()),
+            )
+            .with_context(|| format!("overlayfs mount with erofs layers: {overlay_opts}"))?;
+            info!(
+                "overlayfs rootfs: {} erofs layers + tmpfs upper",
+                erofs_layers
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (rootfs_preattached, erofs_layers);
+        }
+
+        // Write config.json: prefer inline RPC data, bail if missing
         if !config_json.is_empty() {
             std::fs::write(mount_point.join("config.json"), config_json)
                 .context("write inline config.json")?;
             info!("wrote inline config.json ({} bytes)", config_json.len());
-        } else if disk_mount.join("config.json").exists() {
-            // Legacy path: config.json baked into the disk image
-            std::fs::copy(
-                disk_mount.join("config.json"),
-                mount_point.join("config.json"),
-            )
-            .context("copy config.json from disk")?;
-            info!("copied config.json from disk");
         } else if !mount_point.join("config.json").exists() {
-            anyhow::bail!("no config.json: neither inline data nor on-disk file present");
+            anyhow::bail!("no config.json: inline data not provided and no on-disk file present");
         }
 
         // Write inline filesystem volume files to the bundle directory
@@ -489,7 +416,7 @@ impl ContainerManager {
 
         // If volumes were baked into the disk (legacy path), make them
         // accessible at the expected bundle path via symlink
-        let disk_volumes = disk_mount.join("volumes");
+        let disk_volumes = mount_point.join("_disk").join("volumes");
         let bundle_volumes = mount_point.join("volumes");
         if disk_volumes.exists() && !bundle_volumes.exists() {
             std::os::unix::fs::symlink(&disk_volumes, &bundle_volumes)
@@ -620,6 +547,7 @@ impl ContainerManager {
         volumes: &[VolumeInfo],
         config_json: &[u8],
         rootfs_preattached: bool,
+        erofs_layers: u32,
     ) -> Result<u32> {
         self.create(
             container_id,
@@ -627,6 +555,7 @@ impl ContainerManager {
             volumes,
             config_json,
             rootfs_preattached,
+            erofs_layers,
         )
         .await?;
         self.start(container_id).await

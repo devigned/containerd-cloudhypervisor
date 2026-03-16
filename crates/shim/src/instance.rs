@@ -174,36 +174,6 @@ impl Instance for CloudHvInstance {
     async fn delete(&self) -> Result<(), Error> {
         info!("CloudHvInstance::delete id={}", self.id);
 
-        // Always unmount the rootfs that containerd mounted, regardless of
-        // VM state. Without this, the devmapper snapshot stays "in use" and
-        // containerd's snapshotter retries deactivation in a blocking loop
-        // (100 × 15s), preventing all new container creation on the node.
-        let rootfs_mount = self.bundle.join("rootfs");
-        #[cfg(target_os = "linux")]
-        {
-            let rpath = rootfs_mount.clone();
-            let umount_result = tokio::task::spawn_blocking(move || {
-                use std::ffi::CString;
-                match CString::new(rpath.to_string_lossy().as_bytes()) {
-                    Ok(cpath) => {
-                        let rc = unsafe { libc::umount2(cpath.as_ptr(), libc::MNT_DETACH) };
-                        if rc == 0 {
-                            Ok(())
-                        } else {
-                            Err(std::io::Error::last_os_error())
-                        }
-                    }
-                    Err(e) => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)),
-                }
-            })
-            .await;
-            match umount_result {
-                Ok(Ok(())) => info!("unmounted rootfs: {}", rootfs_mount.display()),
-                Ok(Err(e)) => info!("rootfs unmount (best-effort): {e}"),
-                Err(e) => info!("rootfs unmount task failed: {e}"),
-            }
-        }
-
         let vm_state = get_vm(&self.sandbox_id);
 
         if let Some(vm_state) = vm_state {
@@ -407,96 +377,35 @@ impl CloudHvInstance {
         let spec_path = self.bundle.join("config.json");
         let volumes = extract_volumes(&spec_path).ctx("extract volumes")?;
 
-        // Check if rootfs is backed by a block device (devmapper snapshotter).
-        let rootfs_block_dev = detect_block_backing(&rootfs_path);
+        // Find erofs layer blobs backing the rootfs.
+        // The erofs snapshotter creates layer.erofs files that we pass directly
+        // to the VM as read-only block devices — no conversion needed.
+        let erofs_layers = find_erofs_layers(&rootfs_path);
+        if erofs_layers.is_empty() {
+            return Err(Error::Any(anyhow::anyhow!(
+                "no erofs layers found for rootfs at {}. \
+                 The erofs snapshotter must be configured in containerd.",
+                rootfs_path.display()
+            )));
+        }
 
-        let rootfs_disk_path = if let Some(block_dev) = &rootfs_block_dev {
-            // Tier 1: devmapper block passthrough — zero-copy, zero CPU
-            info!(
-                "rootfs backed by block device {}, using direct passthrough",
-                block_dev.display()
-            );
-            block_dev.clone()
-        } else {
-            // Tier 2: create ext4 cache image from overlayfs directory
-            let disk_path = parent_dir.join(format!("{disk_id}.img"));
-
-            let cache_dir = std::path::PathBuf::from("/opt/cloudhv/cache");
-            let rootfs_clone = rootfs_path.clone();
-
-            let cache_key = tokio::task::spawn_blocking(move || compute_rootfs_hash(&rootfs_clone))
-                .await
-                .map_err(|_| Error::Any(anyhow::anyhow!("hash task panicked")))?
-                .ctx("compute rootfs hash")?;
-
-            let cached_img = cache_dir.join(format!("{cache_key}.img"));
-            let rootfs_disk_path = parent_dir.join(format!("{disk_id}.img"));
-
-            if !cached_img.exists() {
-                info!("rootfs cache miss for {cache_key}, creating base image");
-                let rootfs_for_cache = rootfs_path.clone();
-                let cached_img_clone = cached_img.clone();
-                tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                    if let Some(parent) = cached_img_clone.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-
-                    let lock_path = cached_img_clone.with_extension("lock");
-                    let lock_file = std::fs::File::create(&lock_path)
-                        .map_err(|e| anyhow::anyhow!("create cache lock: {e}"))?;
-
-                    let fd = std::os::unix::io::AsRawFd::as_raw_fd(&lock_file);
-                    let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
-                    if ret != 0 {
-                        return Err(anyhow::anyhow!(
-                            "flock cache lock: {}",
-                            std::io::Error::last_os_error()
-                        ));
-                    }
-
-                    if cached_img_clone.exists() {
-                        log::info!(
-                            "cache populated by another process: {}",
-                            cached_img_clone.display()
-                        );
-                        return Ok(());
-                    }
-
-                    let tmp_path = cached_img_clone.with_extension("img.tmp");
-                    create_cached_rootfs_image(&rootfs_for_cache, &tmp_path)?;
-
-                    let f = std::fs::File::open(&tmp_path)?;
-                    f.sync_all()?;
-                    drop(f);
-
-                    std::fs::rename(&tmp_path, &cached_img_clone).map_err(|e| {
-                        std::fs::remove_file(&tmp_path).ok();
-                        anyhow::anyhow!("cache rename failed: {e}")
-                    })?;
-
-                    drop(lock_file);
-                    std::fs::remove_file(&lock_path).ok();
-                    Ok(())
-                })
-                .await
-                .map_err(|_| Error::Any(anyhow::anyhow!("cache build task panicked")))?
-                .ctx("build rootfs cache")?;
-            } else {
-                info!("rootfs cache hit for {cache_key}");
-            }
-
-            let cached_src = cached_img.clone();
-            let rootfs_dst = rootfs_disk_path.clone();
-            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                std::fs::copy(&cached_src, &rootfs_dst)?;
-                Ok(())
+        info!(
+            "rootfs backed by {} erofs layer(s), using direct passthrough",
+            erofs_layers.len()
+        );
+        for (i, layer) in erofs_layers.iter().enumerate() {
+            let size = std::fs::metadata(layer).map(|m| m.len()).unwrap_or(0);
+            info!("  erofs layer {}: {} ({} bytes)", i, layer.display(), size);
+        }
+        let rootfs_disks: Vec<(std::path::PathBuf, String, bool)> = erofs_layers
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                let id = format!("{disk_id}-layer{i}");
+                info!("  disk {id} -> {} (readonly)", path.display());
+                (path.clone(), id, true)
             })
-            .await
-            .map_err(|_| Error::Any(anyhow::anyhow!("rootfs copy panicked")))?
-            .ctx("copy cached rootfs")?;
-
-            disk_path
-        };
+            .collect();
 
         // Determine boot role: first container boots the VM, others wait.
         enum BootRole {
@@ -524,18 +433,21 @@ impl CloudHvInstance {
 
         match boot_role {
             BootRole::First => {
-                // First container — boot VM with rootfs pre-attached as /dev/vdb
-                let extra_disk = VmDisk {
-                    path: rootfs_disk_path.to_string_lossy().to_string(),
-                    readonly: false,
-                    id: Some(disk_id.clone()),
-                };
+                // First container — boot VM with rootfs disks pre-attached
+                let extra_disks: Vec<VmDisk> = rootfs_disks
+                    .iter()
+                    .map(|(path, id, readonly)| VmDisk {
+                        path: path.to_string_lossy().to_string(),
+                        readonly: *readonly,
+                        id: Some(id.clone()),
+                    })
+                    .collect();
                 let boot_result = vm_state
                     .vm
                     .create_and_boot_vm(
                         vm_state.tap_name.as_deref(),
                         vm_state.tap_mac.as_deref(),
-                        vec![extra_disk],
+                        extra_disks,
                     )
                     .await;
 
@@ -592,22 +504,24 @@ impl CloudHvInstance {
                     }
                 }
 
-                // Hot-plug disk for this container
+                // Hot-plug disks for this container
                 let api_socket = vm_state.api_socket.clone();
-                let disk_json = serde_json::json!({
-                    "path": rootfs_disk_path.to_string_lossy(),
-                    "readonly": false,
-                    "id": &disk_id,
-                });
-                VmManager::api_request_to_socket(
-                    &api_socket,
-                    "PUT",
-                    "/api/v1/vm.add-disk",
-                    Some(&disk_json.to_string()),
-                )
-                .await
-                .ctx("hot-plug rootfs disk")?;
-                info!("rootfs disk hot-plugged: {disk_id}");
+                for (path, id, readonly) in &rootfs_disks {
+                    let disk_json = serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "readonly": *readonly,
+                        "id": id,
+                    });
+                    VmManager::api_request_to_socket(
+                        &api_socket,
+                        "PUT",
+                        "/api/v1/vm.add-disk",
+                        Some(&disk_json.to_string()),
+                    )
+                    .await
+                    .ctx("hot-plug rootfs disk")?;
+                    info!("rootfs disk hot-plugged: {id}");
+                }
             }
         }
 
@@ -662,6 +576,7 @@ impl CloudHvInstance {
         create_req.bundle_path = bundle_guest.clone();
         create_req.config_json = config_json_bytes;
         create_req.rootfs_preattached = is_first_container;
+        create_req.erofs_layers = rootfs_disks.len() as u32;
         for vol in &volumes {
             let mut vm = cloudhv_proto::VolumeMount::new();
             vm.destination = vol.destination.clone();
@@ -922,29 +837,74 @@ fn to_systemd_cgroup_path(cgroups_path: &str) -> String {
     result
 }
 
-/// Detect if a directory is backed by a block device (e.g., devmapper snapshot).
+/// Find erofs layer blobs backing the container's rootfs.
 ///
-/// Parses `/proc/self/mountinfo` to find the mount source. If the source is a
-/// devmapper device (`/dev/mapper/*` or `/dev/dm-*`), returns the path.
-/// Returns None for overlayfs, tmpfs, or other non-devmapper mounts.
-fn detect_block_backing(path: &std::path::Path) -> Option<std::path::PathBuf> {
-    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
-    let path_str = path.to_string_lossy();
+/// When the erofs snapshotter is active, containerd mounts the rootfs as
+/// overlayfs with erofs lower layers.  We parse `/proc/self/mountinfo` to
+/// find the overlay mount at `rootfs_path`, extract its `lowerdir` entries,
+/// then find the erofs source files backing those mounts.
+///
+/// Returns the layer.erofs file paths in overlayfs lowerdir order
+/// (leftmost = top/highest precedence), or an empty
+/// vec if the rootfs is not backed by erofs (e.g., plain overlayfs).
+fn find_erofs_layers(rootfs_path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mountinfo = match std::fs::read_to_string("/proc/self/mountinfo") {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+    let path_str = rootfs_path.to_string_lossy();
+
+    // Step 1: find the overlay mount at rootfs_path and extract lowerdirs
+    let mut lowerdirs: Vec<String> = Vec::new();
     for line in mountinfo.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        // mountinfo format: id parent major:minor root mount_point options ... - fs_type source super_options
         if parts.len() > 4 && parts[4] == path_str.as_ref() {
             if let Some(sep) = parts.iter().position(|&p| p == "-") {
-                if parts.len() > sep + 2 {
-                    let src = parts[sep + 2];
-                    if src.starts_with("/dev/mapper/") || src.starts_with("/dev/dm-") {
-                        return Some(std::path::PathBuf::from(src));
+                if parts.len() > sep + 1 && parts[sep + 1] == "overlay" {
+                    // Found the overlay mount — extract lowerdir from options
+                    let super_opts = parts.get(sep + 3).unwrap_or(&"");
+                    for opt in super_opts.split(',') {
+                        if let Some(dirs) = opt.strip_prefix("lowerdir=") {
+                            lowerdirs = dirs.split(':').map(String::from).collect();
+                            break;
+                        }
+                    }
+                    // Also check mount options before the separator
+                    for part in parts.iter().take(sep).skip(5) {
+                        if let Some(dirs) = part.strip_prefix("lowerdir=") {
+                            lowerdirs = dirs.split(':').map(String::from).collect();
+                            break;
+                        }
                     }
                 }
             }
         }
     }
-    None
+
+    if lowerdirs.is_empty() {
+        return Vec::new();
+    }
+
+    // Step 2: for each lowerdir, find the erofs source file from mountinfo
+    let mut erofs_layers: Vec<std::path::PathBuf> = Vec::new();
+    for ldir in &lowerdirs {
+        for line in mountinfo.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() > 4 && parts[4] == ldir.as_str() {
+                if let Some(sep) = parts.iter().position(|&p| p == "-") {
+                    if parts.len() > sep + 2 && parts[sep + 1] == "erofs" {
+                        let src = parts[sep + 2];
+                        let path = std::path::PathBuf::from(src);
+                        if path.exists() {
+                            erofs_layers.push(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    erofs_layers
 }
 
 /// Parsed sandbox configuration from the OCI spec.
@@ -1138,352 +1098,30 @@ fn detect_block_fs_type(device: &str) -> Option<String> {
     }
 }
 
-/// Create an ext4 disk image containing the OCI bundle (config.json + rootfs).
+/// Create an erofs disk image containing the container rootfs.
 ///
-/// Uses `mkfs.ext4 -d` to populate the image directly from a staging directory,
-/// avoiding loopback mount/umount and kernel VFS lock contention.
-///
-/// NOTE: Retained for unit tests only. Production code uses
-/// [`create_cached_rootfs_image`] + inline RPC for metadata.
+/// Uses `mkfs.erofs` to create a read-only erofs image from the rootfs
+/// directory. The shim passes this to the VM as a read-only virtio-blk device.
 #[cfg(test)]
-fn create_rootfs_disk_image(
-    bundle_path: &str,
+fn create_rootfs_erofs_image(
     rootfs_path: &std::path::Path,
     disk_path: &std::path::Path,
-    volumes: &[VolumeSpec],
 ) -> anyhow::Result<()> {
     use anyhow::Context;
     use std::process::Command;
 
-    // Calculate total size: rootfs + read-only volume data (emptyDir excluded)
-    let mut total_size = dir_size(rootfs_path)?;
-    for vol in volumes {
-        if !vol.is_block && !vol.is_empty_dir {
-            total_size += dir_size(std::path::Path::new(&vol.source)).context("volume dir_size")?;
-        }
-    }
-    let image_size_mb = std::cmp::max(64, (total_size * 3 / 2 / 1024 / 1024 + 16) as u64);
-
-    // Create sparse file
-    let f = std::fs::File::create(disk_path)
-        .with_context(|| format!("create disk image: {}", disk_path.display()))?;
-    f.set_len(image_size_mb * 1024 * 1024)?;
-    drop(f);
-
-    // Stage the directory layout for mkfs.ext4 -d
-    let staging = disk_path.with_extension("staging");
-    std::fs::create_dir_all(staging.join("rootfs"))?;
-
-    let status = Command::new("cp")
-        .args(["-a", "--"])
-        .arg(format!("{}/.", rootfs_path.display()))
-        .arg(staging.join("rootfs"))
-        .status()
-        .context("cp rootfs to staging dir")?;
-    if !status.success() {
-        std::fs::remove_dir_all(&staging).ok();
-        anyhow::bail!("cp rootfs failed: {status}");
-    }
-
-    let config_src = std::path::Path::new(bundle_path).join("config.json");
-    if config_src.exists() {
-        std::fs::copy(&config_src, staging.join("config.json"))?;
-    }
-
-    // Stage read-only filesystem volumes (ConfigMaps, Secrets) into volumes/<id>/.
-    // emptyDir and block volumes are NOT baked in — they get separate disks.
-    for vol in volumes {
-        if vol.is_block || vol.is_empty_dir {
-            continue;
-        }
-        let vol_staging = staging.join("volumes").join(&vol.volume_id);
-        std::fs::create_dir_all(&vol_staging)?;
-        let src = std::path::Path::new(&vol.source);
-        if src.is_dir() {
-            let status = Command::new("cp")
-                .args(["-a", "--"])
-                .arg(format!("{}/.", src.display()))
-                .arg(&vol_staging)
-                .status()
-                .context("cp volume data")?;
-            if !status.success() {
-                std::fs::remove_dir_all(&staging).ok();
-                anyhow::bail!("failed to copy volume {} to staging: {status}", vol.source);
-            }
-        } else if src.is_file() {
-            // Copy single file preserving permissions (pure Rust, no shell)
-            copy_preserving_metadata(src, &vol_staging.join(src.file_name().unwrap_or_default()))
-                .with_context(|| format!("copy volume file: {}", src.display()))?;
-        }
-        log::info!(
-            "staged volume: {} -> volumes/{} (ro={})",
-            vol.destination,
-            vol.volume_id,
-            vol.readonly
-        );
-    }
-
-    // Create and populate ext4 image in one step (no loopback mount)
-    let status = Command::new("mkfs.ext4")
-        .args(["-q", "-F", "-d"])
-        .arg(&staging)
+    let status = Command::new("mkfs.erofs")
+        .args(["--quiet"])
         .arg(disk_path)
+        .arg(rootfs_path)
         .status()
-        .context("mkfs.ext4 -d")?;
-
-    std::fs::remove_dir_all(&staging).ok();
+        .context("mkfs.erofs")?;
 
     if !status.success() {
-        anyhow::bail!("mkfs.ext4 -d failed: {status}");
+        anyhow::bail!("mkfs.erofs failed: {status}");
     }
 
-    log::info!("disk image created: {}", disk_path.display());
-    Ok(())
-}
-
-/// Copy a file preserving ownership and permissions (pure Rust, no shell).
-#[cfg(test)]
-fn copy_preserving_metadata(src: &std::path::Path, dst: &std::path::Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    std::fs::copy(src, dst)?;
-    let meta = std::fs::metadata(src)?;
-    std::fs::set_permissions(dst, std::fs::Permissions::from_mode(meta.mode()))?;
-    nix::unistd::chown(
-        dst,
-        Some(nix::unistd::Uid::from_raw(meta.uid())),
-        Some(nix::unistd::Gid::from_raw(meta.gid())),
-    )?;
-    Ok(())
-}
-
-/// Calculate total size of a directory tree in bytes.
-fn dir_size(path: &std::path::Path) -> anyhow::Result<u64> {
-    let mut total = 0u64;
-    if path.is_dir() {
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            let meta = entry.metadata()?;
-            if meta.is_dir() {
-                total += dir_size(&entry.path())?;
-            } else {
-                total += meta.len();
-            }
-        }
-    }
-    Ok(total)
-}
-
-/// Count total entries (files + directories + symlinks) in a directory tree.
-/// Used to estimate inode requirements for ext4 image sizing.
-fn dir_entry_count(path: &std::path::Path) -> anyhow::Result<u64> {
-    let mut count = 0u64;
-    if path.is_dir() {
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            count += 1;
-            if entry.path().is_dir() {
-                count += dir_entry_count(&entry.path())?;
-            }
-        }
-    }
-    Ok(count)
-}
-
-// ---------------------------------------------------------------------------
-// Rootfs image cache — cached rootfs + inline metadata
-// ---------------------------------------------------------------------------
-
-/// Compute a metadata hash of a rootfs directory for cache keying.
-///
-/// Hashes the sorted list of (relative_path, size, mode) tuples using FNV-1a.
-/// This is safe because containerd snapshot mounts are immutable — the same
-/// image always produces the same overlayfs snapshot with identical file
-/// metadata. Does not hash file contents for speed.
-fn compute_rootfs_hash(rootfs: &std::path::Path) -> anyhow::Result<String> {
-    use std::collections::BTreeSet;
-    use std::os::unix::fs::MetadataExt;
-
-    fn walk(
-        base: &std::path::Path,
-        dir: &std::path::Path,
-        out: &mut BTreeSet<String>,
-    ) -> anyhow::Result<()> {
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let meta = entry.path().symlink_metadata()?;
-            let rel = entry
-                .path()
-                .strip_prefix(base)
-                .unwrap_or(entry.path().as_path())
-                .to_string_lossy()
-                .to_string();
-            out.insert(format!("{}:{}:{}", rel, meta.len(), meta.mode()));
-            if meta.file_type().is_dir() {
-                walk(base, &entry.path(), out)?;
-            }
-        }
-        Ok(())
-    }
-
-    let mut entries = BTreeSet::new();
-    walk(rootfs, rootfs, &mut entries)?;
-
-    // FNV-1a 64-bit hash of the sorted entry list
-    let mut h: u64 = 0xcbf29ce484222325;
-    for entry in &entries {
-        for b in entry.bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-    }
-    Ok(format!("{:016x}", h))
-}
-
-/// Create a cached rootfs-only ext4 image (one-time cost per container image).
-///
-/// The resulting image contains only `rootfs/` — no config.json or volumes.
-/// It is stored at `/opt/cloudhv/cache/<hash>.img` and cloned (cp) for each
-/// container, eliminating filesystem creation from the hot path.
-///
-/// Uses ext4 with journal disabled (`-O ^has_journal`) for minimal overhead
-/// on ephemeral container disks.
-fn create_cached_rootfs_image(
-    rootfs_path: &std::path::Path,
-    cache_path: &std::path::Path,
-) -> anyhow::Result<()> {
-    use anyhow::Context;
-    use std::process::Command;
-
-    if let Some(parent) = cache_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let staging = cache_path.with_extension("staging");
-    std::fs::create_dir_all(staging.join("rootfs"))?;
-
-    let status = Command::new("cp")
-        .args(["-a", "--"])
-        .arg(format!("{}/.", rootfs_path.display()))
-        .arg(staging.join("rootfs"))
-        .status()
-        .context("cp rootfs to cache staging")?;
-    if !status.success() {
-        std::fs::remove_dir_all(&staging).ok();
-        anyhow::bail!("cp rootfs to cache staging failed: {status}");
-    }
-
-    let total_size = dir_size(rootfs_path)?;
-    let inode_count = dir_entry_count(rootfs_path)?;
-    let size_for_bytes = total_size * 3 / 2 / 1024 / 1024 + 4;
-    let size_for_inodes = (inode_count * 16 / 1024).max(1);
-    let image_size_mb = std::cmp::max(16, std::cmp::max(size_for_bytes, size_for_inodes));
-
-    let f = std::fs::File::create(cache_path)
-        .with_context(|| format!("create cached image: {}", cache_path.display()))?;
-    f.set_len(image_size_mb * 1024 * 1024)?;
-    drop(f);
-
-    let status = Command::new("mkfs.ext4")
-        .args(["-q", "-F", "-O", "^has_journal", "-d"])
-        .arg(&staging)
-        .arg(cache_path)
-        .status()
-        .context("mkfs.ext4 -d for cache")?;
-    if !status.success() {
-        std::fs::remove_dir_all(&staging).ok();
-        std::fs::remove_file(cache_path).ok();
-        anyhow::bail!("mkfs.ext4 -d for rootfs cache failed: {status}");
-    }
-
-    std::fs::remove_dir_all(&staging).ok();
-
-    let size = std::fs::metadata(cache_path)
-        .map(|m| m.len() / 1024)
-        .unwrap_or(0);
-    log::info!("rootfs cached: {} ({}KB, ext4)", cache_path.display(), size);
-    Ok(())
-}
-
-/// Create a tiny metadata ext4 disk (config.json + volume data).
-///
-/// NOTE: Retained for unit tests only. Production code uses inline RPC +
-/// tmpfs instead of a metadata disk.
-#[cfg(test)]
-fn create_metadata_disk_image(
-    bundle_path: &str,
-    disk_path: &std::path::Path,
-    volumes: &[VolumeSpec],
-) -> anyhow::Result<()> {
-    use anyhow::Context;
-    use std::process::Command;
-
-    let staging = disk_path.with_extension("staging");
-    std::fs::create_dir_all(&staging)?;
-
-    // Copy config.json
-    let config_src = std::path::Path::new(bundle_path).join("config.json");
-    if config_src.exists() {
-        std::fs::copy(&config_src, staging.join("config.json"))?;
-    }
-
-    // Stage read-only filesystem volumes (ConfigMaps, Secrets)
-    let mut vol_size: u64 = 4096; // config.json + overhead
-    for vol in volumes {
-        if vol.is_block || vol.is_empty_dir {
-            continue;
-        }
-        let vol_staging = staging.join("volumes").join(&vol.volume_id);
-        std::fs::create_dir_all(&vol_staging)?;
-        let src = std::path::Path::new(&vol.source);
-        if src.is_dir() {
-            let status = Command::new("cp")
-                .args(["-a", "--"])
-                .arg(format!("{}/.", src.display()))
-                .arg(&vol_staging)
-                .status()
-                .context("cp volume data to metadata staging")?;
-            if !status.success() {
-                std::fs::remove_dir_all(&staging).ok();
-                anyhow::bail!(
-                    "failed to copy volume {} to metadata staging: {status}",
-                    vol.source
-                );
-            }
-            vol_size += dir_size(src).unwrap_or(0);
-        } else if src.is_file() {
-            copy_preserving_metadata(src, &vol_staging.join(src.file_name().unwrap_or_default()))
-                .with_context(|| format!("copy volume file: {}", src.display()))?;
-            vol_size += src.metadata().map(|m| m.len()).unwrap_or(0);
-        }
-    }
-
-    // Tiny image: just enough for metadata + padding (minimum 2MB for ext4)
-    let image_size_mb = std::cmp::max(2, vol_size * 3 / 2 / 1024 / 1024 + 1);
-
-    let f = std::fs::File::create(disk_path)
-        .with_context(|| format!("create metadata disk: {}", disk_path.display()))?;
-    f.set_len(image_size_mb * 1024 * 1024)?;
-    drop(f);
-
-    let status = Command::new("mkfs.ext4")
-        .args(["-q", "-F", "-d"])
-        .arg(&staging)
-        .arg(disk_path)
-        .status()
-        .context("mkfs.ext4 -d for metadata")?;
-
-    std::fs::remove_dir_all(&staging).ok();
-
-    if !status.success() {
-        anyhow::bail!("mkfs.ext4 -d for metadata disk failed: {status}");
-    }
-
-    log::info!(
-        "metadata disk created: {} ({}MB)",
-        disk_path.display(),
-        image_size_mb
-    );
+    log::info!("erofs image created: {}", disk_path.display());
     Ok(())
 }
 
@@ -1956,46 +1594,6 @@ mod tests {
     }
 
     #[test]
-    fn copy_preserving_metadata_copies_content_and_permissions() {
-        let dir = TempDir::new().unwrap();
-        let src = dir.path().join("source.txt");
-        let dst = dir.path().join("dest.txt");
-        fs::write(&src, "hello world").unwrap();
-
-        // Set specific permissions
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&src, fs::Permissions::from_mode(0o644)).unwrap();
-
-        copy_preserving_metadata(&src, &dst).unwrap();
-
-        assert_eq!(fs::read_to_string(&dst).unwrap(), "hello world");
-        let src_meta = fs::metadata(&src).unwrap();
-        let dst_meta = fs::metadata(&dst).unwrap();
-        assert_eq!(
-            src_meta.permissions().mode() & 0o777,
-            dst_meta.permissions().mode() & 0o777
-        );
-    }
-
-    #[test]
-    fn dir_size_counts_nested_files() {
-        let dir = TempDir::new().unwrap();
-        let sub = dir.path().join("sub");
-        fs::create_dir_all(&sub).unwrap();
-        fs::write(dir.path().join("a.txt"), "aaaa").unwrap(); // 4 bytes
-        fs::write(sub.join("b.txt"), "bbbbbbbb").unwrap(); // 8 bytes
-        let size = super::dir_size(dir.path()).unwrap();
-        assert!(size >= 12, "total should be at least 12 bytes, got {size}");
-    }
-
-    #[test]
-    fn dir_size_empty_dir() {
-        let dir = TempDir::new().unwrap();
-        let size = super::dir_size(dir.path()).unwrap();
-        assert_eq!(size, 0);
-    }
-
-    #[test]
     fn volume_id_is_deterministic() {
         let id1 = volume_id_for("/etc/config");
         let id2 = volume_id_for("/etc/config");
@@ -2003,83 +1601,6 @@ mod tests {
         // Different paths produce different IDs
         let id3 = volume_id_for("/etc/secrets");
         assert_ne!(id1, id3);
-    }
-
-    #[test]
-    fn create_rootfs_disk_image_with_volumes() {
-        // Skip if mkfs.ext4 isn't available
-        if std::process::Command::new("which")
-            .arg("mkfs.ext4")
-            .output()
-            .map(|o| !o.status.success())
-            .unwrap_or(true)
-        {
-            eprintln!("SKIPPING: mkfs.ext4 not available");
-            return;
-        }
-
-        let dir = TempDir::new().unwrap();
-
-        // Create a minimal rootfs
-        let rootfs = dir.path().join("rootfs");
-        fs::create_dir_all(rootfs.join("bin")).unwrap();
-        fs::write(rootfs.join("bin/hello"), "#!/bin/sh\necho hi\n").unwrap();
-
-        // Create bundle with config.json
-        let bundle = dir.path().join("bundle");
-        fs::create_dir_all(&bundle).unwrap();
-        let config = serde_json::json!({
-            "ociVersion": "1.0.2",
-            "process": { "args": ["/bin/hello"] },
-            "root": { "path": "rootfs" }
-        });
-        fs::write(
-            bundle.join("config.json"),
-            serde_json::to_string_pretty(&config).unwrap(),
-        )
-        .unwrap();
-
-        // Create ConfigMap volume data
-        let cm_src = dir.path().join("cm-vol");
-        fs::create_dir_all(&cm_src).unwrap();
-        fs::write(cm_src.join("app.conf"), "key=value\n").unwrap();
-        fs::write(cm_src.join("extra.yaml"), "foo: bar\n").unwrap();
-
-        let volumes = vec![
-            VolumeSpec {
-                destination: "/etc/config".to_string(),
-                source: cm_src.to_string_lossy().to_string(),
-                readonly: true,
-                is_block: false,
-                is_empty_dir: false,
-                fs_type: String::new(),
-                volume_id: volume_id_for("/etc/config"),
-            },
-            // emptyDir should be skipped (separate disk)
-            VolumeSpec {
-                destination: "/tmp".to_string(),
-                source: "/var/lib/kubelet/pods/x/volumes/kubernetes.io~empty-dir/tmp".to_string(),
-                readonly: false,
-                is_block: false,
-                is_empty_dir: true,
-                fs_type: String::new(),
-                volume_id: volume_id_for("/tmp"),
-            },
-        ];
-
-        let disk = dir.path().join("container.img");
-        create_rootfs_disk_image(&bundle.to_string_lossy(), &rootfs, &disk, &volumes)
-            .expect("create_rootfs_disk_image should succeed");
-
-        // Verify the disk image was created and is non-trivial
-        let meta = fs::metadata(&disk).unwrap();
-        assert!(meta.len() > 0, "disk image should not be empty");
-
-        // Verify staging directory was cleaned up
-        assert!(
-            !disk.with_extension("staging").exists(),
-            "staging dir should be cleaned up"
-        );
     }
 
     #[test]
@@ -2148,81 +1669,6 @@ mod tests {
     }
 
     #[test]
-    fn compute_rootfs_hash_deterministic() {
-        let dir = TempDir::new().unwrap();
-        let rootfs = dir.path().join("rootfs");
-        fs::create_dir_all(rootfs.join("bin")).unwrap();
-        fs::write(rootfs.join("bin/hello"), "#!/bin/sh\necho hi\n").unwrap();
-        fs::write(rootfs.join("bin/world"), "data").unwrap();
-
-        let h1 = compute_rootfs_hash(&rootfs).unwrap();
-        let h2 = compute_rootfs_hash(&rootfs).unwrap();
-        assert_eq!(h1, h2, "same content should produce same hash");
-        assert_eq!(h1.len(), 16, "hash should be 16 hex chars");
-    }
-
-    #[test]
-    fn compute_rootfs_hash_differs_on_content_change() {
-        let dir = TempDir::new().unwrap();
-        let rootfs = dir.path().join("rootfs");
-        fs::create_dir_all(rootfs.join("bin")).unwrap();
-        fs::write(rootfs.join("bin/app"), "v1").unwrap();
-        let h1 = compute_rootfs_hash(&rootfs).unwrap();
-
-        // Change file content (size changes)
-        fs::write(rootfs.join("bin/app"), "v2-longer").unwrap();
-        let h2 = compute_rootfs_hash(&rootfs).unwrap();
-
-        assert_ne!(h1, h2, "different content should produce different hash");
-    }
-
-    #[test]
-    fn compute_rootfs_hash_differs_on_new_file() {
-        let dir = TempDir::new().unwrap();
-        let rootfs = dir.path().join("rootfs");
-        fs::create_dir_all(rootfs.join("bin")).unwrap();
-        fs::write(rootfs.join("bin/app"), "data").unwrap();
-        let h1 = compute_rootfs_hash(&rootfs).unwrap();
-
-        // Add a new file
-        fs::write(rootfs.join("bin/extra"), "more").unwrap();
-        let h2 = compute_rootfs_hash(&rootfs).unwrap();
-
-        assert_ne!(h1, h2, "adding a file should change the hash");
-    }
-
-    #[test]
-    fn create_cached_rootfs_image_works() {
-        if std::process::Command::new("which")
-            .arg("mkfs.ext4")
-            .output()
-            .map(|o| !o.status.success())
-            .unwrap_or(true)
-        {
-            eprintln!("SKIPPING: mkfs.ext4 not available");
-            return;
-        }
-
-        let dir = TempDir::new().unwrap();
-        let rootfs = dir.path().join("rootfs");
-        fs::create_dir_all(rootfs.join("bin")).unwrap();
-        fs::write(rootfs.join("bin/hello"), "#!/bin/sh\necho hi\n").unwrap();
-
-        let cache_path = dir.path().join("cache").join("test.img");
-        create_cached_rootfs_image(&rootfs, &cache_path).expect("should create cached image");
-
-        assert!(cache_path.exists(), "cached image should exist");
-        assert!(
-            cache_path.metadata().unwrap().len() > 0,
-            "image should not be empty"
-        );
-        assert!(
-            !cache_path.with_extension("staging").exists(),
-            "staging cleaned up"
-        );
-    }
-
-    #[test]
     fn read_volume_files_reads_directory() {
         let dir = TempDir::new().unwrap();
         let vol_src = dir.path().join("configmap");
@@ -2249,53 +1695,5 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].0, "secret.txt");
         assert_eq!(files[0].1, b"s3cret");
-    }
-
-    #[test]
-    fn cache_and_inline_workflow() {
-        if std::process::Command::new("which")
-            .arg("mkfs.ext4")
-            .output()
-            .map(|o| !o.status.success())
-            .unwrap_or(true)
-        {
-            eprintln!("SKIPPING: mkfs.ext4 not available");
-            return;
-        }
-
-        let dir = TempDir::new().unwrap();
-
-        // Simulate rootfs
-        let rootfs = dir.path().join("rootfs");
-        fs::create_dir_all(rootfs.join("bin")).unwrap();
-        fs::write(rootfs.join("bin/app"), "binary-data").unwrap();
-
-        // Build cache (first container)
-        let cache_dir = dir.path().join("cache");
-        let hash = compute_rootfs_hash(&rootfs).unwrap();
-        let cached_img = cache_dir.join(format!("{hash}.img"));
-        create_cached_rootfs_image(&rootfs, &cached_img).expect("cache build");
-        assert!(cached_img.exists());
-
-        // Clone for container 1 (cache hit)
-        let ctr1_disk = dir.path().join("ctr1.img");
-        fs::copy(&cached_img, &ctr1_disk).expect("cache clone");
-        assert!(ctr1_disk.exists());
-
-        // Clone for container 2 (same image, cache hit again)
-        let hash2 = compute_rootfs_hash(&rootfs).unwrap();
-        assert_eq!(hash, hash2, "same rootfs should hit cache");
-        let ctr2_disk = dir.path().join("ctr2.img");
-        fs::copy(&cached_img, &ctr2_disk).expect("cache clone 2");
-        assert!(ctr2_disk.exists());
-
-        // Volume files are read inline (no metadata disk needed)
-        let vol_src = dir.path().join("configmap");
-        fs::create_dir_all(&vol_src).unwrap();
-        fs::write(vol_src.join("app.conf"), "setting=1").unwrap();
-        let files = read_volume_files(&vol_src).unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].0, "app.conf");
-        assert_eq!(files[0].1, b"setting=1");
     }
 }
