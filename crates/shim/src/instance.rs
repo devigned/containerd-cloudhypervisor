@@ -378,34 +378,57 @@ impl CloudHvInstance {
         let volumes = extract_volumes(&spec_path).ctx("extract volumes")?;
 
         // Find erofs layer blobs backing the rootfs.
-        // The erofs snapshotter creates layer.erofs files that we pass directly
-        // to the VM as read-only block devices — no conversion needed.
+        // Path 1: erofs snapshotter (containerd 2.1+) — layer.erofs files exist
+        // Path 2: overlayfs snapshotter (containerd 2.0) — convert rootfs dir to erofs
         let erofs_layers = find_erofs_layers(&rootfs_path);
-        if erofs_layers.is_empty() {
-            return Err(Error::Any(anyhow::anyhow!(
-                "no erofs layers found for rootfs at {}. \
-                 The erofs snapshotter must be configured in containerd.",
-                rootfs_path.display()
-            )));
-        }
-
-        info!(
-            "rootfs backed by {} erofs layer(s), using direct passthrough",
-            erofs_layers.len()
-        );
-        for (i, layer) in erofs_layers.iter().enumerate() {
-            let size = std::fs::metadata(layer).map(|m| m.len()).unwrap_or(0);
-            info!("  erofs layer {}: {} ({} bytes)", i, layer.display(), size);
-        }
-        let rootfs_disks: Vec<(std::path::PathBuf, String, bool)> = erofs_layers
-            .iter()
-            .enumerate()
-            .map(|(i, path)| {
-                let id = format!("{disk_id}-layer{i}");
-                info!("  disk {id} -> {} (readonly)", path.display());
-                (path.clone(), id, true)
+        let rootfs_disks: Vec<(std::path::PathBuf, String, bool)> = if !erofs_layers.is_empty() {
+            // Path 1: erofs snapshotter — pass layer.erofs blobs directly
+            info!(
+                "rootfs backed by {} erofs layer(s), using direct passthrough",
+                erofs_layers.len()
+            );
+            for (i, layer) in erofs_layers.iter().enumerate() {
+                let size = std::fs::metadata(layer).map(|m| m.len()).unwrap_or(0);
+                info!("  erofs layer {}: {} ({} bytes)", i, layer.display(), size);
+            }
+            erofs_layers
+                .iter()
+                .enumerate()
+                .map(|(i, path)| {
+                    let id = format!("{disk_id}-layer{i}");
+                    (path.clone(), id, true)
+                })
+                .collect()
+        } else {
+            // Path 2: overlayfs snapshotter — create erofs image from rootfs directory
+            info!("no erofs snapshotter layers, converting rootfs to erofs image");
+            let erofs_path = parent_dir.join(format!("{disk_id}.erofs"));
+            let rootfs_for_erofs = rootfs_path.clone();
+            let erofs_dst = erofs_path.clone();
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let status = std::process::Command::new("mkfs.erofs")
+                    .arg("--quiet")
+                    .arg(&erofs_dst)
+                    .arg(&rootfs_for_erofs)
+                    .status()
+                    .map_err(|e| anyhow::anyhow!("mkfs.erofs: {e}"))?;
+                if !status.success() {
+                    anyhow::bail!("mkfs.erofs failed: {status}");
+                }
+                Ok(())
             })
-            .collect();
+            .await
+            .map_err(|_| Error::Any(anyhow::anyhow!("erofs conversion panicked")))?
+            .ctx("convert rootfs to erofs")?;
+
+            let size = std::fs::metadata(&erofs_path).map(|m| m.len()).unwrap_or(0);
+            info!(
+                "erofs image created: {} ({} bytes)",
+                erofs_path.display(),
+                size
+            );
+            vec![(erofs_path, disk_id.clone(), true)]
+        };
 
         // Determine boot role: first container boots the VM, others wait.
         enum BootRole {

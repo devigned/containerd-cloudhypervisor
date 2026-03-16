@@ -47,8 +47,33 @@ TCEOF
   rm -f "$HOST/tmp/cloudhv-install-tc.sh"
 fi
 
-# 2. Load erofs kernel module
+# 2. Load erofs kernel module and install erofs-utils
 nsenter --target 1 --mount -- modprobe erofs 2>/dev/null || true
+if ! nsenter --target 1 --mount -- sh -c 'command -v mkfs.erofs' >/dev/null 2>&1; then
+  echo "[cloudhv] mkfs.erofs not found, installing erofs-utils..."
+  cat > "$HOST/tmp/cloudhv-install-erofs.sh" << 'EROFSEOF'
+#!/bin/sh
+if command -v tdnf >/dev/null 2>&1; then
+  tdnf install -y erofs-utils
+elif command -v dnf >/dev/null 2>&1; then
+  dnf install -y erofs-utils
+elif command -v apt-get >/dev/null 2>&1; then
+  apt-get update -qq && apt-get install -y erofs-utils
+else
+  echo "No supported package manager found" >&2
+  exit 1
+fi
+EROFSEOF
+  chmod +x "$HOST/tmp/cloudhv-install-erofs.sh"
+  if nsenter --target 1 --mount --uts --ipc --pid -- /tmp/cloudhv-install-erofs.sh 2>&1 | tail -5; then
+    echo "[cloudhv] erofs-utils installed"
+  else
+    echo "[cloudhv] ERROR: mkfs.erofs is required but could not be installed"
+    rm -f "$HOST/tmp/cloudhv-install-erofs.sh"
+    exit 1
+  fi
+  rm -f "$HOST/tmp/cloudhv-install-erofs.sh"
+fi
 
 # 3. Copy binaries and guest artifacts
 echo "[cloudhv] Copying binaries and guest artifacts..."
