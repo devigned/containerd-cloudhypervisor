@@ -281,6 +281,7 @@ impl CloudHvInstance {
             config,
             sandbox_spec.mem_request,
             sandbox_spec.mem_limit,
+            sandbox_spec.cpu_limit,
         );
 
         // Cold-boot a new VM
@@ -936,6 +937,7 @@ struct SandboxSpec {
     annotations: HashMap<String, String>,
     mem_request: Option<u64>,
     mem_limit: Option<u64>,
+    cpu_limit: Option<u32>,
     cgroups_path: Option<String>,
 }
 
@@ -946,6 +948,7 @@ fn parse_sandbox_spec(spec_path: &std::path::Path) -> SandboxSpec {
         annotations: HashMap::new(),
         mem_request: None,
         mem_limit: None,
+        cpu_limit: None,
         cgroups_path: None,
     };
     let data = match std::fs::read_to_string(spec_path) {
@@ -969,6 +972,7 @@ fn parse_sandbox_spec(spec_path: &std::path::Path) -> SandboxSpec {
 
     let annotations = crate::annotations::annotations_from_spec(&spec);
     let (req, lim) = crate::annotations::memory_resources_from_spec(&spec);
+    let cpu_limit = crate::annotations::cpu_resources_from_spec(&spec);
 
     // Extract cgroups path for VM process placement
     let cgroups_path = spec
@@ -982,8 +986,11 @@ fn parse_sandbox_spec(spec_path: &std::path::Path) -> SandboxSpec {
     if !annotations.is_empty() {
         info!("sandbox annotations: {:?}", annotations);
     }
-    if req.is_some() || lim.is_some() {
-        info!("sandbox resources: request={:?}MiB limit={:?}MiB", req, lim);
+    if req.is_some() || lim.is_some() || cpu_limit.is_some() {
+        info!(
+            "sandbox resources: mem_request={:?}MiB mem_limit={:?}MiB cpu_limit={:?}vcpus",
+            req, lim, cpu_limit
+        );
     }
     if cgroups_path.is_some() {
         info!("sandbox cgroups: {:?}", cgroups_path);
@@ -994,6 +1001,7 @@ fn parse_sandbox_spec(spec_path: &std::path::Path) -> SandboxSpec {
         annotations,
         mem_request: req,
         mem_limit: lim,
+        cpu_limit,
         cgroups_path,
     }
 }

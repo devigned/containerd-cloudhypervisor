@@ -17,6 +17,11 @@ pub struct RuntimeConfig {
     #[serde(default = "default_vcpus")]
     pub default_vcpus: u32,
 
+    /// Maximum vCPUs when no CPU limit is set.
+    /// 0 (default) = use host CPU count.
+    #[serde(default)]
+    pub max_default_vcpus: u32,
+
     /// Default memory in MiB per VM
     #[serde(default = "default_memory_mb")]
     pub default_memory_mb: u64,

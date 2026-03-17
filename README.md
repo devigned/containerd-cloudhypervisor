@@ -13,6 +13,7 @@ that runs container workloads inside lightweight microVMs with maximum density a
 - **Multi-container pods** — up to 5 containers per VM with mount + PID isolation
 - **Pod networking** — transparent CNI integration via TAP + TC redirect
 - **Kata-compatible annotations** — per-pod memory/vCPU sizing with `io.cloudhv.*` or `io.katacontainers.*`
+- **Transparent vCPU sizing** — VM vCPUs match the pod's CPU limit; no limit = host CPU count
 
 ## When to Use
 
@@ -52,6 +53,7 @@ sudo tee /opt/cloudhv/config.json > /dev/null <<EOF
   "rootfs_path": "/opt/cloudhv/rootfs.ext4",
   "kernel_args": "console=hvc0 root=/dev/vda rw quiet init=/init net.ifnames=0",
   "default_vcpus": 1,
+  "max_default_vcpus": 0,
   "default_memory_mb": 512,
   "max_containers_per_vm": 5
 }

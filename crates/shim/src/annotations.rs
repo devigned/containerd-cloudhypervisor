@@ -229,16 +229,71 @@ pub fn memory_resources_from_spec(spec: &serde_json::Value) -> (Option<u64>, Opt
     (request_bytes.map(to_mb), limit_bytes.map(to_mb))
 }
 
+/// Extract CPU resources from the OCI spec.
+///
+/// Kubernetes sets `linux.resources.cpu.quota` and `linux.resources.cpu.period`
+/// from `resources.limits.cpu`. Returns the CPU limit as a whole vCPU count
+/// (rounded up). If no CPU limit is set, returns None.
+pub fn cpu_resources_from_spec(spec: &serde_json::Value) -> Option<u32> {
+    let quota = spec
+        .pointer("/linux/resources/cpu/quota")
+        .and_then(|v| v.as_i64())
+        .filter(|&v| v > 0)?;
+
+    let period = spec
+        .pointer("/linux/resources/cpu/period")
+        .and_then(|v| v.as_u64())
+        .filter(|&v| v > 0)
+        .unwrap_or(100_000); // default CFS period
+
+    // quota / period = number of CPUs (e.g., quota=200000, period=100000 → 2 CPUs)
+    // Round up so limits.cpu: "1500m" → 2 vCPUs
+    let vcpus = (quota as u64).div_ceil(period) as u32;
+    if vcpus > 0 {
+        Some(vcpus)
+    } else {
+        None
+    }
+}
+
 /// Apply OCI resource limits to the runtime config.
 ///
-/// When a memory limit exceeds the configured boot memory, automatically
-/// enables virtio-mem hotplug with headroom up to the limit.
+/// - CPU limit → `default_vcpus` (rounded up to whole vCPUs)
+/// - No CPU limit → `max_default_vcpus` (0 = host CPU count)
+/// - Memory limit → virtio-mem hotplug headroom
 pub fn apply_resource_limits(
     mut config: RuntimeConfig,
     request_mb: Option<u64>,
     limit_mb: Option<u64>,
+    cpu_limit_vcpus: Option<u32>,
 ) -> RuntimeConfig {
-    // If request is set and valid, use it as boot memory
+    // CPU: size vCPUs from pod spec
+    if let Some(vcpus) = cpu_limit_vcpus {
+        let vcpus = std::cmp::max(1, vcpus);
+        info!(
+            "CPU limit: default_vcpus {} -> {}",
+            config.default_vcpus, vcpus
+        );
+        config.default_vcpus = vcpus;
+    } else {
+        // No CPU limit — use max_default_vcpus (0 = host CPU count)
+        let max_vcpus = if config.max_default_vcpus >= 1 {
+            config.max_default_vcpus
+        } else {
+            std::thread::available_parallelism()
+                .map(|n| n.get() as u32)
+                .unwrap_or(1)
+        };
+        if max_vcpus > config.default_vcpus {
+            info!(
+                "no CPU limit: default_vcpus {} -> {} (max_default_vcpus)",
+                config.default_vcpus, max_vcpus
+            );
+            config.default_vcpus = max_vcpus;
+        }
+    }
+
+    // Memory: if request is set and valid, use it as boot memory
     if let Some(req) = request_mb {
         if req >= MIN_MEMORY_MB {
             info!(
@@ -281,6 +336,7 @@ mod tests {
             kernel_path: String::new(),
             rootfs_path: String::new(),
             default_vcpus: 1,
+            max_default_vcpus: 0,
             default_memory_mb: 512,
             vsock_port: 0,
             agent_startup_timeout_secs: 10,
@@ -509,7 +565,7 @@ mod tests {
 
     #[test]
     fn test_apply_resource_limits_enables_hotplug() {
-        let config = apply_resource_limits(default_config(), Some(128), Some(1024));
+        let config = apply_resource_limits(default_config(), Some(128), Some(1024), None);
         assert_eq!(config.default_memory_mb, 128);
         assert_eq!(config.hotplug_memory_mb, 896);
         assert_eq!(config.hotplug_method, "virtio-mem");
@@ -517,15 +573,82 @@ mod tests {
 
     #[test]
     fn test_apply_resource_limits_no_limit() {
-        let config = apply_resource_limits(default_config(), Some(256), None);
+        let config = apply_resource_limits(default_config(), Some(256), None, None);
         assert_eq!(config.default_memory_mb, 256);
         assert_eq!(config.hotplug_memory_mb, 0);
     }
 
     #[test]
     fn test_apply_resource_limits_limit_equals_request() {
-        let config = apply_resource_limits(default_config(), Some(512), Some(512));
+        let config = apply_resource_limits(default_config(), Some(512), Some(512), None);
         assert_eq!(config.default_memory_mb, 512);
         assert_eq!(config.hotplug_memory_mb, 0);
+    }
+
+    #[test]
+    fn test_cpu_limit_sets_vcpus() {
+        let config = apply_resource_limits(default_config(), None, None, Some(4));
+        assert_eq!(config.default_vcpus, 4);
+    }
+
+    #[test]
+    fn test_no_cpu_limit_uses_max_default() {
+        let mut cfg = default_config();
+        cfg.max_default_vcpus = 8;
+        let config = apply_resource_limits(cfg, None, None, None);
+        assert_eq!(config.default_vcpus, 8);
+    }
+
+    #[test]
+    fn test_no_cpu_limit_zero_max_uses_host_cpus() {
+        let config = apply_resource_limits(default_config(), None, None, None);
+        // Should be at least 1 (host CPU count)
+        assert!(config.default_vcpus >= 1);
+    }
+
+    #[test]
+    fn test_cpu_resources_from_spec_2_cores() {
+        let spec = serde_json::json!({
+            "linux": {
+                "resources": {
+                    "cpu": { "quota": 200000, "period": 100000 }
+                }
+            }
+        });
+        assert_eq!(cpu_resources_from_spec(&spec), Some(2));
+    }
+
+    #[test]
+    fn test_cpu_resources_from_spec_1500m() {
+        // 1500m = 1.5 CPUs → rounds up to 2
+        let spec = serde_json::json!({
+            "linux": {
+                "resources": {
+                    "cpu": { "quota": 150000, "period": 100000 }
+                }
+            }
+        });
+        assert_eq!(cpu_resources_from_spec(&spec), Some(2));
+    }
+
+    #[test]
+    fn test_cpu_resources_from_spec_no_limit() {
+        let spec = serde_json::json!({
+            "linux": { "resources": {} }
+        });
+        assert_eq!(cpu_resources_from_spec(&spec), None);
+    }
+
+    #[test]
+    fn test_cpu_resources_from_spec_zero_period() {
+        // period=0 should not panic — treated as default 100000
+        let spec = serde_json::json!({
+            "linux": {
+                "resources": {
+                    "cpu": { "quota": 200000, "period": 0 }
+                }
+            }
+        });
+        assert_eq!(cpu_resources_from_spec(&spec), Some(2));
     }
 }

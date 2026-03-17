@@ -59,6 +59,7 @@ impl TestFixtures {
             kernel_path: self.kernel_path.to_string_lossy().to_string(),
             rootfs_path: self.rootfs_path.to_string_lossy().to_string(),
             default_vcpus: 1,
+            max_default_vcpus: 0,
             default_memory_mb: 512,
             vsock_port: cloudhv_common::AGENT_VSOCK_PORT,
             agent_startup_timeout_secs: 30,

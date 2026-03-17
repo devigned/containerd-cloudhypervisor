@@ -92,6 +92,7 @@ cat > "$HOST/opt/cloudhv/config.json" << CONFIG
   "rootfs_path": "/opt/cloudhv/rootfs.ext4",
   "kernel_args": "${KERNEL_CONSOLE} root=/dev/vda rw init=/init net.ifnames=0",
   "default_vcpus": 1,
+  "max_default_vcpus": 0,
   "default_memory_mb": 512,
   "max_containers_per_vm": 5,
   "hotplug_memory_mb": 0,
