@@ -15,7 +15,7 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/cloudhv-installer
   CH_VERSION: "v44.0"
-  KERNEL_VERSION: "6.12.8"
+  KERNEL_VERSION: "6.18.16"
 
 jobs:
   build-binaries:
@@ -144,6 +144,7 @@ jobs:
 
       - name: Build rootfs
         run: |
+          sudo apt-get update && sudo apt-get install -y erofs-utils
           chmod +x /tmp/agent/cloudhv-agent
           cd guest/rootfs
           sudo bash build-rootfs.sh /tmp/agent/cloudhv-agent
