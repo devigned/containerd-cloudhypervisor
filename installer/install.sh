@@ -81,7 +81,7 @@ install -D -m 755 "$ARTIFACTS/containerd-shim-cloudhv-v1" "$HOST/usr/local/bin/c
 install -m 755 "$ARTIFACTS/cloud-hypervisor" "$HOST/usr/local/bin/cloud-hypervisor"
 mkdir -p "$HOST/opt/cloudhv"
 install -m 644 "$ARTIFACTS/vmlinux" "$HOST/opt/cloudhv/vmlinux"
-install -m 644 "$ARTIFACTS/rootfs.ext4" "$HOST/opt/cloudhv/rootfs.ext4"
+install -m 644 "$ARTIFACTS/rootfs.erofs" "$HOST/opt/cloudhv/rootfs.erofs"
 
 # 4. Write runtime config
 echo "[cloudhv] Writing runtime config..."
@@ -89,7 +89,7 @@ cat > "$HOST/opt/cloudhv/config.json" << CONFIG
 {
   "cloud_hypervisor_binary": "/usr/local/bin/cloud-hypervisor",
   "kernel_path": "/opt/cloudhv/vmlinux",
-  "rootfs_path": "/opt/cloudhv/rootfs.ext4",
+  "rootfs_path": "/opt/cloudhv/rootfs.erofs",
   "kernel_args": "${KERNEL_CONSOLE} root=/dev/vda rw init=/init net.ifnames=0",
   "default_vcpus": 1,
   "default_memory_mb": 512,
