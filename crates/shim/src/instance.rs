@@ -268,10 +268,32 @@ impl CloudHvInstance {
         let spec_path = self.bundle.join("config.json");
         let sandbox_spec = parse_sandbox_spec(&spec_path);
 
-        // Set up TAP device in the pod's network namespace
+        // Set up TAP device in the pod's network namespace.
+        // Retry the entire setup since CNI populates the netns asynchronously —
+        // the netns file may exist but the veth/IP/routes may not be configured yet.
         let (tap_name, tap_mac, ip_config) = if let Some(ref netns) = sandbox_spec.netns {
-            match setup_tap_in_netns(netns, &sandbox_id) {
-                Ok(tap_info) => {
+            let mut result = None;
+            for attempt in 0..10 {
+                match setup_tap_in_netns(netns, &sandbox_id) {
+                    Ok(tap_info) => {
+                        if attempt > 0 {
+                            info!("TAP setup succeeded after {attempt} retries");
+                        }
+                        result = Some(tap_info);
+                        break;
+                    }
+                    Err(e) => {
+                        if attempt < 9 {
+                            info!("TAP setup attempt {attempt} failed ({e:#}), retrying...");
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                        } else {
+                            info!("TAP setup failed after 10 attempts (proceeding without network): {e}");
+                        }
+                    }
+                }
+            }
+            match result {
+                Some(tap_info) => {
                     info!(
                         "TAP created: dev={} mac={} ip={} gw={}",
                         tap_info.tap_name, tap_info.mac, tap_info.ip_cidr, tap_info.gateway
@@ -282,10 +304,7 @@ impl CloudHvInstance {
                         Some((tap_info.ip_cidr, tap_info.gateway)),
                     )
                 }
-                Err(e) => {
-                    info!("TAP setup failed (proceeding without network): {e}");
-                    (None, None, None)
-                }
+                None => (None, None, None),
             }
         } else {
             info!("no network namespace — VM will boot without networking");
@@ -1277,8 +1296,22 @@ fn setup_tap_in_netns(netns_path: &str, vm_id: &str) -> anyhow::Result<TapInfo> 
     let tap_name = format!("tap_{}", &vm_id[..8.min(vm_id.len())]);
     let netns_arg = format!("--net={netns_path}");
 
-    // Dump pre-existing netns state for diagnostics — helps debug stale
-    // TAP/tc rules left over from a previous sandbox in the same netns.
+    // Wait for the network namespace to exist — CNI creates it asynchronously
+    // and the shim may start before the netns file appears.
+    for attempt in 0..20 {
+        if std::path::Path::new(netns_path).exists() {
+            if attempt > 0 {
+                log::info!("netns {netns_path} appeared after {attempt} retries");
+            }
+            break;
+        }
+        if attempt == 19 {
+            anyhow::bail!("netns {netns_path} did not appear after 2s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Dump pre-existing netns state for diagnostics
     if let Ok(output) = Command::new("nsenter")
         .args([&netns_arg, "--", "ip", "link", "show"])
         .output()
@@ -1297,6 +1330,11 @@ fn setup_tap_in_netns(netns_path: &str, vm_id: &str) -> anyhow::Result<TapInfo> 
     }
 
     // Run the setup commands inside the network namespace using nsenter
+    // Clean up any stale TAP from a previous failed attempt (the caller retries)
+    let _ = Command::new("nsenter")
+        .args([&netns_arg, "--", "ip", "link", "del", &tap_name])
+        .output();
+
     // Create TAP device
     let status = Command::new("nsenter")
         .args([
