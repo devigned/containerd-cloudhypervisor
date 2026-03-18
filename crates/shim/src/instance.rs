@@ -1317,67 +1317,93 @@ fn setup_tap_in_netns(netns_path: &str, vm_id: &str) -> anyhow::Result<TapInfo> 
         anyhow::bail!("ip link set tap up failed: {status}");
     }
 
-    // Find the veth device and its IP/MAC
-    let output = Command::new("nsenter")
-        .args([&netns_arg, "--", "ip", "-j", "addr", "show"])
-        .output()
-        .context("ip addr show")?;
-    let addrs: serde_json::Value =
-        serde_json::from_slice(&output.stdout).unwrap_or(serde_json::json!([]));
-
+    // Find the veth device and its IP/MAC — retry briefly since CNI may
+    // still be configuring addresses when the shim starts.
     let mut veth_name = String::new();
     let mut ip_cidr = String::new();
     let mut mac = String::new();
 
-    if let Some(interfaces) = addrs.as_array() {
-        for iface in interfaces {
-            let name = iface.get("ifname").and_then(|n| n.as_str()).unwrap_or("");
-            // Skip loopback and our TAP
-            if name == "lo" || name == tap_name {
-                continue;
-            }
-            if let Some(addr_info) = iface.get("addr_info").and_then(|a| a.as_array()) {
-                for addr in addr_info {
-                    if addr.get("family").and_then(|f| f.as_str()) == Some("inet") {
-                        ip_cidr = format!(
-                            "{}/{}",
-                            addr.get("local").and_then(|l| l.as_str()).unwrap_or(""),
-                            addr.get("prefixlen").and_then(|p| p.as_u64()).unwrap_or(24)
-                        );
-                        veth_name = name.to_string();
-                        mac = iface
-                            .get("address")
-                            .and_then(|a| a.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        break;
+    for attempt in 0..10 {
+        let output = Command::new("nsenter")
+            .args([&netns_arg, "--", "ip", "-j", "addr", "show"])
+            .output()
+            .context("ip addr show")?;
+        let addrs: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or(serde_json::json!([]));
+
+        if let Some(interfaces) = addrs.as_array() {
+            for iface in interfaces {
+                let name = iface.get("ifname").and_then(|n| n.as_str()).unwrap_or("");
+                if name == "lo" || name == tap_name {
+                    continue;
+                }
+                if let Some(addr_info) = iface.get("addr_info").and_then(|a| a.as_array()) {
+                    for addr in addr_info {
+                        if addr.get("family").and_then(|f| f.as_str()) == Some("inet") {
+                            ip_cidr = format!(
+                                "{}/{}",
+                                addr.get("local").and_then(|l| l.as_str()).unwrap_or(""),
+                                addr.get("prefixlen").and_then(|p| p.as_u64()).unwrap_or(24)
+                            );
+                            veth_name = name.to_string();
+                            mac = iface
+                                .get("address")
+                                .and_then(|a| a.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            break;
+                        }
                     }
                 }
+                if !veth_name.is_empty() {
+                    break;
+                }
             }
-            if !veth_name.is_empty() {
-                break;
+        }
+        if !veth_name.is_empty() {
+            if attempt > 0 {
+                log::info!("veth with IP appeared after {attempt} retries");
             }
+            break;
+        }
+        if attempt < 9 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
 
     if veth_name.is_empty() || ip_cidr.is_empty() {
-        anyhow::bail!("could not find veth with IP in netns {netns_path}");
+        anyhow::bail!("could not find veth with IP in netns {netns_path} after retries");
     }
 
-    // Get default gateway
-    let output = Command::new("nsenter")
-        .args([&netns_arg, "--", "ip", "-j", "route", "show", "default"])
-        .output()
-        .context("ip route show default")?;
-    let routes: serde_json::Value =
-        serde_json::from_slice(&output.stdout).unwrap_or(serde_json::json!([]));
-    let gateway = routes
-        .as_array()
-        .and_then(|r| r.first())
-        .and_then(|r| r.get("gateway"))
-        .and_then(|g| g.as_str())
-        .unwrap_or("10.88.0.1")
-        .to_string();
+    // Get default gateway — retry briefly since CNI may still be populating
+    // routes when the shim starts.
+    let mut gateway = String::new();
+    for attempt in 0..10 {
+        let output = Command::new("nsenter")
+            .args([&netns_arg, "--", "ip", "-j", "route", "show", "default"])
+            .output()
+            .context("ip route show default")?;
+        let routes: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or(serde_json::json!([]));
+        if let Some(gw) = routes
+            .as_array()
+            .and_then(|r| r.first())
+            .and_then(|r| r.get("gateway"))
+            .and_then(|g| g.as_str())
+        {
+            gateway = gw.to_string();
+            if attempt > 0 {
+                log::info!("default route appeared after {attempt} retries");
+            }
+            break;
+        }
+        if attempt < 9 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    if gateway.is_empty() {
+        anyhow::bail!("no default route in netns {netns_path} after retries (CNI not ready?)");
+    }
 
     // Set up TC redirect: veth ingress → TAP egress, TAP ingress → veth egress
     for cmd in [
