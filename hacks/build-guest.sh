@@ -17,7 +17,11 @@ build() {
 
   apk add --no-cache erofs-utils
 
-  /host/hacks/build-guest-kernel.sh build "$host_user_group" 
+  if [ ! -f /host/vmlinux -o ! -f /host/vmlinux.kconfig ] ; then
+    /host/hacks/build-guest-kernel.sh build "$host_user_group"
+  else
+    echo -e "\n --- Found 'vmlinux', will use it for the guest instead of rebuilding from scratch. ---\n"
+  fi
   /host/hacks/build-static-rust.sh build "$host_user_group" crates/agent/cloudhv-agent
 
   mv /host/cloudhv-agent /opt/build/guest/rootfs
@@ -34,22 +38,13 @@ if [ "${1:-}" = "build" ] ; then
   shift
   build ${@}
 else
-  uid="$(id -u)"
-  gid="$(id -g)"
-  scriptname="$(basename "$0")"
-
   arch="$(docker_arch "$@")"
-  platform="$(docker_platform "$arch")"
   dest="_build/${arch}"
 
-  rm -rf vmlinux vmlinux.kconfig rootfs.erofs "${dest}"
-  echo -e "\n ------=======#######  Full Guest Build to '${dest}' #######=======-------\n"
-  docker run --rm -i \
-      -v $(pwd):/host \
-      $platform \
-      alpine \
-      "/host/hacks/${scriptname}" "build" "$uid:$gid" $@
+  rm -rf rootfs.erofs "${dest}"
   mkdir -p "${dest}"
+  echo -e "\n ------=======#######  Full Guest Build to '${dest}' #######=======-------\n"
+  docker_wrapper ${@}
   mv vmlinux vmlinux.kconfig rootfs.erofs "${dest}"
   echo -e "\n ------=======#######  Full Guest Build done #######=======-------\n"
   echo "${dest}:"

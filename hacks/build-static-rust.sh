@@ -67,16 +67,5 @@ if [ "$1" = "build" ] ; then
   shift
   build ${@}
 else
-  uid="$(id -u)"
-  gid="$(id -g)"
-  scriptname="$(basename "$0")"
-  arch="$(docker_arch "$@")"
-  platform="$(docker_platform "$arch")"
-  if [ "${1:-}" == "--arch" ] ; then
-    shift; shift
-  fi
-  docker run --rm -i -v $(pwd):/host \
-      $platform \
-      alpine \
-      "/host/hacks/${scriptname}" "build" "$uid:$gid" ${@}
+  docker_wrapper ${@}
 fi

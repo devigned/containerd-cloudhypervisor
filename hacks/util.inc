@@ -39,3 +39,30 @@ docker_platform() {
   esac
 }
 # --
+
+latest_kernel_release() {
+  local series="${1}"
+
+  curl -sSL https://www.kernel.org/releases.json \
+    | jq -r ".releases[] | select(.version | startswith(\"${series}\") ) | \"\(.version)\""
+}
+# --
+
+docker_wrapper() {
+  local uid gid scriptname platform arch
+  uid="$(id -u)"
+  gid="$(id -g)"
+  scriptname="$(basename "$0")"
+
+  arch="$(docker_arch "$@")"
+  if [ "${1:-}" == "--arch" ] ; then
+    shift; shift
+  fi
+  platform="$(docker_platform "$arch")"
+
+  docker run --rm -i -v $(pwd):/host \
+      $platform \
+      alpine \
+      "/host/hacks/${scriptname}" "build" "$uid:$gid" ${@}
+}
+# --
