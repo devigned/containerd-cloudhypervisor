@@ -1,10 +1,10 @@
 #!/bin/sh
 # vim: et ts=2 sw=2 syn=sh
 #
-# Containerised build for the full guest (kernel and root FS)
+# Containerised build for the containerd/cloud-hypervisor system extension image.
 # Usage:
-#   hacks/build-guest.sh [--arch <arch>]
-# The optional <arch> can be x86-64 or arm64.
+#   hacks/build-sysext.sh [--arch <arch>]
+# The optional <arch> can be x86-64 or arm64. The resulting image is containerd-cloudhypervisor.raw.
 
 set -euo pipefail
 scriptdir="$(cd "$(dirname "$0")"; pwd)"
@@ -37,7 +37,7 @@ build() {
   cp /host/mkfs.erofs root/usr/bin
 
   local arch="$(translate_arch)"
-  sed -i "s/^ARCH=.*/ARCH=${arch}/" \
+  sed -i "s/^ARCHITECTURE=.*/ARCHITECTURE=${arch}/" \
       root/usr/lib/extension-release.d/extension-release.containerd-cloudhypervisor
 
   # CNI plugins

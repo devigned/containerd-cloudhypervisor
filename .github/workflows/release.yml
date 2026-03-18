@@ -15,225 +15,75 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/cloudhv-installer
   CH_VERSION: "v44.0"
-  KERNEL_VERSION: "6.18.16"
+  KERNEL_SERIES: "6.18"
 
 jobs:
-  build-binaries:
-    name: Build Binaries (${{ matrix.arch }})
+  build-everything:
+    name: Build Guest and Host Binaries, Guest root, and sysext for (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
         include:
-          - target: x86_64-unknown-linux-musl
-            package: containerd-shim-cloudhv
-            artifact: containerd-shim-cloudhv-v1
-            runner: ubuntu-latest
+          - runner: ubuntu-latest
             arch: x86_64
-          - target: x86_64-unknown-linux-musl
-            package: cloudhv-agent
-            artifact: cloudhv-agent
-            runner: ubuntu-latest
-            arch: x86_64
-          - target: aarch64-unknown-linux-musl
-            package: containerd-shim-cloudhv
-            artifact: containerd-shim-cloudhv-v1
-            runner: ubuntu-24.04-arm
-            arch: aarch64
-          - target: aarch64-unknown-linux-musl
-            package: cloudhv-agent
-            artifact: cloudhv-agent
-            runner: ubuntu-24.04-arm
+          - runner: ubuntu-24.04-arm
             arch: aarch64
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: release-${{ matrix.target }}
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler musl-tools
-
-      - name: Build release binary
+      - name: Build complete Guest (kernel, agent, and root FS)
         run: |
-          if [ "${{ matrix.package }}" = "cloudhv-agent" ]; then
-            cd crates/agent && cargo build --release --target ${{ matrix.target }}
-          else
-            cargo build --release -p ${{ matrix.package }} --target ${{ matrix.target }}
-          fi
+          bash hacks/build-guest.sh
 
-      - name: Stage binary for upload
+      - name: Build Containerd shim
         run: |
-          if [ "${{ matrix.package }}" = "cloudhv-agent" ]; then
-            cp crates/agent/target/${{ matrix.target }}/release/${{ matrix.artifact }} /tmp/${{ matrix.artifact }}
-          else
-            cp target/${{ matrix.target }}/release/${{ matrix.artifact }} /tmp/${{ matrix.artifact }}
-          fi
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}-${{ matrix.target }}
-          path: /tmp/${{ matrix.artifact }}
-
-  build-kernel:
-    name: Build Guest Kernel (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      matrix:
-        include:
-          - arch: x86_64
-            runner: ubuntu-latest
-            config: guest/kernel/configs/microvm.config
-            artifact_name: vmlinux-x86_64
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
-            config: guest/kernel/configs/microvm-aarch64.config
-            artifact_name: vmlinux-aarch64
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Cache kernel
-        id: kernel-cache
-        uses: actions/cache@v4
-        with:
-          path: guest/kernel/vmlinux
-          key: kernel-${{ matrix.arch }}-${{ env.KERNEL_VERSION }}-${{ hashFiles(matrix.config, 'guest/kernel/build-kernel.sh') }}
-
-      - name: Install kernel build dependencies
-        if: steps.kernel-cache.outputs.cache-hit != 'true'
-        run: sudo apt-get update && sudo apt-get install -y flex bison libelf-dev bc
-
-      - name: Build kernel
-        if: steps.kernel-cache.outputs.cache-hit != 'true'
-        run: cd guest/kernel && bash build-kernel.sh ${{ env.KERNEL_VERSION }}
-
-      - name: Upload kernel
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact_name }}
-          path: guest/kernel/vmlinux
-
-  build-rootfs:
-    name: Build Guest Rootfs (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    needs: [build-binaries]
-    strategy:
-      matrix:
-        include:
-          - arch: x86_64
-            runner: ubuntu-latest
-            agent_artifact: cloudhv-agent-x86_64-unknown-linux-musl
-            rootfs_artifact: rootfs-x86_64
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
-            agent_artifact: cloudhv-agent-aarch64-unknown-linux-musl
-            rootfs_artifact: rootfs-aarch64
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download agent binary
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ matrix.agent_artifact }}
-          path: /tmp/agent
-
-      - name: Build rootfs
-        run: |
-          sudo apt-get update && sudo apt-get install -y erofs-utils
-          chmod +x /tmp/agent/cloudhv-agent
-          cd guest/rootfs
-          sudo bash build-rootfs.sh /tmp/agent/cloudhv-agent
-
-      - name: Upload rootfs
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.rootfs_artifact }}
-          path: guest/rootfs/rootfs.erofs
-
-  build-sysext:
-    # FIXME: the below will-rebuild everything instead of re-using the above build artifacts.
-    #        We should eventually simplify the above build in the same way as ci.yaml, and build + upload everything in one job.
-    name: System Extension Image for (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      matrix:
-        include:
-          - arch: x86_64
-            sysext_arch: x86-64
-            runner: ubuntu-latest
-          - arch: aarch64
-            sysext_arch: arm64
-            runner: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v4
+          bash hacks/build-static-rust.sh containerd-shim-cloudhv
 
       - name: Build extension image
         run: |
-          hacks/build-sysext.sh
-          mv containerd-cloudhypervisor.raw containerd-cloudhypervisor-${{ github.ref_name }}-${{ matrix.sysext_arch }}.raw
+          bash hacks/build-sysext.sh
 
-      - name: Upload rootfs
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: containerd-cloudhypervisor-${{ github.ref_name }}-${{ matrix.sysext_arch }}.raw
-          path: containerd-cloudhypervisor-${{ github.ref_name }}-${{ matrix.sysext_arch }}.raw
+          name: build-${{ matrix.arch }}
+          path: |
+            cloudhv-agent
+            rootfs.erofs
+            vmlinux
+            vmlinux.kconfig
+            containerd-shim-cloudhv-v1
+            containerd-cloudhypervisor.raw
 
   build-installer-image:
     name: Build Installer Image
     runs-on: ubuntu-latest
-    needs: [build-binaries, build-kernel, build-rootfs]
+    needs: [build-everything]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download shim (x86_64)
+      - name: Download build artifacts (arm64)
         uses: actions/download-artifact@v4
         with:
-          name: containerd-shim-cloudhv-v1-x86_64-unknown-linux-musl
-          path: /tmp/artifacts/containerd-shim-cloudhv-v1-x86_64-unknown-linux-musl
+          name: build-aarch64
+          path: /tmp/artifacts/arm64
 
-      - name: Download shim (aarch64)
+      - name: Download build artifacts (amd64)
         uses: actions/download-artifact@v4
         with:
-          name: containerd-shim-cloudhv-v1-aarch64-unknown-linux-musl
-          path: /tmp/artifacts/containerd-shim-cloudhv-v1-aarch64-unknown-linux-musl
-
-      - name: Download kernel (x86_64)
-        uses: actions/download-artifact@v4
-        with:
-          name: vmlinux-x86_64
-          path: /tmp/artifacts/vmlinux-x86_64
-
-      - name: Download kernel (aarch64)
-        uses: actions/download-artifact@v4
-        with:
-          name: vmlinux-aarch64
-          path: /tmp/artifacts/vmlinux-aarch64
-
-      - name: Download rootfs (x86_64)
-        uses: actions/download-artifact@v4
-        with:
-          name: rootfs-x86_64
-          path: /tmp/artifacts/rootfs-x86_64
-
-      - name: Download rootfs (aarch64)
-        uses: actions/download-artifact@v4
-        with:
-          name: rootfs-aarch64
-          path: /tmp/artifacts/rootfs-aarch64
+          name: build-x86_64
+          path: /tmp/artifacts/amd64
 
       - name: Prepare image contents (amd64)
         run: |
           mkdir -p /tmp/image-root-amd64/opt/cloudhv
-          cp /tmp/artifacts/containerd-shim-cloudhv-v1-x86_64-unknown-linux-musl/containerd-shim-cloudhv-v1 \
+
+          cp /tmp/artifacts/amd64/containerd-shim-cloudhv-v1 \
+              /tmp/artifacts/amd64/vmlinux \
+              /tmp/artifacts/amd64/rootfs.erofs \
+              installer/install.sh \
             /tmp/image-root-amd64/opt/cloudhv/
-          cp /tmp/artifacts/vmlinux-x86_64/vmlinux /tmp/image-root-amd64/opt/cloudhv/
-          cp /tmp/artifacts/rootfs-x86_64/rootfs.erofs /tmp/image-root-amd64/opt/cloudhv/
-          cp installer/install.sh /tmp/image-root-amd64/opt/cloudhv/
+
           chmod +x /tmp/image-root-amd64/opt/cloudhv/containerd-shim-cloudhv-v1
           chmod +x /tmp/image-root-amd64/opt/cloudhv/install.sh
           ls -lh /tmp/image-root-amd64/opt/cloudhv/
@@ -241,11 +91,12 @@ jobs:
       - name: Prepare image contents (arm64)
         run: |
           mkdir -p /tmp/image-root-arm64/opt/cloudhv
-          cp /tmp/artifacts/containerd-shim-cloudhv-v1-aarch64-unknown-linux-musl/containerd-shim-cloudhv-v1 \
+          cp /tmp/artifacts/arm64/containerd-shim-cloudhv-v1 \
+              /tmp/artifacts/arm64/vmlinux \
+              /tmp/artifacts/arm64/rootfs.erofs \
+              installer/install.sh \
             /tmp/image-root-arm64/opt/cloudhv/
-          cp /tmp/artifacts/vmlinux-aarch64/vmlinux /tmp/image-root-arm64/opt/cloudhv/
-          cp /tmp/artifacts/rootfs-aarch64/rootfs.erofs /tmp/image-root-arm64/opt/cloudhv/
-          cp installer/install.sh /tmp/image-root-arm64/opt/cloudhv/
+
           chmod +x /tmp/image-root-arm64/opt/cloudhv/containerd-shim-cloudhv-v1
           chmod +x /tmp/image-root-arm64/opt/cloudhv/install.sh
           ls -lh /tmp/image-root-arm64/opt/cloudhv/
@@ -302,81 +153,52 @@ jobs:
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [build-binaries, build-kernel, build-rootfs, build-installer-image]
+    needs: [build-everything,build-installer-image]
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Download shim (x86_64)
+      - name: Download build artifacts (arm64)
         uses: actions/download-artifact@v4
         with:
-          name: containerd-shim-cloudhv-v1-x86_64-unknown-linux-musl
-          path: /tmp/artifacts/containerd-shim-cloudhv-v1-x86_64-unknown-linux-musl
+          name: build-aarch64
+          path: /tmp/artifacts/arm64
 
-      - name: Download shim (aarch64)
+      - name: Download build artifacts (amd64)
         uses: actions/download-artifact@v4
         with:
-          name: containerd-shim-cloudhv-v1-aarch64-unknown-linux-musl
-          path: /tmp/artifacts/containerd-shim-cloudhv-v1-aarch64-unknown-linux-musl
-
-      - name: Download agent (x86_64)
-        uses: actions/download-artifact@v4
-        with:
-          name: cloudhv-agent-x86_64-unknown-linux-musl
-          path: /tmp/artifacts/cloudhv-agent-x86_64-unknown-linux-musl
-
-      - name: Download agent (aarch64)
-        uses: actions/download-artifact@v4
-        with:
-          name: cloudhv-agent-aarch64-unknown-linux-musl
-          path: /tmp/artifacts/cloudhv-agent-aarch64-unknown-linux-musl
-
-      - name: Download kernel (x86_64)
-        uses: actions/download-artifact@v4
-        with:
-          name: vmlinux-x86_64
-          path: /tmp/artifacts/vmlinux-x86_64
-
-      - name: Download kernel (aarch64)
-        uses: actions/download-artifact@v4
-        with:
-          name: vmlinux-aarch64
-          path: /tmp/artifacts/vmlinux-aarch64
-
-      - name: Download rootfs (x86_64)
-        uses: actions/download-artifact@v4
-        with:
-          name: rootfs-x86_64
-          path: /tmp/artifacts/rootfs-x86_64
-
-      - name: Download rootfs (aarch64)
-        uses: actions/download-artifact@v4
-        with:
-          name: rootfs-aarch64
-          path: /tmp/artifacts/rootfs-aarch64
+          name: build-x86_64
+          path: /tmp/artifacts/amd64
 
       - name: Prepare release assets
         run: |
           mkdir -p /tmp/release
+
           # x86_64
-          cp /tmp/artifacts/containerd-shim-cloudhv-v1-x86_64-unknown-linux-musl/containerd-shim-cloudhv-v1 \
-            /tmp/release/containerd-shim-cloudhv-v1-linux-amd64
-          cp /tmp/artifacts/cloudhv-agent-x86_64-unknown-linux-musl/cloudhv-agent \
-            /tmp/release/cloudhv-agent-linux-amd64
-          cp /tmp/artifacts/vmlinux-x86_64/vmlinux /tmp/release/vmlinux-amd64
-          cp /tmp/artifacts/rootfs-x86_64/rootfs.erofs /tmp/release/rootfs-amd64.erofs
+          cd /tmp/artifacts/amd64
+          cp -v cloudhv-agent /tmp/release/cloudhv-agent-linux-amd64 
+          cp -v containerd-shim-cloudhv-v1 /tmp/release/containerd-shim-cloudhv-v1-linux-amd64 
+          cp -v rootfs.erofs /tmp/release/rootfs-amd64.erofs 
+          cp -v vmlinux /tmp/release/vmlinux-amd64
+          cp -v vmlinux.kconfig /tmp/release/vmlinux-amd64.kconfig
+          cp -v containerd-cloudhypervisor.raw /tmp/release/containerd-cloudhypervisor-${{ github.ref_name }}-x86-64.raw
+
           chmod +x /tmp/release/containerd-shim-cloudhv-v1-linux-amd64
           chmod +x /tmp/release/cloudhv-agent-linux-amd64
+
           # aarch64
-          cp /tmp/artifacts/containerd-shim-cloudhv-v1-aarch64-unknown-linux-musl/containerd-shim-cloudhv-v1 \
-            /tmp/release/containerd-shim-cloudhv-v1-linux-arm64
-          cp /tmp/artifacts/cloudhv-agent-aarch64-unknown-linux-musl/cloudhv-agent \
-            /tmp/release/cloudhv-agent-linux-arm64
-          cp /tmp/artifacts/vmlinux-aarch64/vmlinux /tmp/release/vmlinux-arm64
-          cp /tmp/artifacts/rootfs-aarch64/rootfs.erofs /tmp/release/rootfs-arm64.erofs
+          cd /tmp/artifacts/arm64
+          cp -v cloudhv-agent /tmp/release/cloudhv-agent-linux-arm64 
+          cp -v containerd-shim-cloudhv-v1 /tmp/release/containerd-shim-cloudhv-v1-linux-arm64 
+          cp -v rootfs.erofs /tmp/release/rootfs-arm64.erofs 
+          cp -v vmlinux /tmp/release/vmlinux-arm64
+          cp -v vmlinux.kconfig /tmp/release/vmlinux-arm64.kconfig
+          cp -v containerd-cloudhypervisor.raw /tmp/release/containerd-cloudhypervisor-${{ github.ref_name }}-arm64.raw
+
           chmod +x /tmp/release/containerd-shim-cloudhv-v1-linux-arm64
           chmod +x /tmp/release/cloudhv-agent-linux-arm64
+
           # Generate checksums
           cd /tmp/release && sha256sum * > checksums-sha256.txt
 
@@ -432,16 +254,25 @@ jobs:
           cat >> /tmp/release-notes.md << 'INSTALL'
           ## Installation
 
-          ### Binaries (bare Linux)
+          ### System extension image
 
-          Download the binaries from this release and install manually:
+          Download `containerd-cloudhypervisor-TAG-x86-64.raw` to `/etc/extensions/containerd-cloudhypervisor.raw`,
+          then run `systemd-sysext refresh`.
 
-          ```bash
-          sudo install -m 755 containerd-shim-cloudhv-v1-linux-amd64 /usr/local/bin/containerd-shim-cloudhv-v1
-          sudo mkdir -p /opt/cloudhv
-          sudo cp vmlinux rootfs.erofs /opt/cloudhv/
+          Use the following Butane config to automatically install the sysext at provisioning time on distros that support Ignition / Butane provisioning (Fedora CoreOS, SUSE MicroOS, Flatcar, etc.).
+          Adjust `variant:` and `version:` in accordance with your distro's requirements.
+          The example is for `x86-64`; replace with `arm64` in the sysext file name to provision for `arm64`.
+          ```yaml
+          variant: flatcar
+          version: 1.0.0
+
+          storage:
+            files:
+            - path: /etc/extensions/containerd-cloudhypervisor.raw
+              mode: 0644
+              contents:
+                source: https://github.com/devigned/containerd-cloudhypervisor/releases/download/TAG/containerd-cloudhypervisor-TAG-x86-64.raw
           ```
-
           ### Helm Chart (Kubernetes)
 
           The chart is published to GHCR as an OCI artifact:
@@ -458,10 +289,20 @@ jobs:
           ```
           ghcr.io/devigned/cloudhv-installer:TAG
           ```
+
+          ### Manual Binaries (bare Linux)
+
+          Download the binaries from this release and install manually:
+
+          ```bash
+          sudo install -m 755 containerd-shim-cloudhv-v1-linux-amd64 /usr/local/bin/containerd-shim-cloudhv-v1
+          sudo mkdir -p /opt/cloudhv
+          sudo cp vmlinux rootfs.erofs /opt/cloudhv/
+          ```
           INSTALL
 
           # Replace TAG placeholder
-          sed -i "s/TAG/${GITHUB_REF_NAME}/" /tmp/release-notes.md
+          sed -i "s/TAG/${GITHUB_REF_NAME}/g" /tmp/release-notes.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
