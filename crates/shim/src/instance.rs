@@ -72,6 +72,7 @@ struct SharedVmState {
     // Store sandbox boot config for deferred boot
     tap_name: Option<String>,
     tap_mac: Option<String>,
+    netns: Option<String>,
     cgroups_path: Option<String>,
 }
 
@@ -212,6 +213,13 @@ impl Instance for CloudHvInstance {
             // Decrement container count; clean up VM if zero
             let prev = vm_state.container_count.fetch_sub(1, Ordering::SeqCst);
             if prev <= 1 {
+                // Clean up network state BEFORE shutting down VM — the netns
+                // may be reused by the next sandbox if we don't remove the TAP
+                // device and tc redirect rules.
+                if let (Some(ref tap), Some(ref netns)) = (&vm_state.tap_name, &vm_state.netns) {
+                    cleanup_tap_in_netns(netns, tap);
+                }
+
                 let removed = VMS
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
@@ -357,6 +365,7 @@ impl CloudHvInstance {
             boot_complete: tokio::sync::Notify::new(),
             tap_name,
             tap_mac,
+            netns: sandbox_spec.netns.clone(),
             cgroups_path: sandbox_spec.cgroups_path.clone(),
         });
 
@@ -1216,6 +1225,44 @@ struct TapInfo {
 
 /// Create a TAP device in the pod's network namespace and set up
 ///
+/// Clean up TAP device and tc redirect rules in the pod's network namespace.
+/// Must be called before the VM is destroyed so the next sandbox using this
+/// netns gets a clean slate. Best-effort — failures are logged but don't
+/// prevent further cleanup.
+fn cleanup_tap_in_netns(netns_path: &str, tap_name: &str) {
+    use std::process::Command;
+
+    let netns_arg = format!("--net={netns_path}");
+
+    // Remove tc ingress qdiscs (which hold the redirect filters).
+    // We delete from the TAP first, then the veth. If the TAP is already
+    // gone (e.g. netns was destroyed), this is a no-op.
+    for dev in [tap_name, "eth0"] {
+        let _ = Command::new("nsenter")
+            .args([
+                &netns_arg, "--", "tc", "qdisc", "del", "dev", dev, "ingress",
+            ])
+            .output();
+    }
+
+    // Delete the TAP device
+    let result = Command::new("nsenter")
+        .args([&netns_arg, "--", "ip", "link", "del", tap_name])
+        .output();
+    match result {
+        Ok(output) if output.status.success() => {
+            log::info!("cleaned up TAP {tap_name} in netns {netns_path}");
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::info!("TAP {tap_name} cleanup (may already be gone): {stderr}");
+        }
+        Err(e) => {
+            log::info!("TAP cleanup nsenter failed (netns gone?): {e}");
+        }
+    }
+}
+
 /// This implements the same pattern as firecracker-containerd's
 /// tc-redirect-tap CNI plugin:
 /// 1. Enter the network namespace
