@@ -195,15 +195,17 @@ impl Instance for CloudHvInstance {
                 let _ = agent.delete_container(ctx, &del_req).await;
             }
 
-            // Clean up disk image
+            // Clean up disk image (erofs or ext4)
             if !self.is_sandbox {
                 let state_dir = vm_state.shared_dir.parent().unwrap_or(&vm_state.shared_dir);
                 let disk_id = format!("ctr-{}", &self.id[..12.min(self.id.len())]);
-                let disk_img = state_dir.join(format!("{disk_id}.img"));
-                match std::fs::remove_file(&disk_img) {
-                    Ok(()) => info!("removed disk image: {}", disk_img.display()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => info!("failed to remove disk image: {e}"),
+                for ext in &["erofs", "img"] {
+                    let disk_path = state_dir.join(format!("{disk_id}.{ext}"));
+                    match std::fs::remove_file(&disk_path) {
+                        Ok(()) => info!("removed disk image: {}", disk_path.display()),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => info!("failed to remove disk image: {e}"),
+                    }
                 }
             }
 
@@ -1227,6 +1229,25 @@ fn setup_tap_in_netns(netns_path: &str, vm_id: &str) -> anyhow::Result<TapInfo> 
 
     let tap_name = format!("tap_{}", &vm_id[..8.min(vm_id.len())]);
     let netns_arg = format!("--net={netns_path}");
+
+    // Dump pre-existing netns state for diagnostics — helps debug stale
+    // TAP/tc rules left over from a previous sandbox in the same netns.
+    if let Ok(output) = Command::new("nsenter")
+        .args([&netns_arg, "--", "ip", "link", "show"])
+        .output()
+    {
+        let links = String::from_utf8_lossy(&output.stdout);
+        log::info!("netns pre-setup links:\n{links}");
+    }
+    if let Ok(output) = Command::new("nsenter")
+        .args([&netns_arg, "--", "tc", "qdisc", "show"])
+        .output()
+    {
+        let qdiscs = String::from_utf8_lossy(&output.stdout);
+        if qdiscs.contains("ingress") {
+            log::warn!("netns has pre-existing tc ingress rules — stale state:\n{qdiscs}");
+        }
+    }
 
     // Run the setup commands inside the network namespace using nsenter
     // Create TAP device
