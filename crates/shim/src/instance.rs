@@ -167,12 +167,19 @@ impl Instance for CloudHvInstance {
             }
         }
 
+        // Record exit so shimkit's task_delete can retrieve an exit code.
+        // shimkit >=0.1.1+patch allows kill() on Exited tasks (no-op),
+        // so repeated calls here are harmless.
         let _ = self.exit.set((137, Utc::now()));
         Ok(())
     }
 
     async fn delete(&self) -> Result<(), Error> {
         info!("CloudHvInstance::delete id={}", self.id);
+
+        // Ensure exit is recorded — if kill() was never called (e.g. force-delete),
+        // this lets shimkit's task_delete retrieve an exit code.
+        let _ = self.exit.set((137, Utc::now()));
 
         let vm_state = get_vm(&self.sandbox_id);
 
@@ -784,22 +791,14 @@ fn place_in_pod_cgroup_at(
     // Strip leading slash — OCI spec paths often have one
     let cgroups_path = cgroups_path.trim_start_matches('/');
 
-    // Try cgroup v2 (unified hierarchy) — create the directory if needed
+    // Try cgroup v2 (unified hierarchy) — use existing path only.
+    // Never create_dir_all on systemd-managed cgroup trees; that corrupts
+    // systemd's transient unit tracking and can brick the node.
     let v2_path = cgroup_root.join(cgroups_path);
-    let v2_procs = v2_path.join("cgroup.procs");
-    if v2_procs.exists() {
-        std::fs::write(&v2_procs, &pid_str)
+    if v2_path.join("cgroup.procs").exists() {
+        std::fs::write(v2_path.join("cgroup.procs"), &pid_str)
             .map_err(|e| anyhow::anyhow!("write cgroup v2 procs: {e}"))?;
         return Ok(());
-    }
-    // On cgroup v2, creating the directory auto-populates cgroup.procs
-    if cgroup_root.join("cgroup.controllers").exists() {
-        std::fs::create_dir_all(&v2_path).ok();
-        if v2_path.join("cgroup.procs").exists() {
-            std::fs::write(v2_path.join("cgroup.procs"), &pid_str)
-                .map_err(|e| anyhow::anyhow!("write cgroup v2 procs (created): {e}"))?;
-            return Ok(());
-        }
     }
 
     // Try systemd-style cgroup v2 path
