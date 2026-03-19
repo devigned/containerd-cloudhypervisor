@@ -459,7 +459,7 @@ dependencies = [
 [[package]]
 name = "containerd-shimkit"
 version = "0.1.1"
-source = "git+https://github.com/devigned/runwasi.git?branch=shimkit-ttrpc-0.10#12857ed1169134f157bdab54a0f62adc4dfce192"
+source = "git+https://github.com/devigned/runwasi.git?branch=shimkit-ttrpc-0.10#40679f43d6909ca4111e1334f443a188b0c547eb"
 dependencies = [
  "anyhow",
  "caps",

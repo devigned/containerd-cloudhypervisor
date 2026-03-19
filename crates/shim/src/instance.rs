@@ -72,6 +72,7 @@ struct SharedVmState {
     // Store sandbox boot config for deferred boot
     tap_name: Option<String>,
     tap_mac: Option<String>,
+    netns: Option<String>,
     cgroups_path: Option<String>,
 }
 
@@ -167,12 +168,19 @@ impl Instance for CloudHvInstance {
             }
         }
 
+        // Record exit so shimkit's task_delete can retrieve an exit code.
+        // shimkit >=0.1.1+patch allows kill() on Exited tasks (no-op),
+        // so repeated calls here are harmless.
         let _ = self.exit.set((137, Utc::now()));
         Ok(())
     }
 
     async fn delete(&self) -> Result<(), Error> {
         info!("CloudHvInstance::delete id={}", self.id);
+
+        // Ensure exit is recorded — if kill() was never called (e.g. force-delete),
+        // this lets shimkit's task_delete retrieve an exit code.
+        let _ = self.exit.set((137, Utc::now()));
 
         let vm_state = get_vm(&self.sandbox_id);
 
@@ -188,21 +196,30 @@ impl Instance for CloudHvInstance {
                 let _ = agent.delete_container(ctx, &del_req).await;
             }
 
-            // Clean up disk image
+            // Clean up disk image (erofs or ext4)
             if !self.is_sandbox {
                 let state_dir = vm_state.shared_dir.parent().unwrap_or(&vm_state.shared_dir);
                 let disk_id = format!("ctr-{}", &self.id[..12.min(self.id.len())]);
-                let disk_img = state_dir.join(format!("{disk_id}.img"));
-                match std::fs::remove_file(&disk_img) {
-                    Ok(()) => info!("removed disk image: {}", disk_img.display()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => info!("failed to remove disk image: {e}"),
+                for ext in &["erofs", "img"] {
+                    let disk_path = state_dir.join(format!("{disk_id}.{ext}"));
+                    match std::fs::remove_file(&disk_path) {
+                        Ok(()) => info!("removed disk image: {}", disk_path.display()),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => info!("failed to remove disk image: {e}"),
+                    }
                 }
             }
 
             // Decrement container count; clean up VM if zero
             let prev = vm_state.container_count.fetch_sub(1, Ordering::SeqCst);
             if prev <= 1 {
+                // Clean up network state BEFORE shutting down VM — the netns
+                // may be reused by the next sandbox if we don't remove the TAP
+                // device and tc redirect rules.
+                if let (Some(ref tap), Some(ref netns)) = (&vm_state.tap_name, &vm_state.netns) {
+                    cleanup_tap_in_netns(netns, tap);
+                }
+
                 let removed = VMS
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
@@ -251,10 +268,32 @@ impl CloudHvInstance {
         let spec_path = self.bundle.join("config.json");
         let sandbox_spec = parse_sandbox_spec(&spec_path);
 
-        // Set up TAP device in the pod's network namespace
+        // Set up TAP device in the pod's network namespace.
+        // Retry the entire setup since CNI populates the netns asynchronously —
+        // the netns file may exist but the veth/IP/routes may not be configured yet.
         let (tap_name, tap_mac, ip_config) = if let Some(ref netns) = sandbox_spec.netns {
-            match setup_tap_in_netns(netns, &sandbox_id) {
-                Ok(tap_info) => {
+            let mut result = None;
+            for attempt in 0..10 {
+                match setup_tap_in_netns(netns, &sandbox_id) {
+                    Ok(tap_info) => {
+                        if attempt > 0 {
+                            info!("TAP setup succeeded after {attempt} retries");
+                        }
+                        result = Some(tap_info);
+                        break;
+                    }
+                    Err(e) => {
+                        if attempt < 9 {
+                            info!("TAP setup attempt {attempt} failed ({e:#}), retrying...");
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                        } else {
+                            info!("TAP setup failed after 10 attempts (proceeding without network): {e}");
+                        }
+                    }
+                }
+            }
+            match result {
+                Some(tap_info) => {
                     info!(
                         "TAP created: dev={} mac={} ip={} gw={}",
                         tap_info.tap_name, tap_info.mac, tap_info.ip_cidr, tap_info.gateway
@@ -265,10 +304,7 @@ impl CloudHvInstance {
                         Some((tap_info.ip_cidr, tap_info.gateway)),
                     )
                 }
-                Err(e) => {
-                    info!("TAP setup failed (proceeding without network): {e}");
-                    (None, None, None)
-                }
+                None => (None, None, None),
             }
         } else {
             info!("no network namespace — VM will boot without networking");
@@ -348,6 +384,7 @@ impl CloudHvInstance {
             boot_complete: tokio::sync::Notify::new(),
             tap_name,
             tap_mac,
+            netns: sandbox_spec.netns.clone(),
             cgroups_path: sandbox_spec.cgroups_path.clone(),
         });
 
@@ -784,22 +821,14 @@ fn place_in_pod_cgroup_at(
     // Strip leading slash — OCI spec paths often have one
     let cgroups_path = cgroups_path.trim_start_matches('/');
 
-    // Try cgroup v2 (unified hierarchy) — create the directory if needed
+    // Try cgroup v2 (unified hierarchy) — use existing path only.
+    // Never create_dir_all on systemd-managed cgroup trees; that corrupts
+    // systemd's transient unit tracking and can brick the node.
     let v2_path = cgroup_root.join(cgroups_path);
-    let v2_procs = v2_path.join("cgroup.procs");
-    if v2_procs.exists() {
-        std::fs::write(&v2_procs, &pid_str)
+    if v2_path.join("cgroup.procs").exists() {
+        std::fs::write(v2_path.join("cgroup.procs"), &pid_str)
             .map_err(|e| anyhow::anyhow!("write cgroup v2 procs: {e}"))?;
         return Ok(());
-    }
-    // On cgroup v2, creating the directory auto-populates cgroup.procs
-    if cgroup_root.join("cgroup.controllers").exists() {
-        std::fs::create_dir_all(&v2_path).ok();
-        if v2_path.join("cgroup.procs").exists() {
-            std::fs::write(v2_path.join("cgroup.procs"), &pid_str)
-                .map_err(|e| anyhow::anyhow!("write cgroup v2 procs (created): {e}"))?;
-            return Ok(());
-        }
     }
 
     // Try systemd-style cgroup v2 path
@@ -1215,6 +1244,44 @@ struct TapInfo {
 
 /// Create a TAP device in the pod's network namespace and set up
 ///
+/// Clean up TAP device and tc redirect rules in the pod's network namespace.
+/// Must be called before the VM is destroyed so the next sandbox using this
+/// netns gets a clean slate. Best-effort — failures are logged but don't
+/// prevent further cleanup.
+fn cleanup_tap_in_netns(netns_path: &str, tap_name: &str) {
+    use std::process::Command;
+
+    let netns_arg = format!("--net={netns_path}");
+
+    // Remove tc ingress qdiscs (which hold the redirect filters).
+    // We delete from the TAP first, then the veth. If the TAP is already
+    // gone (e.g. netns was destroyed), this is a no-op.
+    for dev in [tap_name, "eth0"] {
+        let _ = Command::new("nsenter")
+            .args([
+                &netns_arg, "--", "tc", "qdisc", "del", "dev", dev, "ingress",
+            ])
+            .output();
+    }
+
+    // Delete the TAP device
+    let result = Command::new("nsenter")
+        .args([&netns_arg, "--", "ip", "link", "del", tap_name])
+        .output();
+    match result {
+        Ok(output) if output.status.success() => {
+            log::info!("cleaned up TAP {tap_name} in netns {netns_path}");
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::info!("TAP {tap_name} cleanup (may already be gone): {stderr}");
+        }
+        Err(e) => {
+            log::info!("TAP cleanup nsenter failed (netns gone?): {e}");
+        }
+    }
+}
+
 /// This implements the same pattern as firecracker-containerd's
 /// tc-redirect-tap CNI plugin:
 /// 1. Enter the network namespace
@@ -1229,7 +1296,45 @@ fn setup_tap_in_netns(netns_path: &str, vm_id: &str) -> anyhow::Result<TapInfo> 
     let tap_name = format!("tap_{}", &vm_id[..8.min(vm_id.len())]);
     let netns_arg = format!("--net={netns_path}");
 
+    // Wait for the network namespace to exist — CNI creates it asynchronously
+    // and the shim may start before the netns file appears.
+    for attempt in 0..20 {
+        if std::path::Path::new(netns_path).exists() {
+            if attempt > 0 {
+                log::info!("netns {netns_path} appeared after {attempt} retries");
+            }
+            break;
+        }
+        if attempt == 19 {
+            anyhow::bail!("netns {netns_path} did not appear after 2s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Dump pre-existing netns state for diagnostics
+    if let Ok(output) = Command::new("nsenter")
+        .args([&netns_arg, "--", "ip", "link", "show"])
+        .output()
+    {
+        let links = String::from_utf8_lossy(&output.stdout);
+        log::info!("netns pre-setup links:\n{links}");
+    }
+    if let Ok(output) = Command::new("nsenter")
+        .args([&netns_arg, "--", "tc", "qdisc", "show"])
+        .output()
+    {
+        let qdiscs = String::from_utf8_lossy(&output.stdout);
+        if qdiscs.contains("ingress") {
+            log::warn!("netns has pre-existing tc ingress rules — stale state:\n{qdiscs}");
+        }
+    }
+
     // Run the setup commands inside the network namespace using nsenter
+    // Clean up any stale TAP from a previous failed attempt (the caller retries)
+    let _ = Command::new("nsenter")
+        .args([&netns_arg, "--", "ip", "link", "del", &tap_name])
+        .output();
+
     // Create TAP device
     let status = Command::new("nsenter")
         .args([
@@ -1250,67 +1355,93 @@ fn setup_tap_in_netns(netns_path: &str, vm_id: &str) -> anyhow::Result<TapInfo> 
         anyhow::bail!("ip link set tap up failed: {status}");
     }
 
-    // Find the veth device and its IP/MAC
-    let output = Command::new("nsenter")
-        .args([&netns_arg, "--", "ip", "-j", "addr", "show"])
-        .output()
-        .context("ip addr show")?;
-    let addrs: serde_json::Value =
-        serde_json::from_slice(&output.stdout).unwrap_or(serde_json::json!([]));
-
+    // Find the veth device and its IP/MAC — retry briefly since CNI may
+    // still be configuring addresses when the shim starts.
     let mut veth_name = String::new();
     let mut ip_cidr = String::new();
     let mut mac = String::new();
 
-    if let Some(interfaces) = addrs.as_array() {
-        for iface in interfaces {
-            let name = iface.get("ifname").and_then(|n| n.as_str()).unwrap_or("");
-            // Skip loopback and our TAP
-            if name == "lo" || name == tap_name {
-                continue;
-            }
-            if let Some(addr_info) = iface.get("addr_info").and_then(|a| a.as_array()) {
-                for addr in addr_info {
-                    if addr.get("family").and_then(|f| f.as_str()) == Some("inet") {
-                        ip_cidr = format!(
-                            "{}/{}",
-                            addr.get("local").and_then(|l| l.as_str()).unwrap_or(""),
-                            addr.get("prefixlen").and_then(|p| p.as_u64()).unwrap_or(24)
-                        );
-                        veth_name = name.to_string();
-                        mac = iface
-                            .get("address")
-                            .and_then(|a| a.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        break;
+    for attempt in 0..10 {
+        let output = Command::new("nsenter")
+            .args([&netns_arg, "--", "ip", "-j", "addr", "show"])
+            .output()
+            .context("ip addr show")?;
+        let addrs: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or(serde_json::json!([]));
+
+        if let Some(interfaces) = addrs.as_array() {
+            for iface in interfaces {
+                let name = iface.get("ifname").and_then(|n| n.as_str()).unwrap_or("");
+                if name == "lo" || name == tap_name {
+                    continue;
+                }
+                if let Some(addr_info) = iface.get("addr_info").and_then(|a| a.as_array()) {
+                    for addr in addr_info {
+                        if addr.get("family").and_then(|f| f.as_str()) == Some("inet") {
+                            ip_cidr = format!(
+                                "{}/{}",
+                                addr.get("local").and_then(|l| l.as_str()).unwrap_or(""),
+                                addr.get("prefixlen").and_then(|p| p.as_u64()).unwrap_or(24)
+                            );
+                            veth_name = name.to_string();
+                            mac = iface
+                                .get("address")
+                                .and_then(|a| a.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            break;
+                        }
                     }
                 }
+                if !veth_name.is_empty() {
+                    break;
+                }
             }
-            if !veth_name.is_empty() {
-                break;
+        }
+        if !veth_name.is_empty() {
+            if attempt > 0 {
+                log::info!("veth with IP appeared after {attempt} retries");
             }
+            break;
+        }
+        if attempt < 9 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
 
     if veth_name.is_empty() || ip_cidr.is_empty() {
-        anyhow::bail!("could not find veth with IP in netns {netns_path}");
+        anyhow::bail!("could not find veth with IP in netns {netns_path} after retries");
     }
 
-    // Get default gateway
-    let output = Command::new("nsenter")
-        .args([&netns_arg, "--", "ip", "-j", "route", "show", "default"])
-        .output()
-        .context("ip route show default")?;
-    let routes: serde_json::Value =
-        serde_json::from_slice(&output.stdout).unwrap_or(serde_json::json!([]));
-    let gateway = routes
-        .as_array()
-        .and_then(|r| r.first())
-        .and_then(|r| r.get("gateway"))
-        .and_then(|g| g.as_str())
-        .unwrap_or("10.88.0.1")
-        .to_string();
+    // Get default gateway — retry briefly since CNI may still be populating
+    // routes when the shim starts.
+    let mut gateway = String::new();
+    for attempt in 0..10 {
+        let output = Command::new("nsenter")
+            .args([&netns_arg, "--", "ip", "-j", "route", "show", "default"])
+            .output()
+            .context("ip route show default")?;
+        let routes: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or(serde_json::json!([]));
+        if let Some(gw) = routes
+            .as_array()
+            .and_then(|r| r.first())
+            .and_then(|r| r.get("gateway"))
+            .and_then(|g| g.as_str())
+        {
+            gateway = gw.to_string();
+            if attempt > 0 {
+                log::info!("default route appeared after {attempt} retries");
+            }
+            break;
+        }
+        if attempt < 9 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    if gateway.is_empty() {
+        anyhow::bail!("no default route in netns {netns_path} after retries (CNI not ready?)");
+    }
 
     // Set up TC redirect: veth ingress → TAP egress, TAP ingress → veth egress
     for cmd in [
