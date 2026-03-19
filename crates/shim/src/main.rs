@@ -5,6 +5,7 @@ mod config;
 mod hypervisor;
 mod instance;
 mod memory;
+mod netns;
 mod vm;
 mod vsock;
 

@@ -265,7 +265,7 @@ impl Instance for CloudHvInstance {
                 // device and tc redirect rules.
                 let t_tap = std::time::Instant::now();
                 if let (Some(ref tap), Some(ref netns)) = (&vm_state.tap_name, &vm_state.netns) {
-                    cleanup_tap_in_netns(netns, tap);
+                    crate::netns::cleanup_tap(netns, tap).await;
                 }
                 let tap_ms = t_tap.elapsed().as_millis();
 
@@ -337,14 +337,12 @@ impl CloudHvInstance {
         let spec_path = self.bundle.join("config.json");
         let sandbox_spec = parse_sandbox_spec(&spec_path);
 
-        // Set up TAP device in the pod's network namespace.
-        // Retry the entire setup since CNI populates the netns asynchronously —
-        // the netns file may exist but the veth/IP/routes may not be configured yet.
+        // Set up TAP device in the pod's network namespace via netlink (in-process).
         let t_tap = std::time::Instant::now();
         let (tap_name, tap_mac, ip_config) = if let Some(ref netns) = sandbox_spec.netns {
             let mut result = None;
-            for attempt in 0..10 {
-                match setup_tap_in_netns(netns, &sandbox_id) {
+            for attempt in 0..5 {
+                match crate::netns::setup_tap(netns, &sandbox_id).await {
                     Ok(tap_info) => {
                         if attempt > 0 {
                             info!("TAP setup succeeded after {attempt} retries");
@@ -353,11 +351,13 @@ impl CloudHvInstance {
                         break;
                     }
                     Err(e) => {
-                        if attempt < 9 {
+                        if attempt < 4 {
                             info!("TAP setup attempt {attempt} failed ({e:#}), retrying...");
-                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         } else {
-                            info!("TAP setup failed after 10 attempts (proceeding without network): {e}");
+                            info!(
+                                "TAP setup failed after 5 attempts (proceeding without network): {e}"
+                            );
                         }
                     }
                 }
@@ -1489,273 +1489,6 @@ fn read_volume_files(src: &std::path::Path) -> anyhow::Result<Vec<(String, Vec<u
     }
 
     Ok(files)
-}
-
-/// Information about a TAP device created for VM networking.
-struct TapInfo {
-    tap_name: String,
-    mac: String,
-    ip_cidr: String,
-    gateway: String,
-}
-
-/// Create a TAP device in the pod's network namespace and set up
-///
-/// Clean up TAP device and tc redirect rules in the pod's network namespace.
-/// Must be called before the VM is destroyed so the next sandbox using this
-/// netns gets a clean slate. Best-effort — failures are logged but don't
-/// prevent further cleanup.
-fn cleanup_tap_in_netns(netns_path: &str, tap_name: &str) {
-    use std::process::Command;
-
-    let netns_arg = format!("--net={netns_path}");
-
-    // Remove tc ingress qdiscs (which hold the redirect filters).
-    // We delete from the TAP first, then the veth. If the TAP is already
-    // gone (e.g. netns was destroyed), this is a no-op.
-    for dev in [tap_name, "eth0"] {
-        let _ = Command::new("nsenter")
-            .args([
-                &netns_arg, "--", "tc", "qdisc", "del", "dev", dev, "ingress",
-            ])
-            .output();
-    }
-
-    // Delete the TAP device
-    let result = Command::new("nsenter")
-        .args([&netns_arg, "--", "ip", "link", "del", tap_name])
-        .output();
-    match result {
-        Ok(output) if output.status.success() => {
-            log::info!("cleaned up TAP {tap_name} in netns {netns_path}");
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            log::info!("TAP {tap_name} cleanup (may already be gone): {stderr}");
-        }
-        Err(e) => {
-            log::info!("TAP cleanup nsenter failed (netns gone?): {e}");
-        }
-    }
-}
-
-/// This implements the same pattern as firecracker-containerd's
-/// tc-redirect-tap CNI plugin:
-/// 1. Enter the network namespace
-/// 2. Find the veth device (created by CNI)
-/// 3. Create a TAP device
-/// 4. Set up TC u32 filters to redirect veth ↔ TAP
-/// 5. Return TAP info for Cloud Hypervisor's virtio-net config
-fn setup_tap_in_netns(netns_path: &str, vm_id: &str) -> anyhow::Result<TapInfo> {
-    use anyhow::Context;
-    use std::process::Command;
-
-    let tap_name = format!("tap_{}", &vm_id[..8.min(vm_id.len())]);
-    let netns_arg = format!("--net={netns_path}");
-
-    // Wait for the network namespace to exist — CNI creates it asynchronously
-    // and the shim may start before the netns file appears.
-    for attempt in 0..20 {
-        if std::path::Path::new(netns_path).exists() {
-            if attempt > 0 {
-                log::info!("netns {netns_path} appeared after {attempt} retries");
-            }
-            break;
-        }
-        if attempt == 19 {
-            anyhow::bail!("netns {netns_path} did not appear after 2s");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-
-    // Dump pre-existing netns state for diagnostics
-    if let Ok(output) = Command::new("nsenter")
-        .args([&netns_arg, "--", "ip", "link", "show"])
-        .output()
-    {
-        let links = String::from_utf8_lossy(&output.stdout);
-        log::info!("netns pre-setup links:\n{links}");
-    }
-    if let Ok(output) = Command::new("nsenter")
-        .args([&netns_arg, "--", "tc", "qdisc", "show"])
-        .output()
-    {
-        let qdiscs = String::from_utf8_lossy(&output.stdout);
-        if qdiscs.contains("ingress") {
-            log::warn!("netns has pre-existing tc ingress rules — stale state:\n{qdiscs}");
-        }
-    }
-
-    // Run the setup commands inside the network namespace using nsenter
-    // Clean up any stale TAP from a previous failed attempt (the caller retries)
-    let _ = Command::new("nsenter")
-        .args([&netns_arg, "--", "ip", "link", "del", &tap_name])
-        .output();
-
-    // Create TAP device
-    let status = Command::new("nsenter")
-        .args([
-            &netns_arg, "--", "ip", "tuntap", "add", &tap_name, "mode", "tap",
-        ])
-        .status()
-        .context("create TAP")?;
-    if !status.success() {
-        anyhow::bail!("ip tuntap add failed: {status}");
-    }
-
-    // Bring TAP up
-    let status = Command::new("nsenter")
-        .args([&netns_arg, "--", "ip", "link", "set", &tap_name, "up"])
-        .status()
-        .context("ip link set tap up")?;
-    if !status.success() {
-        anyhow::bail!("ip link set tap up failed: {status}");
-    }
-
-    // Find the veth device and its IP/MAC — retry briefly since CNI may
-    // still be configuring addresses when the shim starts.
-    let mut veth_name = String::new();
-    let mut ip_cidr = String::new();
-    let mut mac = String::new();
-
-    for attempt in 0..10 {
-        let output = Command::new("nsenter")
-            .args([&netns_arg, "--", "ip", "-j", "addr", "show"])
-            .output()
-            .context("ip addr show")?;
-        let addrs: serde_json::Value =
-            serde_json::from_slice(&output.stdout).unwrap_or(serde_json::json!([]));
-
-        if let Some(interfaces) = addrs.as_array() {
-            for iface in interfaces {
-                let name = iface.get("ifname").and_then(|n| n.as_str()).unwrap_or("");
-                if name == "lo" || name == tap_name {
-                    continue;
-                }
-                if let Some(addr_info) = iface.get("addr_info").and_then(|a| a.as_array()) {
-                    for addr in addr_info {
-                        if addr.get("family").and_then(|f| f.as_str()) == Some("inet") {
-                            ip_cidr = format!(
-                                "{}/{}",
-                                addr.get("local").and_then(|l| l.as_str()).unwrap_or(""),
-                                addr.get("prefixlen").and_then(|p| p.as_u64()).unwrap_or(24)
-                            );
-                            veth_name = name.to_string();
-                            mac = iface
-                                .get("address")
-                                .and_then(|a| a.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            break;
-                        }
-                    }
-                }
-                if !veth_name.is_empty() {
-                    break;
-                }
-            }
-        }
-        if !veth_name.is_empty() {
-            if attempt > 0 {
-                log::info!("veth with IP appeared after {attempt} retries");
-            }
-            break;
-        }
-        if attempt < 9 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-    }
-
-    if veth_name.is_empty() || ip_cidr.is_empty() {
-        anyhow::bail!("could not find veth with IP in netns {netns_path} after retries");
-    }
-
-    // Get default gateway — retry briefly since CNI may still be populating
-    // routes when the shim starts.
-    let mut gateway = String::new();
-    for attempt in 0..10 {
-        let output = Command::new("nsenter")
-            .args([&netns_arg, "--", "ip", "-j", "route", "show", "default"])
-            .output()
-            .context("ip route show default")?;
-        let routes: serde_json::Value =
-            serde_json::from_slice(&output.stdout).unwrap_or(serde_json::json!([]));
-        if let Some(gw) = routes
-            .as_array()
-            .and_then(|r| r.first())
-            .and_then(|r| r.get("gateway"))
-            .and_then(|g| g.as_str())
-        {
-            gateway = gw.to_string();
-            if attempt > 0 {
-                log::info!("default route appeared after {attempt} retries");
-            }
-            break;
-        }
-        if attempt < 9 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-    }
-    if gateway.is_empty() {
-        anyhow::bail!("no default route in netns {netns_path} after retries (CNI not ready?)");
-    }
-
-    // Set up TC redirect: veth ingress → TAP egress, TAP ingress → veth egress
-    for cmd in [
-        // Add ingress qdisc to veth
-        vec!["tc", "qdisc", "add", "dev", &veth_name, "ingress"],
-        // Redirect veth ingress → TAP
-        vec![
-            "tc", "filter", "add", "dev", &veth_name, "parent", "ffff:", "protocol", "all", "u32",
-            "match", "u32", "0", "0", "action", "mirred", "egress", "redirect", "dev", &tap_name,
-        ],
-        // Add ingress qdisc to TAP
-        vec!["tc", "qdisc", "add", "dev", &tap_name, "ingress"],
-        // Redirect TAP ingress → veth
-        vec![
-            "tc", "filter", "add", "dev", &tap_name, "parent", "ffff:", "protocol", "all", "u32",
-            "match", "u32", "0", "0", "action", "mirred", "egress", "redirect", "dev", &veth_name,
-        ],
-    ] {
-        let mut nsenter_cmd = vec!["nsenter", &netns_arg, "--"];
-        nsenter_cmd.extend(cmd.iter().copied());
-
-        let status = Command::new(nsenter_cmd[0])
-            .args(&nsenter_cmd[1..])
-            .status()
-            .with_context(|| format!("tc command: {:?}", cmd))?;
-        if !status.success() {
-            log::warn!("tc command failed (may be ok): {:?} -> {}", cmd, status);
-        }
-    }
-
-    // Remove the IP from the netns veth so packets destined for the pod IP
-    // are forwarded through TC redirect to the TAP → VM, instead of being
-    // handled locally by the netns kernel stack.
-    let status = Command::new("nsenter")
-        .args([&netns_arg, "--", "ip", "addr", "flush", "dev", &veth_name])
-        .status()
-        .context("flush IP from veth")?;
-    if !status.success() {
-        log::warn!("failed to flush IP from veth (may cause routing issues)");
-    }
-
-    log::info!(
-        "TAP {} set up in netns {}: veth={} ip={} gw={} mac={}",
-        tap_name,
-        netns_path,
-        veth_name,
-        ip_cidr,
-        gateway,
-        mac
-    );
-
-    Ok(TapInfo {
-        tap_name,
-        mac,
-        ip_cidr,
-        gateway,
-    })
 }
 
 /// Convert a CIDR prefix length to a dotted-decimal netmask.
