@@ -15,6 +15,11 @@ use cloudhv_common::types::VmDisk;
 use crate::config::load_config;
 use crate::vm::VmManager;
 
+/// Directory for cached erofs images shared across sandboxes.
+/// Same container image → same erofs image (keyed by content hash of
+/// the overlayfs lowerdir paths).
+const EROFS_CACHE_DIR: &str = "/run/cloudhv/erofs-cache";
+
 /// Extension trait to simplify error conversion to shimkit Error.
 trait ResultExt<T> {
     fn ctx(self, msg: &str) -> Result<T, Error>;
@@ -79,6 +84,9 @@ struct SharedVmState {
 /// Lazily connect to the guest agent over vsock, caching the client in the
 /// `OnceCell`. The first caller pays the connection cost; subsequent callers
 /// get the cached client.
+///
+/// Uses exponential backoff with jitter to avoid thundering herd when many
+/// VMs boot simultaneously on the same node.
 async fn get_or_connect_agent(
     vm_state: &SharedVmState,
 ) -> Result<cloudhv_proto::AgentServiceClient, Error> {
@@ -86,19 +94,55 @@ async fn get_or_connect_agent(
         .agent
         .get_or_try_init(|| async {
             let vsock_client = crate::vsock::VsockClient::new(&vm_state.vsock_socket);
-            // Poll for agent readiness
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-            while tokio::time::Instant::now() < deadline {
-                if vsock_client.health_check().await.unwrap_or(false) {
+
+            // Retry with exponential backoff + jitter.
+            // Base delay doubles each attempt: 200ms, 400ms, 800ms, 1600ms, 3000ms, ...
+            // Jitter adds ±50% to each delay to desynchronize concurrent boots.
+            // Overall deadline: 60s hard cap regardless of attempt count.
+            let max_attempts = 10u32;
+            let base_delay_ms = 200u64;
+            let max_delay_ms = 3000u64;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+            let mut last_err = String::new();
+
+            for attempt in 0..max_attempts {
+                if tokio::time::Instant::now() >= deadline {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+                // Try to connect directly — no separate health-check poll to avoid
+                // connection churn and log spam under load.
+                match vsock_client.connect_ttrpc().await {
+                    Ok((agent, _health)) => {
+                        if attempt > 0 {
+                            info!("agent connected after {attempt} retries");
+                        }
+                        return Ok(agent);
+                    }
+                    Err(e) => {
+                        last_err = format!("{e:#}");
+                        if attempt < max_attempts - 1 && tokio::time::Instant::now() < deadline {
+                            // Exponential backoff with jitter
+                            let exp_delay = base_delay_ms * 2u64.pow(attempt);
+                            let capped = exp_delay.min(max_delay_ms);
+                            let jitter_seed = (std::process::id() as u64)
+                                .wrapping_mul(attempt as u64 + 1)
+                                .wrapping_add(0x517cc1b727220a95);
+                            let jitter_frac = (jitter_seed % 100) as f64 / 100.0;
+                            let jitter_ms = (capped as f64 * (0.5 + jitter_frac)) as u64;
+                            info!(
+                                "agent connect attempt {attempt} failed, retrying in {jitter_ms}ms: {last_err}"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(jitter_ms))
+                                .await;
+                        }
+                    }
+                }
             }
-            let (agent, _health) = vsock_client
-                .connect_ttrpc()
-                .await
-                .map_err(|e| Error::Any(anyhow::anyhow!("agent connect: {e}")))?;
-            Ok(agent)
+
+            Err(Error::Any(anyhow::anyhow!(
+                "agent connect: {last_err} (after {max_attempts} attempts)"
+            )))
         })
         .await
         .cloned()
@@ -176,6 +220,7 @@ impl Instance for CloudHvInstance {
     }
 
     async fn delete(&self) -> Result<(), Error> {
+        let t_total = std::time::Instant::now();
         info!("CloudHvInstance::delete id={}", self.id);
 
         // Ensure exit is recorded — if kill() was never called (e.g. force-delete),
@@ -188,6 +233,7 @@ impl Instance for CloudHvInstance {
             // Best-effort delete RPC — use a short timeout since the VM may
             // already be dead (crash, liveness probe kill). A long timeout here
             // blocks containerd's snapshot cleanup, causing "device busy" loops.
+            let t_rpc = std::time::Instant::now();
             if let Some(agent) = vm_state.agent.get() {
                 let cid = self.id.clone();
                 let mut del_req = cloudhv_proto::DeleteContainerRequest::new();
@@ -195,6 +241,7 @@ impl Instance for CloudHvInstance {
                 let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(2));
                 let _ = agent.delete_container(ctx, &del_req).await;
             }
+            let rpc_ms = t_rpc.elapsed().as_millis();
 
             // Clean up disk image (erofs or ext4)
             if !self.is_sandbox {
@@ -216,10 +263,13 @@ impl Instance for CloudHvInstance {
                 // Clean up network state BEFORE shutting down VM — the netns
                 // may be reused by the next sandbox if we don't remove the TAP
                 // device and tc redirect rules.
+                let t_tap = std::time::Instant::now();
                 if let (Some(ref tap), Some(ref netns)) = (&vm_state.tap_name, &vm_state.netns) {
                     cleanup_tap_in_netns(netns, tap);
                 }
+                let tap_ms = t_tap.elapsed().as_millis();
 
+                let t_vm = std::time::Instant::now();
                 let removed = VMS
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
@@ -239,6 +289,24 @@ impl Instance for CloudHvInstance {
                         }
                     }
                 }
+                let vm_ms = t_vm.elapsed().as_millis();
+
+                info!(
+                    "TIMING delete {}: rpc={}ms tap_cleanup={}ms vm_cleanup={}ms total={}ms",
+                    self.id,
+                    rpc_ms,
+                    tap_ms,
+                    vm_ms,
+                    t_total.elapsed().as_millis()
+                );
+            } else {
+                info!(
+                    "TIMING delete {}: rpc={}ms total={}ms (container only, {} remaining)",
+                    self.id,
+                    rpc_ms,
+                    t_total.elapsed().as_millis(),
+                    prev - 1
+                );
             }
         }
 
@@ -264,6 +332,7 @@ impl CloudHvInstance {
     /// Boot a VM for the sandbox container.
     async fn start_sandbox(&self) -> Result<u32, Error> {
         let sandbox_id = self.id.clone();
+        let t_total = std::time::Instant::now();
 
         let spec_path = self.bundle.join("config.json");
         let sandbox_spec = parse_sandbox_spec(&spec_path);
@@ -271,6 +340,7 @@ impl CloudHvInstance {
         // Set up TAP device in the pod's network namespace.
         // Retry the entire setup since CNI populates the netns asynchronously —
         // the netns file may exist but the veth/IP/routes may not be configured yet.
+        let t_tap = std::time::Instant::now();
         let (tap_name, tap_mac, ip_config) = if let Some(ref netns) = sandbox_spec.netns {
             let mut result = None;
             for attempt in 0..10 {
@@ -310,7 +380,9 @@ impl CloudHvInstance {
             info!("no network namespace — VM will boot without networking");
             (None, None, None)
         };
+        let tap_ms = t_tap.elapsed().as_millis();
 
+        let t_config = std::time::Instant::now();
         let config = load_config(None).ctx("config error")?;
         let config = crate::annotations::apply_annotations(config, &sandbox_spec.annotations);
         let config = crate::annotations::apply_resource_limits(
@@ -324,6 +396,7 @@ impl CloudHvInstance {
         let mut vm = VmManager::new(sandbox_id.clone(), config.clone()).ctx("VmManager")?;
 
         vm.prepare().await.ctx("prepare")?;
+        let config_ms = t_config.elapsed().as_millis();
 
         if let Some((ref ip_cidr, ref gw)) = ip_config {
             let parts: Vec<&str> = ip_cidr.split('/').collect();
@@ -335,12 +408,17 @@ impl CloudHvInstance {
             info!("kernel network: {}", ip_param.trim());
         }
 
+        let t_swtpm = std::time::Instant::now();
         vm.start_swtpm().await.ctx("swtpm")?;
+        let swtpm_ms = t_swtpm.elapsed().as_millis();
 
+        let t_vmm = std::time::Instant::now();
         vm.spawn_vmm_in_netns(sandbox_spec.netns.as_deref())
             .ctx("vmm")?;
+        let spawn_ms = t_vmm.elapsed().as_millis();
 
         vm.wait_vmm_ready().await.ctx("vmm")?;
+        let vmm_ready_ms = t_vmm.elapsed().as_millis();
 
         // VM boot is deferred to start_container() — the CH process is
         // spawned and listening on the API socket, but the VM is not yet
@@ -393,12 +471,17 @@ impl CloudHvInstance {
             .insert(sandbox_id.clone(), vm_state.clone());
 
         info!("sandbox VM {} ready (ch_pid={})", sandbox_id, ch_pid);
+        info!(
+            "TIMING start_sandbox {}: tap={}ms config={}ms swtpm={}ms vmm_spawn={}ms vmm_ready={}ms total={}ms",
+            sandbox_id, tap_ms, config_ms, swtpm_ms, spawn_ms, vmm_ready_ms, t_total.elapsed().as_millis()
+        );
         Ok(ch_pid)
     }
 
     /// Create and start an application container inside an existing sandbox VM.
     async fn start_container(&self) -> Result<u32, Error> {
         let container_id = &self.id;
+        let t_total = std::time::Instant::now();
         info!("starting app container: {}", container_id);
 
         let vm_state = get_vm(&self.sandbox_id).ok_or_else(|| {
@@ -418,7 +501,9 @@ impl CloudHvInstance {
         // Find erofs layer blobs backing the rootfs.
         // Path 1: erofs snapshotter (containerd 2.1+) — layer.erofs files exist
         // Path 2: overlayfs snapshotter (containerd 2.0) — convert rootfs dir to erofs
+        let t_erofs = std::time::Instant::now();
         let erofs_layers = find_erofs_layers(&rootfs_path);
+        let mut return_erofs: Option<Vec<(std::path::PathBuf, String, bool)>> = None;
         let rootfs_disks: Vec<(std::path::PathBuf, String, bool)> = if !erofs_layers.is_empty() {
             // Path 1: erofs snapshotter — pass layer.erofs blobs directly
             info!(
@@ -438,35 +523,131 @@ impl CloudHvInstance {
                 })
                 .collect()
         } else {
-            // Path 2: overlayfs snapshotter — create erofs image from rootfs directory
+            // Path 2: overlayfs snapshotter — create erofs image from rootfs directory.
+            // Cache the erofs image keyed by the overlayfs lowerdir paths, which are
+            // deterministic per container image (containerd's snapshotter creates them
+            // from layer digests). This means mkfs.erofs runs once per image, not per pod.
+            //
+            // Race condition handling: multiple shim processes may try to build the
+            // same image concurrently. We use flock on a lock file so only one
+            // process runs mkfs.erofs; the others wait and then hardlink the result.
             info!("no erofs snapshotter layers, converting rootfs to erofs image");
+            let cache_key = erofs_cache_key(&rootfs_path);
             let erofs_path = parent_dir.join(format!("{disk_id}.erofs"));
-            let rootfs_for_erofs = rootfs_path.clone();
-            let erofs_dst = erofs_path.clone();
-            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let status = std::process::Command::new("mkfs.erofs")
-                    .arg("--quiet")
-                    .arg(&erofs_dst)
-                    .arg(&rootfs_for_erofs)
-                    .status()
-                    .map_err(|e| anyhow::anyhow!("mkfs.erofs: {e}"))?;
-                if !status.success() {
-                    anyhow::bail!("mkfs.erofs failed: {status}");
-                }
-                Ok(())
-            })
-            .await
-            .map_err(|_| Error::Any(anyhow::anyhow!("erofs conversion panicked")))?
-            .ctx("convert rootfs to erofs")?;
 
-            let size = std::fs::metadata(&erofs_path).map(|m| m.len()).unwrap_or(0);
-            info!(
-                "erofs image created: {} ({} bytes)",
-                erofs_path.display(),
-                size
-            );
-            vec![(erofs_path, disk_id.clone(), true)]
+            if let Some(ref key) = cache_key {
+                let cache_dir = std::path::Path::new(EROFS_CACHE_DIR);
+                let _ = std::fs::create_dir_all(cache_dir);
+                let cached = cache_dir.join(format!("{key}.erofs"));
+                let lock_path = cache_dir.join(format!("{key}.lock"));
+
+                // Acquire an exclusive lock — first process builds, others block and wait
+                let lock_result = tokio::task::spawn_blocking({
+                    let cached = cached.clone();
+                    let erofs_path = erofs_path.clone();
+                    let lock_path = lock_path.clone();
+                    let rootfs_for_erofs = rootfs_path.clone();
+                    move || -> anyhow::Result<bool> {
+                        use std::os::unix::io::AsRawFd;
+                        let lock_file = std::fs::OpenOptions::new()
+                            .create(true)
+                            .write(true)
+                            .truncate(false)
+                            .open(&lock_path)?;
+                        // Blocking exclusive lock — retry on EINTR, fail on other errors
+                        loop {
+                            let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
+                            if rc == 0 {
+                                break;
+                            }
+                            let err = std::io::Error::last_os_error();
+                            if err.kind() == std::io::ErrorKind::Interrupted {
+                                continue;
+                            }
+                            return Err(err.into());
+                        }
+
+                        if cached.exists() {
+                            // Another process built it while we waited
+                            std::fs::hard_link(&cached, &erofs_path)
+                                .or_else(|_| std::fs::copy(&cached, &erofs_path).map(|_| ()))?;
+                            log::info!(
+                                "erofs cache hit (after lock): {} ({} bytes)",
+                                cached.display(),
+                                std::fs::metadata(&erofs_path).map(|m| m.len()).unwrap_or(0)
+                            );
+                            return Ok(true); // cache hit
+                        }
+
+                        // We're the builder — run mkfs.erofs
+                        let status = std::process::Command::new("mkfs.erofs")
+                            .arg("--quiet")
+                            .arg(&erofs_path)
+                            .arg(&rootfs_for_erofs)
+                            .status()
+                            .map_err(|e| anyhow::anyhow!("mkfs.erofs spawn: {e}"))?;
+                        if !status.success() {
+                            anyhow::bail!("mkfs.erofs failed: {status}");
+                        }
+
+                        // Populate cache atomically: write to unique tmp then rename.
+                        // Remove any stale tmp from a previous crash.
+                        let tmp =
+                            cached.with_extension(format!("erofs.{}.tmp", std::process::id()));
+                        let _ = std::fs::remove_file(&tmp);
+                        std::fs::hard_link(&erofs_path, &tmp)
+                            .or_else(|_| std::fs::copy(&erofs_path, &tmp).map(|_| ()))?;
+                        std::fs::rename(&tmp, &cached)?;
+
+                        log::info!(
+                            "erofs built and cached: {} ({} bytes)",
+                            cached.display(),
+                            std::fs::metadata(&erofs_path).map(|m| m.len()).unwrap_or(0)
+                        );
+                        // Lock released on drop
+                        Ok(false) // cache miss — we built it
+                    }
+                })
+                .await
+                .map_err(|_| Error::Any(anyhow::anyhow!("erofs cache task panicked")))?
+                .ctx("erofs cache")?;
+
+                let _ = lock_result; // true=hit, false=miss — already logged
+                return_erofs = Some(vec![(erofs_path.clone(), disk_id.clone(), true)]);
+            }
+
+            if return_erofs.is_none() {
+                // No cache key (unusual) — build without caching
+                let rootfs_for_erofs = rootfs_path.clone();
+                let erofs_dst = erofs_path.clone();
+                tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    let status = std::process::Command::new("mkfs.erofs")
+                        .arg("--quiet")
+                        .arg(&erofs_dst)
+                        .arg(&rootfs_for_erofs)
+                        .status()
+                        .map_err(|e| anyhow::anyhow!("mkfs.erofs: {e}"))?;
+                    if !status.success() {
+                        anyhow::bail!("mkfs.erofs failed: {status}");
+                    }
+                    Ok(())
+                })
+                .await
+                .map_err(|_| Error::Any(anyhow::anyhow!("erofs conversion panicked")))?
+                .ctx("convert rootfs to erofs")?;
+
+                let size = std::fs::metadata(&erofs_path).map(|m| m.len()).unwrap_or(0);
+                info!(
+                    "erofs image created (uncached): {} ({} bytes)",
+                    erofs_path.display(),
+                    size
+                );
+                return_erofs = Some(vec![(erofs_path, disk_id.clone(), true)]);
+            }
+
+            return_erofs.unwrap()
         };
+        let erofs_ms = t_erofs.elapsed().as_millis();
 
         // Determine boot role: first container boots the VM, others wait.
         enum BootRole {
@@ -495,6 +676,7 @@ impl CloudHvInstance {
         match boot_role {
             BootRole::First => {
                 // First container — boot VM with rootfs disks pre-attached
+                let t_boot = std::time::Instant::now();
                 let extra_disks: Vec<VmDisk> = rootfs_disks
                     .iter()
                     .map(|(path, id, readonly)| VmDisk {
@@ -519,8 +701,10 @@ impl CloudHvInstance {
                     return Err(Error::Any(anyhow::anyhow!("boot with rootfs: {msg}")));
                 }
                 info!("VM booted with pre-attached rootfs: {disk_id}");
+                let boot_ms = t_boot.elapsed().as_millis();
 
                 // Connect to agent — confirms VM is fully booted and agent is responsive
+                let t_agent = std::time::Instant::now();
                 match get_or_connect_agent(&vm_state).await {
                     Ok(_) => {}
                     Err(e) => {
@@ -536,6 +720,12 @@ impl CloudHvInstance {
                 // Mark boot as complete and wake any waiting containers
                 *vm_state.boot_state.lock().await = BootState::Booted;
                 vm_state.boot_complete.notify_waiters();
+                let agent_ms = t_agent.elapsed().as_millis();
+
+                info!(
+                    "TIMING first_boot {}: vm_boot={}ms agent_connect={}ms",
+                    container_id, boot_ms, agent_ms
+                );
 
                 // Place CH in pod cgroup now that the VM is running
                 if let Some(ref cg) = vm_state.cgroups_path {
@@ -668,6 +858,7 @@ impl CloudHvInstance {
             create_req.volumes.push(vm);
         }
 
+        let t_rpc = std::time::Instant::now();
         let start_resp = if is_first_container {
             // First container — use RunContainer (create + start atomically)
             let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
@@ -775,7 +966,16 @@ impl CloudHvInstance {
         });
 
         let pid = start_resp.pid;
+        let rpc_ms = t_rpc.elapsed().as_millis();
         info!("started container {} pid={}", container_id, pid);
+        info!(
+            "TIMING start_container {}: erofs={}ms rpc={}ms total={}ms first_boot={}",
+            container_id,
+            erofs_ms,
+            rpc_ms,
+            t_total.elapsed().as_millis(),
+            is_first_container
+        );
         Ok(pid)
     }
 }
@@ -888,6 +1088,63 @@ fn to_systemd_cgroup_path(cgroups_path: &str) -> String {
         }
     }
     result
+}
+
+/// Compute a cache key for the erofs image based on the overlayfs lowerdir paths.
+/// The lowerdirs are containerd snapshot directories keyed by image layer digests,
+/// so the same container image always produces the same set of lowerdirs.
+/// Returns None if the rootfs isn't an overlayfs mount.
+fn erofs_cache_key(rootfs_path: &std::path::Path) -> Option<String> {
+    erofs_cache_key_from_mountinfo(
+        rootfs_path,
+        &std::fs::read_to_string("/proc/self/mountinfo").ok()?,
+    )
+}
+
+/// Testable implementation that accepts a mountinfo string.
+fn erofs_cache_key_from_mountinfo(
+    rootfs_path: &std::path::Path,
+    mountinfo: &str,
+) -> Option<String> {
+    let path_str = rootfs_path.to_string_lossy();
+
+    for line in mountinfo.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() > 4 && parts[4] == path_str.as_ref() {
+            if let Some(sep) = parts.iter().position(|&p| p == "-") {
+                if parts.len() > sep + 1 && parts[sep + 1] == "overlay" {
+                    // Extract lowerdir from mount options (after separator)
+                    let all_opts = parts.get(sep + 3).unwrap_or(&"");
+                    for opt in all_opts.split(',') {
+                        if let Some(dirs) = opt.strip_prefix("lowerdir=") {
+                            return Some(stable_hash_hex(dirs));
+                        }
+                    }
+                    // Also check before separator
+                    for part in parts.iter().take(sep).skip(5) {
+                        if let Some(dirs) = part.strip_prefix("lowerdir=") {
+                            return Some(stable_hash_hex(dirs));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Stable 128-bit hash (SipHash-like, deterministic across Rust versions).
+/// Uses FNV-1a 128-bit, which is simple, stable, and collision-resistant
+/// enough for a filesystem cache key.
+fn stable_hash_hex(input: &str) -> String {
+    const FNV_OFFSET: u128 = 0x6c62272e07bb0142_62b821756295c58d;
+    const FNV_PRIME: u128 = 0x0000000001000000_000000000000013b;
+    let mut hash = FNV_OFFSET;
+    for byte in input.as_bytes() {
+        hash ^= *byte as u128;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:032x}")
 }
 
 /// Find erofs layer blobs backing the container's rootfs.
@@ -1857,5 +2114,47 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].0, "secret.txt");
         assert_eq!(files[0].1, b"s3cret");
+    }
+
+    #[test]
+    fn erofs_cache_key_extracts_lowerdir() {
+        let mountinfo = "389 34 0:50 / /run/containerd/task/k8s.io/abc/rootfs rw,relatime shared:335 - overlay overlay rw,lowerdir=/snap/917/fs:/snap/916/fs:/snap/915/fs,upperdir=/snap/930/fs,workdir=/snap/930/work";
+        let key = super::erofs_cache_key_from_mountinfo(
+            std::path::Path::new("/run/containerd/task/k8s.io/abc/rootfs"),
+            mountinfo,
+        );
+        assert!(key.is_some());
+        // Same input → same key
+        let key2 = super::erofs_cache_key_from_mountinfo(
+            std::path::Path::new("/run/containerd/task/k8s.io/abc/rootfs"),
+            mountinfo,
+        );
+        assert_eq!(key, key2);
+    }
+
+    #[test]
+    fn erofs_cache_key_different_lowerdirs_differ() {
+        let mi1 = "1 0 0:1 / /rootfs1 rw - overlay overlay rw,lowerdir=/a:/b";
+        let mi2 = "1 0 0:1 / /rootfs1 rw - overlay overlay rw,lowerdir=/a:/c";
+        let k1 = super::erofs_cache_key_from_mountinfo(std::path::Path::new("/rootfs1"), mi1);
+        let k2 = super::erofs_cache_key_from_mountinfo(std::path::Path::new("/rootfs1"), mi2);
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn erofs_cache_key_none_for_non_overlay() {
+        let mountinfo = "1 0 8:1 / /rootfs rw - ext4 /dev/sda1 rw";
+        let key = super::erofs_cache_key_from_mountinfo(std::path::Path::new("/rootfs"), mountinfo);
+        assert!(key.is_none());
+    }
+
+    #[test]
+    fn stable_hash_is_deterministic() {
+        let h1 = super::stable_hash_hex("hello world");
+        let h2 = super::stable_hash_hex("hello world");
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 32); // 128-bit hex
+        let h3 = super::stable_hash_hex("different input");
+        assert_ne!(h1, h3);
     }
 }
