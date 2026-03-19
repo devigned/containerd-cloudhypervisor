@@ -33,6 +33,67 @@ migration, consider [Kata Containers](https://katacontainers.io/) instead.
 
 ## Quick Start
 
+### System extension for Flatcar and similar container OSes
+
+A self-contained system extension image is shipped with each [release](releases/); there's a Butane snippet included with the release notes for provisioning the extension.
+The general pattern is
+```
+variant: flatcar
+version: 1.0.0
+
+storage:
+  files:
+  - path: /etc/extensions/containerd-cloudhypervisor.raw
+    mode: 0644
+    contents:
+      source: https://github.com/devigned/containerd-cloudhypervisor/releases/download/<release-version>/containerd-cloudhypervisor-<release-version>-x86-64.raw
+```
+
+The sysext includes a brief demo to verify if the system is working. Run
+```shell
+root@flatcar $ /usr/share/cloudhv/demo/demo.sh
+```
+to verify.
+
+#### Test your builds locally in a Flatcar VM
+
+Sysext integration makes it easy to build the repository and run it locally in a Flatcar VM.
+
+First, build the sysext.
+This build is containerised and has no host dependencies (except Docker).
+```
+bash hacks/build-sysext.sh
+```
+
+For local testing, we'll leverage the [`boot` feature](https://github.com/flatcar/sysext-bakery?tab=readme-ov-file#interactively-test-extension-images-in-a-local-vm)
+of Flatcar's [sysext bakery](https://github.com/flatcar/sysext-bakery).
+
+1. Check out the bakery repo into a separate directory:
+   ```
+   git clone --depth 1 https://github.com/flatcar/sysext-bakery.git
+   ```
+2. Copy `containerd-cloudhypervisor.raw` into the bakery repo root; change into the bakery repo root.
+3. Run
+   ```
+   ./bakery.sh boot containerd-cloudhypervisor.raw
+   ```
+
+This will download the latest Flatcar Alpha release for qemu, then start a Flatcar VM in ephemeral mode (no changes will be persisted in the Flatcar OS image).
+`bakery.sh boot` will also launch a local Python webserver and generate transient Ignition configuration to provision `containerd-cloudhypervisor.raw` at boot time.
+
+After the VM boot finished, you'll end up on the VM's serial port.
+Run the demo included with the extension image to verify:
+```bash
+sudo /usr/share/cloudhv/demo/demo.sh
+```
+
+You can also connect to the local VM via ssh, using the `core` user:
+```bash
+ssh -p 2222 core@localhost
+```
+
+### Manual installation
+
 ```bash
 # Build
 cargo build --release -p containerd-shim-cloudhv

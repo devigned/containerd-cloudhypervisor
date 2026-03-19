@@ -1,0 +1,6 @@
+{
+  "metadata": { "name": "echo-server" },
+  "image": { "image": "hashicorp/http-echo:latest" },
+  "command": ["/http-echo", "-text=hello from Cloud Hypervisor microVM!", "-listen=:5678"],
+  "log_path": "echo.log"
+}

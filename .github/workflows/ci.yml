@@ -99,13 +99,19 @@ jobs:
       - name: Build complete Guest (kernel, agent, and root FS)
         run: |
           bash hacks/build-guest.sh
-          ls -slh "_build/${{ matrix.alt_arch }}"
-          mv "_build/${{ matrix.alt_arch }}/vmlinux" "_build/${{ matrix.alt_arch }}/vmlinux.kconfig" "_build/${{ matrix.alt_arch }}/rootfs.erofs" .
 
       - name: Build Containerd shim
         run: |
           bash hacks/build-static-rust.sh containerd-shim-cloudhv
           ls -slh containerd-shim-cloudhv-v1
+
+      - name: Build host dependencies for sysext
+        run: |
+          bash hacks/build-host-deps.sh
+
+      - name: Build the system extension image
+        run: |
+          bash hacks/build-sysext.sh
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -116,6 +122,7 @@ jobs:
             vmlinux
             vmlinux.kconfig
             containerd-shim-cloudhv-v1
+            containerd-cloudhypervisor.raw
 
   integration-test:
     name: Integration Tests for ${{ matrix.arch }}

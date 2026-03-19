@@ -1,0 +1,10 @@
+{
+  "metadata": {
+    "name": "echo-pod",
+    "namespace": "default",
+    "attempt": 1,
+    "uid": "echo-pod-uid"
+  },
+  "log_directory": "/tmp/echo-pod-logs",
+  "linux": {}
+}

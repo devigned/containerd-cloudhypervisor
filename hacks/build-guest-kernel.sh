@@ -23,8 +23,8 @@ build() {
       build-base linux-headers ncurses-dev bc elfutils-dev openssl-dev flex bison gawk diffutils jq curl perl
 
   echo -e "\n############  Commencing Kernel Build ############\n"
-  mkdir -p /opt/build
-  cd /opt/build
+  mkdir -p /opt/build-kernel
+  cd /opt/build-kernel
 
   cp -a /host/* .
   cd guest/kernel

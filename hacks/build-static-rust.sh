@@ -29,9 +29,8 @@ build() {
     make \
     musl-dev
 
-  mkdir -p /opt/build
-  cd /opt/build
-
+  mkdir -p /opt/build-rust
+  cd /opt/build-rust
   cp -a /host/* .
 
   # Force static linking for Rust and C dependencies.

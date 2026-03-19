@@ -1,0 +1,6 @@
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.cloudhv]
+  runtime_type = "io.containerd.cloudhv.v1"
+
+[plugins."io.containerd.grpc.v1.cri".cni]
+  bin_dir = "/usr/libexec/cni"
+  conf_dir = "/etc/cni/net.d"

@@ -1,14 +1,19 @@
 # Containerised build hack scripts
 
-Scripts are meant to be called from the repository root.
+Scripts are meant to be called from the repository root, and should be invoked with `bash` (for example, `bash hacks/build-guest-kernel.sh`).
 
-* `hacks/build-guest-kernel.sh` - build the guest kernel in an ephemeral Alpine container.
+* `hacks/build-guest-kernel.sh` - build the guest (L2) kernel in an ephemeral Alpine container.
   - will put `vmlinux` and `vmlinux.kconfig` in the repo root after build.
 * `hacks/build-static-rust.sh` - statically compile Rust binaries from this repo.
-  - e.g. `hacks/build-static.sh containerd-shim-cloudhv crates/agent/cloudhv-agent` will build both L1 containerd shim and L2 cloud hypervisor agent.
+  - e.g. `bash hacks/build-static-rust.sh containerd-shim-cloudhv crates/agent/cloudhv-agent` will build both L1 containerd shim and L2 cloud hypervisor agent.
   - will put the build result (static binary) into the repo root.
 * `hacks/build-guest.sh` - Build a full guest, kernel and rootfs including agent and crun.
-  - will create `_/build/<arch>` and put `root.erofs`, `vmlinux`, and `vmlinux.kconfig` there.
+  - will  put `rootfs.erofs`, `vmlinux`, and `vmlinux.kconfig` into the repository root.
+* `hacks/build-host-deps.sh` - Build host (L1) dependencies. All deps are statically linked. Currently only `mkfs.erofs` is built.
+  - will put static `mkfs.erofs` into the repo root.
+* `hacks/build-sysext.sh` - Will build a system extension image with guest (L2) and host bits, including host configuration.
+  - will put `containerd-cloudhypervisor.raw` into the repo root.
+    See [main readme](../README.md#test-your-builds-locally-in-a-flatcar-vm) for usage instructions.
 
 ## Building for different architectures
 

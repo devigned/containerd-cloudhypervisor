@@ -1,11 +1,12 @@
 # Build artifacts
 /target/
 **/target/
-_build/
 vmlinux*
-root.erofs
+rootfs.erofs
 cloudhv-agent
 containerd-shim-cloudhv-v1
+mkfs.erofs
+containerd-cloudhypervisor.raw
 
 # Cargo lock for binaries is committed
 # Cargo.lock
@@ -22,10 +23,10 @@ containerd-shim-cloudhv-v1
 Thumbs.db
 
 # Build outputs
-*.o
-*.d
-*.img
-*.ext4
+*.o$
+*.d$
+*.img$
+*.ext4$
 vmlinux
 bzImage
 
