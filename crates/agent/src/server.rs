@@ -5,7 +5,7 @@ use crate::proto::agent::*;
 use crate::proto::agent_ttrpc::{self, AgentService, HealthService};
 use anyhow::Result;
 use async_trait::async_trait;
-use log::{debug, info, warn};
+use log::{debug, info};
 use tokio::signal::unix::{signal, SignalKind};
 use ttrpc::r#async::TtrpcContext;
 
@@ -303,23 +303,32 @@ impl AgentService for AgentServiceHandler {
             device, req.ip_address, req.prefix_len, req.gateway
         );
 
-        // Wait for the network device to appear (it may be hot-plugged after restore).
         wait_for_device(device).await.map_err(|e| {
-            ttrpc::Error::Others(format!("configure_network: device wait failed: {e}"))
+            ttrpc::Error::Others(format!("device wait: {e}"))
         })?;
 
-        run_ip_command(&["addr", "add", &format!("{}/{}", req.ip_address, req.prefix_len), "dev", device])
-            .map_err(|e| ttrpc::Error::Others(format!("configure_network: ip addr add failed: {e}")))?;
+        let ip: std::net::Ipv4Addr = req.ip_address.parse()
+            .map_err(|e| ttrpc::Error::Others(format!("invalid IP: {e}")))?;
+        let gw: Option<std::net::Ipv4Addr> = if req.gateway.is_empty() {
+            None
+        } else {
+            Some(req.gateway.parse().map_err(|e| ttrpc::Error::Others(format!("invalid gateway: {e}")))?)
+        };
 
-        run_ip_command(&["link", "set", device, "up"])
-            .map_err(|e| ttrpc::Error::Others(format!("configure_network: ip link set up failed: {e}")))?;
-
-        if !req.gateway.is_empty() {
-            run_ip_command(&["route", "add", "default", "via", &req.gateway, "dev", device])
-                .map_err(|e| ttrpc::Error::Others(format!("configure_network: ip route add failed: {e}")))?;
+        let nl = cloudhv_common::netlink::Netlink::open()
+            .map_err(|e| ttrpc::Error::Others(format!("netlink: {e}")))?;
+        let idx = nl.get_link_index(device)
+            .map_err(|e| ttrpc::Error::Others(format!("get link index: {e}")))?;
+        nl.add_address(idx, ip, req.prefix_len as u8)
+            .map_err(|e| ttrpc::Error::Others(format!("add address: {e}")))?;
+        nl.set_link_up(idx)
+            .map_err(|e| ttrpc::Error::Others(format!("link up: {e}")))?;
+        if let Some(gw) = gw {
+            nl.add_default_route(gw, idx)
+                .map_err(|e| ttrpc::Error::Others(format!("add route: {e}")))?;
         }
 
-        info!("configure_network: device {} configured successfully", device);
+        info!("configure_network: {} configured via netlink", device);
         Ok(ConfigureNetworkResponse::new())
     }
 }
@@ -339,31 +348,6 @@ async fn wait_for_device(device: &str) -> anyhow::Result<()> {
     }
 
     anyhow::bail!("timed out waiting for device {} to appear at {}", device, path)
-}
-
-/// Run an `ip` command with the given arguments.
-fn run_ip_command(args: &[&str]) -> anyhow::Result<()> {
-    info!("running: ip {}", args.join(" "));
-    let output = std::process::Command::new("ip")
-        .args(args)
-        .output()
-        .map_err(|e| anyhow::anyhow!("failed to execute ip command: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // RTNETLINK "File exists" means the route/addr is already configured — not fatal.
-        if stderr.contains("File exists") {
-            warn!("ip {}: already exists (non-fatal)", args.join(" "));
-            return Ok(());
-        }
-        anyhow::bail!(
-            "ip {} failed (exit {}): {}",
-            args.join(" "),
-            output.status.code().unwrap_or(-1),
-            stderr.trim()
-        );
-    }
-    Ok(())
 }
 
 struct HealthServiceHandler;
