@@ -355,6 +355,36 @@ impl VmManager {
         Self::api_request_to_socket(&self.api_socket, method, path, body).await
     }
 
+    // --- Snapshot / Restore ---
+
+    /// Resume a paused VM.
+    pub async fn resume(&self) -> Result<()> {
+        self.api_request("PUT", "/api/v1/vm.resume", None)
+            .await
+            .context("vm.resume")?;
+        info!("VM {} resumed", self.vm_id);
+        Ok(())
+    }
+
+    /// Restore a VM from a snapshot directory. The VM is restored in a paused state.
+    /// Uses userfaultfd-based on-demand paging (CoW) for memory.
+    pub async fn restore_from_snapshot(&self, source_dir: &Path) -> Result<()> {
+        let url = format!("file://{}", source_dir.display());
+        let body = serde_json::json!({
+            "source_url": url,
+            "prefault": false,
+        });
+        self.api_request("PUT", "/api/v1/vm.restore", Some(&body.to_string()))
+            .await
+            .context("vm.restore")?;
+        info!(
+            "VM {} restored from {} (CoW)",
+            self.vm_id,
+            source_dir.display()
+        );
+        Ok(())
+    }
+
     /// Shutdown the VM gracefully.
     pub async fn shutdown(&mut self) -> Result<()> {
         info!("shutting down VM {}", self.vm_id);
@@ -437,6 +467,11 @@ impl VmManager {
     /// Get the Cloud Hypervisor process PID.
     pub fn ch_pid(&self) -> Option<u32> {
         self.ch_process.as_ref().and_then(|c| c.id())
+    }
+
+    /// Get the runtime config.
+    pub fn config(&self) -> &RuntimeConfig {
+        &self.config
     }
 }
 

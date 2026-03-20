@@ -675,32 +675,70 @@ impl CloudHvInstance {
 
         match boot_role {
             BootRole::First => {
-                // First container — boot VM with rootfs disks pre-attached
                 let t_boot = std::time::Instant::now();
-                let extra_disks: Vec<VmDisk> = rootfs_disks
-                    .iter()
-                    .map(|(path, id, readonly)| VmDisk {
-                        path: path.to_string_lossy().to_string(),
-                        readonly: *readonly,
-                        id: Some(id.clone()),
-                    })
-                    .collect();
-                let boot_result = vm_state
-                    .vm
-                    .create_and_boot_vm(
-                        vm_state.tap_name.as_deref(),
-                        vm_state.tap_mac.as_deref(),
-                        extra_disks,
-                    )
-                    .await;
 
-                if let Err(e) = boot_result {
-                    let msg = format!("{e:#}");
-                    *vm_state.boot_state.lock().await = BootState::Failed(msg.clone());
-                    vm_state.boot_complete.notify_waiters();
-                    return Err(Error::Any(anyhow::anyhow!("boot with rootfs: {msg}")));
+                // Try snapshot restore first (CoW — near-instant boot)
+                let snap_key = crate::snapshot::snapshot_cache_key(&vm_state.vm.config());
+                let restored = if crate::snapshot::snapshot_cache_hit(&snap_key) {
+                    let snap_dir = crate::snapshot::snapshot_cache_dir(&snap_key);
+                    info!("snapshot cache hit: {}", snap_dir.display());
+                    match vm_state.vm.restore_from_snapshot(&snap_dir).await {
+                        Ok(()) => {
+                            vm_state.vm.resume().await.ctx("resume after restore")?;
+                            // Hot-plug the container rootfs (not part of snapshot)
+                            for (path, id, readonly) in &rootfs_disks {
+                                let disk_json = serde_json::json!({
+                                    "path": path.to_string_lossy(),
+                                    "readonly": *readonly,
+                                    "id": id,
+                                });
+                                VmManager::api_request_to_socket(
+                                    &vm_state.api_socket,
+                                    "PUT",
+                                    "/api/v1/vm.add-disk",
+                                    Some(&disk_json.to_string()),
+                                )
+                                .await
+                                .ctx("hot-plug rootfs after restore")?;
+                            }
+                            true
+                        }
+                        Err(e) => {
+                            info!("snapshot restore failed, falling back to cold boot: {e:#}");
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+
+                if !restored {
+                    // Cold boot path — create and boot VM with pre-attached rootfs
+                    let extra_disks: Vec<VmDisk> = rootfs_disks
+                        .iter()
+                        .map(|(path, id, readonly)| VmDisk {
+                            path: path.to_string_lossy().to_string(),
+                            readonly: *readonly,
+                            id: Some(id.clone()),
+                        })
+                        .collect();
+                    let boot_result = vm_state
+                        .vm
+                        .create_and_boot_vm(
+                            vm_state.tap_name.as_deref(),
+                            vm_state.tap_mac.as_deref(),
+                            extra_disks,
+                        )
+                        .await;
+
+                    if let Err(e) = boot_result {
+                        let msg = format!("{e:#}");
+                        *vm_state.boot_state.lock().await = BootState::Failed(msg.clone());
+                        vm_state.boot_complete.notify_waiters();
+                        return Err(Error::Any(anyhow::anyhow!("boot with rootfs: {msg}")));
+                    }
                 }
-                info!("VM booted with pre-attached rootfs: {disk_id}");
+                info!("VM booted (restored={restored}): {disk_id}");
                 let boot_ms = t_boot.elapsed().as_millis();
 
                 // Connect to agent — confirms VM is fully booted and agent is responsive
@@ -723,9 +761,21 @@ impl CloudHvInstance {
                 let agent_ms = t_agent.elapsed().as_millis();
 
                 info!(
-                    "TIMING first_boot {}: vm_boot={}ms agent_connect={}ms",
-                    container_id, boot_ms, agent_ms
+                    "TIMING first_boot {}: vm_boot={}ms agent_connect={}ms restored={}",
+                    container_id, boot_ms, agent_ms, restored
                 );
+
+                // After a successful cold boot, create a snapshot for future pods.
+                // This runs async — doesn't block the current pod's startup.
+                if !restored && !crate::snapshot::snapshot_cache_hit(&snap_key) {
+                    let vm_api = vm_state.api_socket.clone();
+                    let key = snap_key.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = create_snapshot_for_cache(&vm_api, &key).await {
+                            log::info!("snapshot cache creation failed (non-fatal): {e:#}");
+                        }
+                    });
+                }
 
                 // Place CH in pod cgroup now that the VM is running
                 if let Some(ref cg) = vm_state.cgroups_path {
@@ -1136,7 +1186,7 @@ fn erofs_cache_key_from_mountinfo(
 /// Stable 128-bit hash (SipHash-like, deterministic across Rust versions).
 /// Uses FNV-1a 128-bit, which is simple, stable, and collision-resistant
 /// enough for a filesystem cache key.
-fn stable_hash_hex(input: &str) -> String {
+pub fn stable_hash_hex(input: &str) -> String {
     const FNV_OFFSET: u128 = 0x6c62272e07bb0142_62b821756295c58d;
     const FNV_PRIME: u128 = 0x0000000001000000_000000000000013b;
     let mut hash = FNV_OFFSET;
@@ -1489,6 +1539,51 @@ fn read_volume_files(src: &std::path::Path) -> anyhow::Result<Vec<(String, Vec<u
     }
 
     Ok(files)
+}
+
+/// Create a golden VM snapshot and store it in the cache.
+/// Called asynchronously after a successful cold boot — doesn't block pod startup.
+async fn create_snapshot_for_cache(
+    api_socket: &std::path::Path,
+    cache_key: &str,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let _lock = crate::snapshot::snapshot_cache_lock(cache_key)?;
+
+    // Check again under lock — another shim may have created it
+    if crate::snapshot::snapshot_cache_hit(cache_key) {
+        return Ok(());
+    }
+
+    // Snapshot into a temp dir, then move into cache
+    let tmp_dir = std::path::PathBuf::from("/run/cloudhv/snapshot-cache")
+        .join(format!("{cache_key}.{}.tmp", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir)?;
+
+    // Pause → snapshot → resume (VM stays running for the current pod)
+    VmManager::api_request_to_socket(api_socket, "PUT", "/api/v1/vm.pause", None)
+        .await
+        .context("pause for snapshot")?;
+
+    let url = format!("file://{}", tmp_dir.display());
+    let body = serde_json::json!({"destination_url": url});
+    let snap_result = VmManager::api_request_to_socket(
+        api_socket,
+        "PUT",
+        "/api/v1/vm.snapshot",
+        Some(&body.to_string()),
+    )
+    .await;
+
+    // Always resume, even if snapshot failed
+    let _ = VmManager::api_request_to_socket(api_socket, "PUT", "/api/v1/vm.resume", None).await;
+
+    snap_result.context("vm.snapshot")?;
+
+    crate::snapshot::snapshot_cache_store(cache_key, &tmp_dir)?;
+    info!("golden snapshot created and cached: {cache_key}");
+    Ok(())
 }
 
 /// Convert a CIDR prefix length to a dotted-decimal netmask.

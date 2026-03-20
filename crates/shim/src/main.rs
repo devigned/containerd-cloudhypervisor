@@ -7,6 +7,7 @@ mod config;
 mod instance;
 mod memory;
 mod netns;
+mod snapshot;
 mod vm;
 mod vsock;
 
