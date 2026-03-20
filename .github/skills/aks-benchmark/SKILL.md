@@ -16,141 +16,184 @@ release needs performance validation.
 ## Prerequisites
 
 - An Azure subscription name from the user
-- Azure CLI authenticated (`az account set --subscription "${SUBSCRIPTION_NAME}"`) where ${SUBSCRIPTION_NAME} is the user provide subscription name
+- Azure CLI authenticated (`az account set --subscription "${SUBSCRIPTION_NAME}"`)
 - `kubectl` and `helm` installed
-- A released version of the CloudHV shim Helm chart on GHCR
+- A dev image built with `hacks/build-dev-image.sh` OR a released version
 
 ## Procedure
 
 ### 1. Create Infrastructure
 
-Create a resource group and two AKS clusters (one for each runtime) with
-identical D8s_v5 worker nodes:
+Create a resource group, an Azure Monitor Workspace (for Managed Prometheus),
+and two AKS clusters with identical D8ds_v5 worker nodes:
 
 ```bash
 REGION="westus3"
 RG="rg-bench-<version>"
 az group create --name "$RG" --location "$REGION"
 
+# Create Azure Monitor Workspace for Managed Prometheus
+az monitor account create --name bench-monitor \
+  --resource-group "$RG" --location "$REGION" -o none
+MONITOR_ID=$(az monitor account show --name bench-monitor \
+  --resource-group "$RG" --query id -o tsv)
+
 # Create both clusters in parallel
 az aks create --resource-group "$RG" --name cloudhv-bench --location "$REGION" \
   --node-count 1 --node-vm-size Standard_D2s_v5 --nodepool-name system \
-  --generate-ssh-keys --network-plugin azure --os-sku AzureLinux &
+  --generate-ssh-keys --network-plugin azure --os-sku AzureLinux -o none &
 az aks create --resource-group "$RG" --name kata-bench --location "$REGION" \
   --node-count 1 --node-vm-size Standard_D2s_v5 --nodepool-name system \
-  --generate-ssh-keys --network-plugin azure --os-sku AzureLinux &
+  --generate-ssh-keys --network-plugin azure --os-sku AzureLinux -o none &
 wait
 
 # Add worker pools in parallel
 az aks nodepool add --resource-group "$RG" --cluster-name cloudhv-bench \
   --name cloudhv --node-count 3 --node-vm-size Standard_D8ds_v5 \
-  --max-pods 60 --labels workload=cloudhv --os-sku AzureLinux &
+  --max-pods 60 --labels workload=cloudhv --os-sku AzureLinux -o none &
 az aks nodepool add --resource-group "$RG" --cluster-name kata-bench \
   --name kata --node-count 3 --node-vm-size Standard_D8ds_v5 \
-  --max-pods 60 --os-sku AzureLinux --workload-runtime KataMshvVmIsolation &
+  --max-pods 60 --os-sku AzureLinux --workload-runtime KataMshvVmIsolation -o none &
 wait
 ```
 
-### 2. Install Shim and Warm Up Metrics
+### 2. Enable Managed Prometheus
+
+Enable Azure Managed Prometheus on **both** clusters. This deploys an
+`ama-metrics` DaemonSet that collects node metrics independently of the
+kubelet metrics endpoint (which times out under heavy VM load).
 
 ```bash
-az aks get-credentials --resource-group "$RG" --name cloudhv-bench
+az aks update --resource-group "$RG" --name cloudhv-bench \
+  --enable-azure-monitor-metrics \
+  --azure-monitor-workspace-resource-id "$MONITOR_ID" -o none &
+az aks update --resource-group "$RG" --name kata-bench \
+  --enable-azure-monitor-metrics \
+  --azure-monitor-workspace-resource-id "$MONITOR_ID" -o none &
+wait
+```
+
+**Why Managed Prometheus?** Under 150-pod load, CloudHV nodes run ~50
+cloud-hypervisor processes that make kubelet slow to respond. The default
+metrics-server times out (`"timeout to access kubelet"`) and reports
+`<unknown>` for worker nodes. Managed Prometheus scrapes independently
+and does not have this problem.
+
+Verify the metrics agent is running after enablement:
+
+```bash
+kubectl get pods -n kube-system -l dsName=ama-metrics-node
+```
+
+### 3. Install CloudHV Shim
+
+Use dedicated KUBECONFIG files to prevent context drift between clusters:
+
+```bash
+export KUBECONFIG=/tmp/cloudhv-bench-kubeconfig
+az aks get-credentials --resource-group "$RG" --name cloudhv-bench --overwrite-existing
+```
+
+For dev builds, create a pull secret and install from the **local chart**
+(the published chart may not have the latest `imagePullSecrets` support):
+
+```bash
+SHA=$(git rev-parse --short HEAD)
+GH_TOKEN=$(gh auth token)
+kubectl create secret docker-registry ghcr-secret \
+  --docker-server=ghcr.io --docker-username="${GHCR_OWNER}" \
+  --docker-password="${GH_TOKEN}" -n kube-system
+
+helm install cloudhv-installer ./charts/cloudhv-installer \
+  --namespace kube-system \
+  --set image.repository=ghcr.io/${GHCR_OWNER}/cloudhv-installer-dev \
+  --set image.tag=${SHA} \
+  --set "imagePullSecrets[0].name=ghcr-secret"
+```
+
+For released versions:
+
+```bash
 helm install cloudhv-installer oci://ghcr.io/devigned/charts/cloudhv-installer \
   --version <VERSION> --namespace kube-system
 ```
 
-Wait for the installer DaemonSet to roll out:
-```bash
-kubectl -n kube-system rollout status daemonset/cloudhv-installer --timeout=180s
-```
-
-**Known issue**: The installer's `dmsetup create` on loopback sparse files may
-hang silently, preventing containerd config patching and CH binary installation.
-Check installer logs (`kubectl -n kube-system logs -l app.kubernetes.io/name=cloudhv-installer`).
-If logs stop at "using loopback sparse file...", manually complete the setup on
-each node via the installer pod (patch containerd config, install CH, restart
-containerd).
-
-**Metrics warmup (critical)**: After installation and any containerd restarts,
-deploy a small warmup workload (3 pods, one per node) using the `cloudhv`
-RuntimeClass. Wait for all warmup pods to reach `Running`, then poll
-`kubectl top nodes` until ALL worker nodes report real values (not `<unknown>`).
-This confirms metrics-server has recovered from any containerd restart.
+Wait for all installer pods to complete:
 
 ```bash
-# Deploy 3 warmup pods
-kubectl create deployment warmup --image=hashicorp/http-echo:latest \
-  --replicas=3 -- -text=warmup -listen=:5678
-kubectl patch deployment warmup -p '{"spec":{"template":{"spec":{
-  "runtimeClassName":"cloudhv",
-  "nodeSelector":{"workload":"cloudhv"},
-  "containers":[{"name":"http-echo","resources":{"requests":{"cpu":"100m","memory":"64Mi"},"limits":{"memory":"256Mi"}}}]
-}}}}'
-
-# Wait for metrics (poll every 10s, up to 5 min)
-until kubectl top nodes 2>&1 | grep "aks-cloudhv" | grep -qv "unknown"; do
-  sleep 10
-done
-kubectl top nodes
-
-# Clean up warmup
-kubectl delete deployment warmup
-sleep 15
+kubectl rollout status daemonset/cloudhv-installer -n kube-system --timeout=300s
+# Verify all 3 nodes show "Installer idle. Shim is active."
+kubectl logs -n kube-system -l app.kubernetes.io/name=cloudhv-installer --tail=3
 ```
 
-Only proceed to the benchmark workload after `kubectl top nodes` shows real
-CPU/memory values for all worker nodes.
+### 4. Deploy Workload
 
-### 3. Deploy Workload
-
-Use identical pod specs on both clusters:
+Use identical pod specs on both clusters. The `command` array format is
+required for CloudHV (arg-only format causes `exec format error`):
 
 ```yaml
-image: hashicorp/http-echo:latest
-imagePullPolicy: IfNotPresent
-args: ["-text=Hello!", "-listen=:5678"]
-resources:
-  requests:
-    cpu: "100m"
-    memory: "64Mi"
-  limits:
-    memory: "256Mi"
+containers:
+  - name: http-echo
+    image: hashicorp/http-echo:latest
+    imagePullPolicy: IfNotPresent
+    command: ["/http-echo", "-text=Hello!", "-listen=:5678"]
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "64Mi"
+      limits:
+        memory: "256Mi"
 ```
 
 RuntimeClassName: `cloudhv` for CloudHV, `kata-vm-isolation` for Kata.
+(Note: Kata RuntimeClass is `kata-vm-isolation`, NOT `kata-mshv-vm-isolation`.)
 
-### 4. Scale Benchmark (3 iterations)
-
-For each runtime, run 3 iterations of:
-
-1. Scale deployment to 150 replicas
-2. Poll every 5s until target ready or 60s timeout
-3. Record: ready count, time, crash count, pending count
-4. Wait 15s for metrics to settle
-5. Capture `kubectl top nodes`
-6. Scale down to 1
-7. Record scale-down time
-8. Wait 15s cooldown between iterations
-
-### 5. Per-Pod RSS Measurement
-
-After the scale benchmark, deploy a single pod on each runtime and use
-`kubectl debug node/<NODE> -it --image=ubuntu` to inspect:
+For CloudHV with warm snapshot restore, deploy 1 replica first, wait for
+it to become Ready, then wait 35s for the snapshot cache to build before
+scaling:
 
 ```bash
-# For each cloud-hypervisor process:
-grep -E "VmRSS|RssShmem" /proc/<PID>/status
-
-# For shim processes:
-grep VmRSS /proc/<PID>/status
-
-# For virtiofsd (Kata only):
-grep VmRSS /proc/<PID>/status
+kubectl scale deployment bench --replicas=1
+kubectl wait --for=condition=Ready pod -l app=bench --timeout=60s
+sleep 35  # snapshot cache creation
+kubectl scale deployment bench --replicas=150
 ```
 
-Filter: only report processes with VmRSS > 10000kB for CH, > 3000kB for shims.
+### 5. Scale Benchmark (3 iterations)
 
-### 6. Key Metrics to Collect
+For each runtime, use the runtime's dedicated KUBECONFIG and run 3 iterations:
+
+1. Scale deployment to 150 replicas
+2. Poll every 5s until target ready or 180s timeout
+3. Record: ready count, time, crash count, pending count
+4. Capture node memory via `free -m` on each worker node (VMSS run-command)
+5. Scale down to 0
+6. Wait 30s cooldown between iterations
+
+### 6. Per-Pod RSS Measurement
+
+After the scale benchmark, deploy a single pod on each runtime and inspect
+via VMSS run-command on the hosting node:
+
+```bash
+NODE_RG=$(az aks show -g $RG -n cloudhv-bench --query nodeResourceGroup -o tsv)
+VMSS=$(az vmss list --resource-group "$NODE_RG" \
+  --query "[?contains(name,'cloudhv')].name" -o tsv)
+
+az vmss run-command invoke -g "$NODE_RG" -n "$VMSS" --instance-id 0 \
+  --command-id RunShellScript --scripts '
+for pid in $(pgrep -f cloud-hyper); do
+  echo "CH PID $pid:"
+  grep -E "VmRSS|RssShmem" /proc/$pid/status
+done
+for pid in $(pgrep -f containerd-shim-cloudhv); do
+  echo "Shim PID $pid:"
+  grep VmRSS /proc/$pid/status
+done
+'
+```
+
+### 7. Key Metrics to Collect
 
 | Metric | How | Why |
 |--------|-----|-----|
@@ -158,25 +201,23 @@ Filter: only report processes with VmRSS > 10000kB for CH, > 3000kB for shims.
 | Pods ready/150 | Final readyReplicas count | Density ceiling |
 | CrashLoopBackOff | Count pod statuses | Reliability |
 | Pending | Count pod statuses | Scheduling limit |
-| Actual CPU | `kubectl top nodes` at peak | Host CPU cost |
-| Actual memory | `kubectl top nodes` at peak | Host memory cost |
+| Node memory | `free -m` via VMSS run-command | True node memory |
+| Node CPU | Managed Prometheus or `kubectl top` | Host CPU cost |
 | CH VmRSS | `/proc/<pid>/status` | True per-pod memory |
 | CH RssShmem | `/proc/<pid>/status` | Guest pages touched |
 | Shim RSS | `/proc/<pid>/status` | Shim overhead |
-| virtiofsd RSS | `/proc/<pid>/status` (Kata) | virtiofsd overhead |
 
-### 7. Report Format
+### 8. Report Format
 
 Save report to `reports/aks-150-pod-scale-cloudhv-v<VERSION>-vs-kata.md` with:
-- Test configuration table
-- RuntimeClass overhead table with source citations
+- Test configuration table (date, VM sizes, versions, image SHA)
 - Scale-up results (per-iteration table)
-- Node metrics at peak
-- Per-pod RSS deep dive (measured via /proc, not kubectl top)
-- Analysis section explaining CPU and memory differences
+- Node memory at peak (from `free -m`, not `kubectl top`)
+- Per-pod RSS deep dive (measured via /proc)
+- Analysis section explaining memory differences
 - Conclusions
 
-### 8. Cleanup
+### 9. Cleanup
 
 ```bash
 az group delete --name "$RG" --yes --no-wait
@@ -184,24 +225,20 @@ az group delete --name "$RG" --yes --no-wait
 
 ## Important Notes
 
-- The CloudHV installer automatically configures the devmapper snapshotter
-  on AKS nodes by detecting ephemeral disks and creating a thin pool.
-  Devmapper passthrough (Tier 1) is active when the installer succeeds.
-  If no ephemeral disk is available and loopback setup fails, the ext4
-  cache fallback (Tier 2) is used instead.
-- **Installer reliability**: `dmsetup create` on loopback sparse files can
-  hang for minutes, causing the installer script to skip config patching and
-  CH binary installation. Always verify installer logs completed through
-  "Installation complete" before proceeding.
-- **Metrics warmup is essential**: After containerd restarts (from shim
-  installation), metrics-server loses connection to worker nodes. Deploying
-  a small warmup workload and waiting for `kubectl top nodes` to report
-  real values ensures metrics are available during the benchmark. Without
-  this step, worker nodes will show `<unknown>` throughout the benchmark.
-- Kata on AKS uses `disable_block_device_use = true` and virtiofsd for rootfs.
-- The 600Mi Kata RuntimeClass overhead is set by Microsoft's AKS addon, not
-  by the Kata project (which recommends 130Mi for Cloud Hypervisor).
-- CloudHV's 50Mi overhead accurately reflects ~59MB actual per-pod RSS.
-- Per-pod RSS via /proc (using installer pods with host PID access) is more
-  reliable than `kubectl top` for per-process memory measurement.
+- **Always use `hacks/build-dev-image.sh`** for dev builds. Never build
+  components separately — this prevents version skew.
+- **Always use dedicated KUBECONFIG files** per cluster (`export
+  KUBECONFIG=/tmp/<name>-kubeconfig`) to prevent context drift when
+  operating on multiple clusters.
+- **Never patch the DaemonSet after install.** If settings are wrong,
+  `helm uninstall` and reinstall with correct `--set` values.
+- **Managed Prometheus is required** for reliable metrics under load.
+  Without it, `kubectl top nodes` returns `<unknown>` for CloudHV workers
+  because kubelet times out under heavy CH process load.
+- **Use `command` array format** for http-echo pods, not `args`. CloudHV
+  requires the full command path.
+- Kata on AKS uses `kata-vm-isolation` RuntimeClass (not
+  `kata-mshv-vm-isolation`).
+- For CloudHV with warm snapshots, seed the cache with 1 pod + 35s wait
+  before scaling. Different container images produce different snapshots.
 - Always delete Azure resources after benchmarking to avoid charges.
