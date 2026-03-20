@@ -77,6 +77,8 @@ struct SharedVmState {
     // Store sandbox boot config for deferred boot
     tap_name: Option<String>,
     tap_mac: Option<String>,
+    ip_cidr: Option<String>,
+    gateway: Option<String>,
     netns: Option<String>,
     cgroups_path: Option<String>,
 }
@@ -451,6 +453,10 @@ impl CloudHvInstance {
             std::mem::forget(shutdown_tx);
         }
 
+        let (ip_cidr_val, gateway_val) = match &ip_config {
+            Some((cidr, gw)) => (Some(cidr.clone()), Some(gw.clone())),
+            None => (None, None),
+        };
         let vm_state = Arc::new(SharedVmState {
             vm,
             agent: OnceCell::new(),
@@ -462,6 +468,8 @@ impl CloudHvInstance {
             boot_complete: tokio::sync::Notify::new(),
             tap_name,
             tap_mac,
+            ip_cidr: ip_cidr_val,
+            gateway: gateway_val,
             netns: sandbox_spec.netns.clone(),
             cgroups_path: sandbox_spec.cgroups_path.clone(),
         });
@@ -677,32 +685,20 @@ impl CloudHvInstance {
             BootRole::First => {
                 let t_boot = std::time::Instant::now();
 
+                // Snapshot cache key includes VM config AND container image identity
+                // so different workload images get separate snapshots.
+                let snap_key = {
+                    let base = crate::snapshot::snapshot_cache_key(vm_state.vm.config());
+                    let erofs_id = erofs_cache_key(&rootfs_path).unwrap_or_default();
+                    stable_hash_hex(&format!("{base}:{erofs_id}"))
+                };
+
                 // Try snapshot restore first (CoW — near-instant boot)
-                let snap_key = crate::snapshot::snapshot_cache_key(&vm_state.vm.config());
                 let restored = if crate::snapshot::snapshot_cache_hit(&snap_key) {
                     let snap_dir = crate::snapshot::snapshot_cache_dir(&snap_key);
                     info!("snapshot cache hit: {}", snap_dir.display());
-                    match vm_state.vm.restore_from_snapshot(&snap_dir).await {
-                        Ok(()) => {
-                            vm_state.vm.resume().await.ctx("resume after restore")?;
-                            // Hot-plug the container rootfs (not part of snapshot)
-                            for (path, id, readonly) in &rootfs_disks {
-                                let disk_json = serde_json::json!({
-                                    "path": path.to_string_lossy(),
-                                    "readonly": *readonly,
-                                    "id": id,
-                                });
-                                VmManager::api_request_to_socket(
-                                    &vm_state.api_socket,
-                                    "PUT",
-                                    "/api/v1/vm.add-disk",
-                                    Some(&disk_json.to_string()),
-                                )
-                                .await
-                                .ctx("hot-plug rootfs after restore")?;
-                            }
-                            true
-                        }
+                    match try_restore(&vm_state, &snap_key, &rootfs_disks).await {
+                        Ok(()) => true,
                         Err(e) => {
                             info!("snapshot restore failed, falling back to cold boot: {e:#}");
                             false
@@ -755,6 +751,30 @@ impl CloudHvInstance {
                     }
                 }
 
+                // After snapshot restore, configure guest networking via agent RPC.
+                // The snapshot was stripped of networking; we re-apply the pod's IP.
+                if restored {
+                    if let (Some(ref ip_cidr), Some(ref gw)) =
+                        (&vm_state.ip_cidr, &vm_state.gateway)
+                    {
+                        let parts: Vec<&str> = ip_cidr.split('/').collect();
+                        let ip = parts[0];
+                        let prefix: u32 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(24);
+                        let agent = get_or_connect_agent(&vm_state).await?;
+                        let mut req = cloudhv_proto::ConfigureNetworkRequest::new();
+                        req.ip_address = ip.to_string();
+                        req.gateway = gw.clone();
+                        req.prefix_len = prefix;
+                        req.device = "eth0".to_string();
+                        let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
+                        agent
+                            .configure_network(ctx, &req)
+                            .await
+                            .ctx("configure guest network after restore")?;
+                        info!("guest network configured: ip={ip}/{prefix} gw={gw}");
+                    }
+                }
+
                 // Mark boot as complete and wake any waiting containers
                 *vm_state.boot_state.lock().await = BootState::Booted;
                 vm_state.boot_complete.notify_waiters();
@@ -766,11 +786,12 @@ impl CloudHvInstance {
                 );
 
                 // After a successful cold boot, create a snapshot for future pods.
-                // This runs async — doesn't block the current pod's startup.
+                // Wait for the workload to warm up before snapshotting.
                 if !restored && !crate::snapshot::snapshot_cache_hit(&snap_key) {
                     let vm_api = vm_state.api_socket.clone();
                     let key = snap_key.clone();
                     tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
                         if let Err(e) = create_snapshot_for_cache(&vm_api, &key).await {
                             log::info!("snapshot cache creation failed (non-fatal): {e:#}");
                         }
@@ -1541,6 +1562,62 @@ fn read_volume_files(src: &std::path::Path) -> anyhow::Result<Vec<(String, Vec<u
     Ok(files)
 }
 
+/// Attempt to restore a VM from a cached snapshot.
+/// Patches the snapshot config with this VM's CID/vsock, restores, resumes,
+/// hot-plugs the TAP device, and hot-plugs container rootfs disks.
+async fn try_restore(
+    vm_state: &SharedVmState,
+    snap_key: &str,
+    rootfs_disks: &[(std::path::PathBuf, String, bool)],
+) -> Result<(), Error> {
+    // Patch snapshot config with this VM's CID and vsock socket
+    let patched_dir = crate::snapshot::prepare_snapshot_for_vm(
+        snap_key,
+        vm_state.vm.state_dir(),
+        vm_state.vm.cid(),
+        &vm_state.vsock_socket,
+    )
+    .ctx("prepare snapshot")?;
+
+    // Restore from patched snapshot (CoW memory)
+    vm_state
+        .vm
+        .restore_from_snapshot(&patched_dir)
+        .await
+        .ctx("restore from snapshot")?;
+
+    // Resume the VM
+    vm_state.vm.resume().await.ctx("resume after restore")?;
+
+    // Hot-plug TAP device if we have networking
+    if let (Some(ref tap), Some(ref mac)) = (&vm_state.tap_name, &vm_state.tap_mac) {
+        vm_state
+            .vm
+            .add_net(tap, Some(mac.as_str()))
+            .await
+            .ctx("hot-plug TAP after restore")?;
+    }
+
+    // Hot-plug container rootfs disks
+    for (path, id, readonly) in rootfs_disks {
+        let disk_json = serde_json::json!({
+            "path": path.to_string_lossy(),
+            "readonly": *readonly,
+            "id": id,
+        });
+        VmManager::api_request_to_socket(
+            &vm_state.api_socket,
+            "PUT",
+            "/api/v1/vm.add-disk",
+            Some(&disk_json.to_string()),
+        )
+        .await
+        .ctx("hot-plug rootfs after restore")?;
+    }
+
+    Ok(())
+}
+
 /// Create a golden VM snapshot and store it in the cache.
 /// Called asynchronously after a successful cold boot — doesn't block pod startup.
 async fn create_snapshot_for_cache(
@@ -1582,7 +1659,42 @@ async fn create_snapshot_for_cache(
     snap_result.context("vm.snapshot")?;
 
     crate::snapshot::snapshot_cache_store(cache_key, &tmp_dir)?;
+
+    // Strip networking so the cached snapshot is network-agnostic and can be
+    // restored for any pod regardless of IP / TAP device.
+    strip_networking_from_snapshot(cache_key)?;
+
     info!("golden snapshot created and cached: {cache_key}");
+    Ok(())
+}
+
+/// Remove network devices and `ip=…` kernel cmdline params from a cached
+/// snapshot's `config.json` so it can be restored into any pod.
+fn strip_networking_from_snapshot(cache_key: &str) -> anyhow::Result<()> {
+    let cache_dir = crate::snapshot::snapshot_cache_dir(cache_key);
+    let config_path = cache_dir.join("config.json");
+    let config_str = std::fs::read_to_string(&config_path)?;
+    let mut config: serde_json::Value = serde_json::from_str(&config_str)?;
+
+    // Remove network devices
+    if let Some(obj) = config.as_object_mut() {
+        obj.insert("net".to_string(), serde_json::json!([]));
+    }
+
+    // Strip ip=... from kernel cmdline
+    if let Some(cmdline) = config.pointer_mut("/payload/cmdline") {
+        if let Some(s) = cmdline.as_str() {
+            let stripped = s
+                .split_whitespace()
+                .filter(|part| !part.starts_with("ip="))
+                .collect::<Vec<_>>()
+                .join(" ");
+            *cmdline = serde_json::json!(stripped);
+        }
+    }
+
+    std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
+    log::info!("stripped networking from cached snapshot {cache_key}");
     Ok(())
 }
 

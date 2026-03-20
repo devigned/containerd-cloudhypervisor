@@ -385,6 +385,52 @@ impl VmManager {
         Ok(())
     }
 
+    /// Hot-plug a TAP network device into the VM.
+    /// Used after snapshot restore to add pod-specific networking.
+    pub async fn add_net(&self, tap_name: &str, mac: Option<&str>) -> Result<()> {
+        let mut net_config = serde_json::json!({
+            "tap": tap_name,
+        });
+        if let Some(m) = mac {
+            net_config
+                .as_object_mut()
+                .unwrap()
+                .insert("mac".to_string(), serde_json::json!(m));
+        }
+        let body = net_config.to_string();
+        info!("hot-plugging TAP {} to VM {}", tap_name, self.vm_id);
+        self.api_request("PUT", "/api/v1/vm.add-net", Some(&body))
+            .await
+            .context("vm.add-net")?;
+        info!("TAP {} hot-plugged to VM {}", tap_name, self.vm_id);
+        Ok(())
+    }
+
+    /// Hot-plug a TAP device via API socket path (static method).
+    #[allow(dead_code)]
+    pub async fn add_net_to_socket(
+        api_socket: &Path,
+        tap_name: &str,
+        mac: Option<&str>,
+    ) -> Result<()> {
+        let mut net_config = serde_json::json!({"tap": tap_name});
+        if let Some(m) = mac {
+            net_config
+                .as_object_mut()
+                .unwrap()
+                .insert("mac".to_string(), serde_json::json!(m));
+        }
+        Self::api_request_to_socket(
+            api_socket,
+            "PUT",
+            "/api/v1/vm.add-net",
+            Some(&net_config.to_string()),
+        )
+        .await
+        .context("vm.add-net (static)")?;
+        Ok(())
+    }
+
     /// Shutdown the VM gracefully.
     pub async fn shutdown(&mut self) -> Result<()> {
         info!("shutting down VM {}", self.vm_id);
@@ -472,6 +518,14 @@ impl VmManager {
     /// Get the runtime config.
     pub fn config(&self) -> &RuntimeConfig {
         &self.config
+    }
+
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    pub fn cid(&self) -> u64 {
+        self.cid
     }
 }
 

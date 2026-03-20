@@ -100,6 +100,58 @@ pub fn snapshot_cache_store(key: &str, source_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Create a per-VM working copy of a cached snapshot with patched vsock config.
+/// Hardlinks memory-ranges and state.json (CoW-friendly), only rewrites config.json.
+pub fn prepare_snapshot_for_vm(
+    cache_key: &str,
+    vm_state_dir: &Path, // e.g. /run/cloudhv/<vm_id>/
+    new_cid: u64,
+    new_vsock_socket: &Path,
+) -> Result<PathBuf> {
+    let cache_dir = snapshot_cache_dir(cache_key);
+    let work_dir = vm_state_dir.join("snapshot");
+    std::fs::create_dir_all(&work_dir)?;
+
+    // Hardlink the large files (memory-ranges can be 512MB+ — don't copy)
+    for name in &["memory-ranges", "state.json"] {
+        let src = cache_dir.join(name);
+        let dst = work_dir.join(name);
+        std::fs::hard_link(&src, &dst)
+            .or_else(|_| std::fs::copy(&src, &dst).map(|_| ()))
+            .with_context(|| format!("link {name} from cache"))?;
+    }
+
+    // Read, patch, and write config.json
+    let config_str = std::fs::read_to_string(cache_dir.join("config.json"))
+        .context("read snapshot config.json")?;
+    let mut config: serde_json::Value =
+        serde_json::from_str(&config_str).context("parse snapshot config.json")?;
+
+    // Patch vsock CID and socket path
+    if let Some(vsock) = config.pointer_mut("/vsock") {
+        if let Some(obj) = vsock.as_object_mut() {
+            obj.insert("cid".to_string(), serde_json::json!(new_cid));
+            obj.insert(
+                "socket".to_string(),
+                serde_json::json!(new_vsock_socket.to_string_lossy()),
+            );
+        }
+    }
+
+    std::fs::write(
+        work_dir.join("config.json"),
+        serde_json::to_string_pretty(&config)?,
+    )
+    .context("write patched config.json")?;
+
+    log::info!(
+        "prepared snapshot for VM: cid={new_cid} socket={} dir={}",
+        new_vsock_socket.display(),
+        work_dir.display()
+    );
+    Ok(work_dir)
+}
+
 fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
