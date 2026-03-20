@@ -3,6 +3,11 @@ image:
   tag: ""  # Defaults to appVersion
   pullPolicy: IfNotPresent
 
+imagePullSecrets: []
+# For dev images from a private GHCR repo:
+#   imagePullSecrets:
+#     - name: ghcr-secret
+
 nodeSelector:
   workload: cloudhv
 
