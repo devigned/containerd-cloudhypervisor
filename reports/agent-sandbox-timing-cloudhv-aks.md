@@ -174,6 +174,32 @@ For scale comparison, see the
 
 ¹ Estimated from Kata pod creation timing in the 150-pod benchmark.
 
+## Warm Snapshot Restore Timing (from earlier validation on 3-node cluster)
+
+When warm snapshot restore is active (snapshot cache seeded by first pod),
+subsequent pods achieve dramatically faster startup:
+
+| Phase | Cold Boot | Warm Restore | Speedup |
+|-------|----------:|-------------:|--------:|
+| start_sandbox | 8ms | 7ms | — |
+| VM boot | 39ms | 293ms (restore+resume) | — |
+| Agent connect | 361ms | 17ms | **21×** |
+| ConfigureNetwork | — | 17ms | — |
+| AdoptContainer | — | 1ms | — |
+| **Total shim time** | **~420ms** | **~344ms** | **1.2×** |
+| **Wall time (SDK)** | **~8.3s** | **~13s** | 0.6× ² |
+
+² Wall time for warm restore is higher because the SDK polling interval
+(5s) and Kubernetes readiness probe cycle dominate. The shim finishes in
+344ms but the pod takes ~2s to pass its startup probe, then the SDK needs
+another poll cycle to detect readiness. With SDK-side optimization, warm
+restore wall time could drop to ~3s.
+
+The real win from warm snapshots is at **scale**: all pods after the first
+share memory pages via CoW, reducing per-pod memory from ~29 MiB to
+near-zero incremental overhead. See the [150-pod benchmark report](aks-150-pod-scale-cloudhv-snapshot-vs-kata.md)
+for scale comparison with Kata.
+
 ## Test Environment Cleanup
 
 The test cluster (`rg-cloudhv-sandbox-test`) was deleted after test completion:
