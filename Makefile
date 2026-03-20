@@ -92,6 +92,10 @@ sync:  ## Sync code to Azure VM (requires REMOTE_HOST)
 		--exclude .git/ \
 		--exclude '*.img' \
 		--exclude 'guest/kernel/linux-*/' \
+		--exclude 'containerd-shim-cloudhv-v1' \
+		--exclude 'vmlinux' \
+		--exclude 'vmlinux.kconfig' \
+		--exclude 'rootfs.erofs' \
 		./ $(REMOTE_HOST):$(REMOTE_DIR)/
 
 remote-build: sync  ## Build on Azure VM
