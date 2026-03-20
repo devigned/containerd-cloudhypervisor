@@ -417,8 +417,9 @@ impl Netlink {
         // nlmsghdr(16) + ifaddrmsg(8) + IFA_LOCAL(8) + IFA_ADDRESS(8) = 40
         let total = 40;
         let mut m = vec![0u8; total];
-        // RTM_NEWADDR=20, NLM_F_REQUEST|NLM_F_ACK|NLM_F_CREATE|NLM_F_EXCL = 0x0605
-        nlhdr(&mut m, total, 20, 0x0605, self.seq());
+        // RTM_NEWADDR=20, NLM_F_REQUEST|NLM_F_ACK|NLM_F_CREATE|NLM_F_REPLACE
+        // 0x0501 = NLM_F_REQUEST(1)|NLM_F_ACK(4)|NLM_F_CREATE(0x400)|NLM_F_REPLACE(0x100)
+        nlhdr(&mut m, total, 20, 0x0501, self.seq());
         // ifaddrmsg: family, prefixlen, flags, scope, index
         m[16] = libc::AF_INET as u8;
         m[17] = prefix_len;
@@ -436,12 +437,15 @@ impl Netlink {
     }
 
     /// Add a default route via the given gateway (RTM_NEWROUTE).
+    /// Uses NLM_F_CREATE|NLM_F_REPLACE so it works both for fresh setup and
+    /// for replacing a stale route after snapshot restore.
     pub fn add_default_route(&self, gateway: Ipv4Addr, ifindex: u32) -> Result<()> {
         // nlmsghdr(16) + rtmsg(12) + RTA_GATEWAY(8) + RTA_OIF(8) = 44
         let total = 44;
         let mut m = vec![0u8; total];
-        // RTM_NEWROUTE=24, NLM_F_REQUEST|NLM_F_ACK|NLM_F_CREATE|NLM_F_EXCL = 0x0605
-        nlhdr(&mut m, total, 24, 0x0605, self.seq());
+        // RTM_NEWROUTE=24, NLM_F_REQUEST|NLM_F_ACK|NLM_F_CREATE|NLM_F_REPLACE = 0x0601 | 0x100
+        // 0x0601 = NLM_F_REQUEST(1)|NLM_F_ACK(4)|NLM_F_CREATE(0x400)|NLM_F_REPLACE(0x100)
+        nlhdr(&mut m, total, 24, 0x0501, self.seq());
         // rtmsg
         m[16] = libc::AF_INET as u8; // family
         m[17] = 0; // dst_len (0 = default route)
@@ -502,15 +506,10 @@ pub fn configure_interface(
         mac
     );
 
-    // Flush existing addresses and routes — essential for snapshot restore
-    // where eth0 still has the old pod's IP and routes from snapshot memory.
-    if let Err(e) = nl.flush_routes(idx) {
-        log::debug!("configure_interface: flush_routes failed (non-fatal): {e}");
-    }
-    if let Err(e) = nl.flush_addrs(idx) {
-        log::debug!("configure_interface: flush_addrs failed (non-fatal): {e}");
-    }
-
+    // Replace (not flush) existing addresses and routes. On snapshot restore,
+    // eth0 has the old pod's IP from snapshot memory. We use NLM_F_REPLACE
+    // semantics: add with EEXIST tolerance rather than destructive flush,
+    // which can break the virtio-net driver's internal state.
     if let Err(e) = nl.add_address(idx, ip, prefix_len) {
         let msg = e.to_string();
         // Treat "already exists" as success to make this idempotent.
