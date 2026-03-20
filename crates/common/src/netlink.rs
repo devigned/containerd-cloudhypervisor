@@ -543,11 +543,35 @@ fn retry_find_by_mac(
                 return Ok((name, idx));
             }
             None => {
+                if attempt == 0 || attempt == max_attempts / 2 {
+                    // Log visible devices on first and midpoint attempts for debugging
+                    if let Ok(links) = nl.dump_links() {
+                        let devs: Vec<String> = links
+                            .iter()
+                            .map(|(idx, name, m)| format!("{name}(idx={idx},mac={m})"))
+                            .collect();
+                        log::info!(
+                            "find_by_mac: attempt {attempt}, looking for {mac}, visible: [{}]",
+                            devs.join(", ")
+                        );
+                    }
+                }
                 if attempt < max_attempts - 1 {
                     std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                 } else {
+                    // Final attempt: log all visible devices for diagnosis
+                    let devs = nl
+                        .dump_links()
+                        .map(|links| {
+                            links
+                                .iter()
+                                .map(|(idx, name, m)| format!("{name}(idx={idx},mac={m})"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default();
                     return Err(anyhow::anyhow!(
-                        "device with mac {mac} not found after {max_attempts} retries"
+                        "device with mac {mac} not found after {max_attempts} retries; visible: [{devs}]"
                     ));
                 }
             }
