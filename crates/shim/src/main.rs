@@ -1,8 +1,9 @@
+#![deny(dead_code)]
+
 use containerd_shimkit::sandbox;
 
 mod annotations;
 mod config;
-mod hypervisor;
 mod instance;
 mod memory;
 mod netns;
