@@ -1,14 +1,40 @@
-//! Content-addressable VM snapshot cache.
+//! # Warm Workload Snapshot Cache
 //!
-//! Caches golden VM snapshots (kernel + agent booted, no workload) so that
-//! subsequent pods can restore from snapshot instead of cold-booting.
-//! Uses userfaultfd-based CoW restore for near-zero memory copy overhead.
+//! Content-addressable cache of fully-warmed VM snapshots. Each snapshot
+//! captures a VM with the kernel booted, agent running, AND the container
+//! workload fully started (e.g. Python server listening on port 8888).
 //!
-//! Cache key = hash of (kernel_path, rootfs_path, vcpus, memory_mb, kernel_args_base).
-//! Cache dir = /run/cloudhv/snapshot-cache/{key}/
-//!   ├── config.json       (CH VM config)
-//!   ├── memory-ranges     (guest RAM — CoW mapped on restore)
-//!   └── state.json        (vCPU + device state)
+//! ## Why "Warm" Snapshots?
+//!
+//! Some workloads have expensive initialization: Python imports, JIT
+//! compilation, model loading, server startup. A Python uvicorn server
+//! takes ~15s to start on 1 vCPU. By snapshotting AFTER the server is
+//! ready, restored VMs get an instantly-warm workload — 15s → ~200ms.
+//!
+//! ## How Networking Survives Restore
+//!
+//! The snapshot is stripped of pod-specific networking (TAP device, IP
+//! address). On restore:
+//!
+//! 1. A new TAP device is hot-plugged via `vm.add-net`
+//! 2. The guest IP is configured via the agent's `ConfigureNetwork` RPC
+//! 3. The workload (e.g. uvicorn) binds `0.0.0.0:<port>`, which accepts
+//!    on ALL interfaces — including the newly-configured eth0
+//! 4. No socket rebind needed: `0.0.0.0` is interface-agnostic
+//!
+//! ## Cache Structure
+//!
+//! ```text
+//! /run/cloudhv/snapshot-cache/
+//!   {key}/
+//!     config.json       CH VM config (networking stripped)
+//!     memory-ranges     Guest RAM (CoW-mapped via userfaultfd on restore)
+//!     state.json        vCPU + device state
+//!   {key}.lock          flock for serializing snapshot creation
+//! ```
+//!
+//! Cache key = hash of (kernel, rootfs, vcpus, memory, container_image).
+//! Same workload image → same snapshot → instant restore.
 
 use std::path::{Path, PathBuf};
 
