@@ -451,7 +451,9 @@ impl Netlink {
         m[21] = 3; // protocol = RTPROT_BOOT
         m[22] = 0; // scope = RT_SCOPE_UNIVERSE
         m[23] = 1; // type = RTN_UNICAST
-        m[24..28].copy_from_slice(&0u32.to_ne_bytes()); // flags
+                   // RTNH_F_ONLINK (0x4) — required for link-local gateways like 169.254.1.1
+                   // that are not within the interface's subnet.
+        m[24..28].copy_from_slice(&4u32.to_ne_bytes()); // flags = RTNH_F_ONLINK
                                                         // RTA_GATEWAY (type=5)
         put_nla(&mut m[28..], 5, 4);
         m[32..36].copy_from_slice(&gateway.octets());
