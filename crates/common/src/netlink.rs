@@ -463,6 +463,12 @@ pub fn configure_interface(
         mac
     );
 
+    // Flush existing addresses — essential for snapshot restore where eth0
+    // still has the old pod's IP from the snapshot memory.
+    if let Err(e) = nl.flush_addrs(idx) {
+        log::debug!("configure_interface: flush_addrs failed (non-fatal): {e}");
+    }
+
     if let Err(e) = nl.add_address(idx, ip, prefix_len) {
         let msg = e.to_string();
         // Treat "already exists" as success to make this idempotent.
