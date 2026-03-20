@@ -261,6 +261,43 @@ impl Netlink {
         Ok(None)
     }
 
+    /// Delete all IPv4 routes associated with an interface.
+    pub fn flush_routes(&self, ifindex: u32) -> Result<()> {
+        let mut m = vec![0u8; 28];
+        nlhdr(&mut m, 28, 26, 0x301, self.seq()); // RTM_GETROUTE, NLM_F_ROOT|NLM_F_MATCH|NLM_F_REQUEST
+        m[16] = libc::AF_INET as u8;
+        for msg in self.dump(&m)? {
+            if msg.len() < 28 || u16_at(&msg, 4) != 24 {
+                continue;
+            }
+            // Check if this route is for our interface (RTA_OIF = type 4)
+            let nla_data = &msg[28..];
+            let mut found = false;
+            let mut offset = 0;
+            while offset + 4 <= nla_data.len() {
+                let nla_len = u16_at(nla_data, offset) as usize;
+                if nla_len < 4 {
+                    break;
+                }
+                let nla_type = u16_at(nla_data, offset + 2);
+                if nla_type == 4 && nla_len >= 8 {
+                    let oif = u32_at(nla_data, offset + 4);
+                    if oif == ifindex {
+                        found = true;
+                    }
+                }
+                offset += (nla_len + 3) & !3;
+            }
+            if found {
+                let mut del = msg.clone();
+                let del_len = del.len();
+                nlhdr(&mut del, del_len, 25, 5, self.seq()); // RTM_DELROUTE, NLM_F_REQUEST|NLM_F_ACK
+                let _ = self.request(&del); // best-effort
+            }
+        }
+        Ok(())
+    }
+
     pub fn add_ingress_qdisc(&self, ifindex: u32) -> Result<()> {
         let kind = b"ingress\0";
         let attr_len = (4 + kind.len() + 3) & !3;
@@ -463,8 +500,11 @@ pub fn configure_interface(
         mac
     );
 
-    // Flush existing addresses — essential for snapshot restore where eth0
-    // still has the old pod's IP from the snapshot memory.
+    // Flush existing addresses and routes — essential for snapshot restore
+    // where eth0 still has the old pod's IP and routes from snapshot memory.
+    if let Err(e) = nl.flush_routes(idx) {
+        log::debug!("configure_interface: flush_routes failed (non-fatal): {e}");
+    }
     if let Err(e) = nl.flush_addrs(idx) {
         log::debug!("configure_interface: flush_addrs failed (non-fatal): {e}");
     }
