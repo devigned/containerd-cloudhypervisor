@@ -107,6 +107,7 @@ Use identical pod specs on both clusters:
 
 ```yaml
 image: hashicorp/http-echo:latest
+imagePullPolicy: IfNotPresent
 args: ["-text=Hello!", "-listen=:5678"]
 resources:
   requests:

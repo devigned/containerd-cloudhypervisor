@@ -13,6 +13,7 @@ spec:
       containers:
         - name: python-runtime
           image: us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/python-runtime-sandbox:latest-main
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8888
           readinessProbe:

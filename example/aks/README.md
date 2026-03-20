@@ -105,6 +105,7 @@ spec:
       containers:
         - name: echo
           image: hashicorp/http-echo:latest
+          imagePullPolicy: IfNotPresent
           args: ["-text=Hello from Cloud Hypervisor on AKS!", "-listen=:5678"]
           ports:
             - containerPort: 5678
@@ -173,6 +174,7 @@ spec:
   containers:
     - name: app
       image: myapp:latest
+      imagePullPolicy: IfNotPresent
 ```
 
 See [Configuration — Pod Annotations](../../docs/configuration.md#pod-annotations) for

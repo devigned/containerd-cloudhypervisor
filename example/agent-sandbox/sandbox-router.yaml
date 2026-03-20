@@ -31,6 +31,7 @@ spec:
       containers:
         - name: router
           image: us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/sandbox-router:latest-main
+          imagePullPolicy: IfNotPresent
           env:
             - name: PROXY_TIMEOUT_SECONDS
               value: "180"
