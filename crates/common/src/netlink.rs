@@ -178,6 +178,18 @@ impl Netlink {
         Ok(out)
     }
 
+    /// Find a network interface by its MAC address.
+    /// Returns `(name, index)` or an error if not found.
+    pub fn find_by_mac(&self, target_mac: &str) -> Result<Option<(String, u32)>> {
+        let target = target_mac.to_lowercase();
+        for (idx, name, mac) in self.dump_links()? {
+            if mac.to_lowercase() == target {
+                return Ok(Some((name, idx)));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn find_veth(&self, tap: &str) -> Result<Option<(String, u32, String, String)>> {
         for (idx, name, mac) in self.dump_links()? {
             if name == "lo" || name == tap || name.is_empty() {
@@ -418,21 +430,68 @@ impl Netlink {
 /// Configure a network interface: resolve link index (with retry for
 /// hot-plugged devices), add an IPv4 address, bring the link up, and
 /// optionally add a default route.
+///
+/// If `mac` is provided, the device is found by MAC address instead of by
+/// name. This is essential for warm-restored VMs where the snapshot leaves
+/// a stale eth0 in guest memory, and the hot-plugged TAP gets a different
+/// name (e.g. eth1). The MAC always matches the hot-plugged device.
 pub fn configure_interface(
     device: &str,
     ip: Ipv4Addr,
     prefix_len: u8,
     gateway: Option<Ipv4Addr>,
+    mac: Option<&str>,
 ) -> Result<()> {
     let nl = Netlink::open()?;
 
-    // Retry get_link_index — the hot-plugged device may not have appeared yet
-    let idx = retry_get_link_index(&nl, device, 20, 100)?;
+    let (resolved_name, idx) = if let Some(mac_addr) = mac {
+        // MAC-based lookup: retry until the hot-plugged device appears
+        retry_find_by_mac(&nl, mac_addr, 20, 100)?
+    } else {
+        // Name-based lookup (cold boot path)
+        let idx = retry_get_link_index(&nl, device, 20, 100)?;
+        (device.to_string(), idx)
+    };
 
-    nl.add_address(idx, ip, prefix_len)?;
+    log::info!(
+        "configure_interface: resolved device={} idx={} (requested={}, mac={:?})",
+        resolved_name,
+        idx,
+        device,
+        mac
+    );
+
+    if let Err(e) = nl.add_address(idx, ip, prefix_len) {
+        let msg = e.to_string();
+        // Treat "already exists" as success to make this idempotent.
+        if msg.contains("EEXIST") || msg.contains("File exists") {
+            log::debug!(
+                "configure_interface: address {}/{} already present on {}: {}",
+                ip,
+                prefix_len,
+                resolved_name,
+                msg
+            );
+        } else {
+            return Err(e);
+        }
+    }
     nl.set_link_up(idx)?;
     if let Some(gw) = gateway {
-        nl.add_default_route(gw, idx)?;
+        if let Err(e) = nl.add_default_route(gw, idx) {
+            let msg = e.to_string();
+            // Treat "already exists" as success to make this idempotent.
+            if msg.contains("EEXIST") || msg.contains("File exists") {
+                log::debug!(
+                    "configure_interface: default route via {} on {} already present: {}",
+                    gw,
+                    resolved_name,
+                    msg
+                );
+            } else {
+                return Err(e);
+            }
+        }
     }
     Ok(())
 }
@@ -457,6 +516,36 @@ fn retry_get_link_index(
                 } else {
                     return Err(e).context(format!(
                         "device {device} not found after {max_attempts} retries"
+                    ));
+                }
+            }
+        }
+    }
+    unreachable!()
+}
+
+/// Retry finding a network interface by MAC address. Hot-plugged devices
+/// may take a moment to appear in the guest kernel's interface list.
+fn retry_find_by_mac(
+    nl: &Netlink,
+    mac: &str,
+    max_attempts: u32,
+    delay_ms: u64,
+) -> Result<(String, u32)> {
+    for attempt in 0..max_attempts {
+        match nl.find_by_mac(mac)? {
+            Some((name, idx)) => {
+                if attempt > 0 {
+                    log::info!("device with mac {mac} appeared as {name} after {attempt} retries");
+                }
+                return Ok((name, idx));
+            }
+            None => {
+                if attempt < max_attempts - 1 {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "device with mac {mac} not found after {max_attempts} retries"
                     ));
                 }
             }

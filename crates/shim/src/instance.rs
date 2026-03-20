@@ -798,6 +798,12 @@ impl CloudHvInstance {
 
                 // After snapshot restore, configure guest networking via agent RPC.
                 // The snapshot was stripped of networking; we re-apply the pod's IP.
+                //
+                // IMPORTANT: We send the TAP MAC address so the agent can find the
+                // correct hot-plugged device. The snapshot leaves a stale virtio-net
+                // device in guest kernel memory (old eth0). The new hot-plugged TAP
+                // gets a different name (e.g. eth1). MAC-based lookup ensures we
+                // configure the RIGHT device — the one backed by the actual TAP.
                 if restored {
                     if let (Some(ref ip_cidr), Some(ref gw)) =
                         (&vm_state.ip_cidr, &vm_state.gateway)
@@ -811,12 +817,20 @@ impl CloudHvInstance {
                         req.gateway = gw.clone();
                         req.prefix_len = prefix;
                         req.device = "eth0".to_string();
+                        // Send TAP MAC so the agent finds the hot-plugged device by MAC
+                        // rather than by name (which may not be eth0 after restore).
+                        if let Some(ref mac) = vm_state.tap_mac {
+                            req.mac = mac.clone();
+                        }
                         let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
                         agent
                             .configure_network(ctx, &req)
                             .await
                             .ctx("configure guest network after restore")?;
-                        info!("guest network configured: ip={ip}/{prefix} gw={gw}");
+                        info!(
+                            "guest network configured: ip={ip}/{prefix} gw={gw} mac={:?}",
+                            vm_state.tap_mac
+                        );
                     }
                 }
 

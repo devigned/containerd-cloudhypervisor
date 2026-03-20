@@ -279,6 +279,58 @@ impl VmManager {
         Ok(())
     }
 
+    /// Wait for the guest agent to start responding on vsock.
+    #[allow(dead_code)]
+    pub async fn wait_for_agent(&self) -> Result<()> {
+        info!(
+            "waiting for guest agent on vsock (cid={}, timeout={}s)",
+            self.cid, self.config.agent_startup_timeout_secs
+        );
+
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(self.config.agent_startup_timeout_secs);
+
+        while tokio::time::Instant::now() < deadline {
+            if self.check_agent_health().await.unwrap_or(false) {
+                info!("guest agent is ready (cid={})", self.cid);
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        anyhow::bail!(
+            "timed out waiting for guest agent after {}s",
+            self.config.agent_startup_timeout_secs
+        )
+    }
+
+    /// Check if the guest agent is responding on vsock.
+    async fn check_agent_health(&self) -> Result<bool> {
+        if !self.vsock_socket.exists() {
+            return Ok(false);
+        }
+
+        let stream = match UnixStream::connect(&self.vsock_socket).await {
+            Ok(s) => s,
+            Err(_) => return Ok(false),
+        };
+
+        let (mut reader, mut writer) = stream.into_split();
+        let cmd = format!("CONNECT {}\n", cloudhv_common::AGENT_VSOCK_PORT);
+        if writer.write_all(cmd.as_bytes()).await.is_err() {
+            return Ok(false);
+        }
+
+        let mut buf = [0u8; 64];
+        match tokio::time::timeout(Duration::from_secs(2), reader.read(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => {
+                let response = String::from_utf8_lossy(&buf[..n]);
+                Ok(response.starts_with("OK"))
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// Send an HTTP request to a Cloud Hypervisor API socket.
     /// Static version for use when the VmManager is behind a Mutex.
     pub async fn api_request_to_socket(
@@ -526,6 +578,63 @@ impl VmManager {
 
     pub fn cid(&self) -> u64 {
         self.cid
+    }
+
+    #[allow(dead_code)]
+    pub fn vm_id(&self) -> &str {
+        &self.vm_id
+    }
+
+    /// Hot-plug a disk to the running VM via the Cloud Hypervisor API.
+    #[allow(dead_code)]
+    pub async fn add_disk(&self, path: &str, disk_id: &str, readonly: bool) -> Result<()> {
+        let disk = VmDisk {
+            path: path.to_string(),
+            readonly,
+            id: Some(disk_id.to_string()),
+        };
+        let body = serde_json::to_string(&disk)?;
+        info!(
+            "hot-plugging disk to VM {}: id={} path={}",
+            self.vm_id, disk_id, path
+        );
+        self.api_request("PUT", "/api/v1/vm.add-disk", Some(&body))
+            .await
+            .context("failed to hot-plug disk")?;
+        info!("disk {} hot-plugged to VM {}", disk_id, self.vm_id);
+        Ok(())
+    }
+
+    /// Resize the VM's vCPUs and/or memory.
+    #[allow(dead_code)]
+    pub async fn resize(
+        &self,
+        desired_vcpus: Option<u32>,
+        desired_memory_bytes: Option<u64>,
+    ) -> Result<()> {
+        let mut resize_body = serde_json::Map::new();
+        if let Some(vcpus) = desired_vcpus {
+            resize_body.insert(
+                "desired_vcpus".to_string(),
+                serde_json::Value::Number(vcpus.into()),
+            );
+        }
+        if let Some(mem) = desired_memory_bytes {
+            resize_body.insert(
+                "desired_ram".to_string(),
+                serde_json::Value::Number(mem.into()),
+            );
+        }
+        if resize_body.is_empty() {
+            return Ok(());
+        }
+        let body = serde_json::to_string(&serde_json::Value::Object(resize_body))?;
+        info!("resizing VM {}: {}", self.vm_id, body);
+        self.api_request("PUT", "/api/v1/vm.resize", Some(&body))
+            .await
+            .context("failed to resize VM")?;
+        info!("VM {} resized successfully", self.vm_id);
+        Ok(())
     }
 }
 

@@ -298,14 +298,25 @@ impl AgentService for AgentServiceHandler {
         } else {
             &req.device
         };
+
+        let mac = if req.mac.is_empty() {
+            None
+        } else {
+            Some(req.mac.as_str())
+        };
+
         info!(
-            "RPC: configure_network dev={} ip={}/{} gw={}",
-            device, req.ip_address, req.prefix_len, req.gateway
+            "RPC: configure_network dev={} mac={:?} ip={}/{} gw={}",
+            device, mac, req.ip_address, req.prefix_len, req.gateway
         );
 
-        wait_for_device(device)
-            .await
-            .map_err(|e| ttrpc::Error::Others(format!("device wait: {e}")))?;
+        // Only wait for sysfs device if not using MAC-based lookup.
+        // MAC-based lookup retries internally via retry_find_by_mac.
+        if mac.is_none() {
+            wait_for_device(device)
+                .await
+                .map_err(|e| ttrpc::Error::Others(format!("device wait: {e}")))?;
+        }
 
         let ip: std::net::Ipv4Addr = req
             .ip_address
@@ -330,10 +341,10 @@ impl AgentService for AgentServiceHandler {
             ));
         }
 
-        cloudhv_common::netlink::configure_interface(device, ip, prefix_len, gw)
+        cloudhv_common::netlink::configure_interface(device, ip, prefix_len, gw, mac)
             .map_err(|e| ttrpc::Error::Others(format!("configure_interface: {e:#}")))?;
 
-        info!("configure_network: {} configured via netlink", device);
+        info!("configure_network: {} configured via netlink (mac={:?})", device, mac);
         Ok(ConfigureNetworkResponse::new())
     }
 

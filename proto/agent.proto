@@ -250,7 +250,8 @@ message ConfigureNetworkRequest {
     string ip_address = 1;    // e.g. "10.224.0.51"
     string gateway = 2;       // e.g. "169.254.1.1"
     uint32 prefix_len = 3;    // e.g. 16
-    string device = 4;        // e.g. "eth0"
+    string device = 4;        // e.g. "eth0" (fallback if mac is empty)
+    string mac = 5;           // e.g. "66:de:08:19:b5:58" — if set, find device by MAC
 }
 
 message ConfigureNetworkResponse {}
