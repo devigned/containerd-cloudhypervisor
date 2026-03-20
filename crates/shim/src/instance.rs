@@ -942,6 +942,34 @@ impl CloudHvInstance {
                         info.container_id, container_id, pid
                     );
 
+                    // Set up exit watcher for warm-restored container.
+                    // Without this, wait() blocks forever and delete() is never called,
+                    // causing pods to stay Terminating indefinitely.
+                    let exit = self.exit.clone();
+                    let cid = container_id.to_string();
+                    let agent_clone = agent.clone();
+                    tokio::spawn(async move {
+                        let t0 = std::time::Instant::now();
+                        let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
+                        wait_req.container_id = cid.clone();
+                        let ctx =
+                            ttrpc::context::with_duration(std::time::Duration::from_secs(86400));
+                        let exit_code = match agent_clone.wait_container(ctx, &wait_req).await {
+                            Ok(resp) => resp.exit_status,
+                            Err(e) => {
+                                log::info!("wait_container RPC error for {}: {e}", cid);
+                                137
+                            }
+                        };
+                        let _ = exit.set((exit_code, Utc::now()));
+                        log::info!(
+                            "warm-restored container {} exited: code={} rpc={}ms",
+                            cid,
+                            exit_code,
+                            t0.elapsed().as_millis()
+                        );
+                    });
+
                     vm_state.container_count.fetch_add(1, Ordering::SeqCst);
                     info!(
                         "TIMING start_container {}: erofs={}ms rpc=0ms total={}ms first_boot=true (warm restore)",
