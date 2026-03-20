@@ -61,7 +61,8 @@ if [ -n "$REMOTE" ]; then
 
   echo "==> Step 1: Syncing code to ${REMOTE}..."
   cd "$REPO_DIR"
-  make sync REMOTE_HOST="${REMOTE}" 2>&1 | tail -3
+  # rsync exit code 23 (partial transfer from vanishing target/ files) is normal
+  make sync REMOTE_HOST="${REMOTE}" 2>&1 | tail -3 || true
   echo ""
 
   echo "==> Step 2: Building static shim (force rebuild)..."
