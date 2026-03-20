@@ -445,8 +445,10 @@ pub fn configure_interface(
     let nl = Netlink::open()?;
 
     let (resolved_name, idx) = if let Some(mac_addr) = mac {
-        // MAC-based lookup: retry until the hot-plugged device appears
-        retry_find_by_mac(&nl, mac_addr, 20, 100)?
+        // MAC-based lookup: retry until the hot-plugged device appears.
+        // Hot-plugged virtio-net devices in a restored VM can take several
+        // seconds to enumerate through the PCI bus, so we allow up to 10s.
+        retry_find_by_mac(&nl, mac_addr, 50, 200)?
     } else {
         // Name-based lookup (cold boot path)
         let idx = retry_get_link_index(&nl, device, 20, 100)?;
