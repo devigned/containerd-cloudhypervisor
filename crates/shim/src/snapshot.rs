@@ -138,6 +138,36 @@ pub fn prepare_snapshot_for_vm(
         }
     }
 
+    // Patch serial console file path — CH opens this file on restore and
+    // fails with ENOENT if it points to the old VM's state directory.
+    let console_path = vm_state_dir.join("console.log");
+    // Create the file so CH can open it
+    let _ = std::fs::File::create(&console_path);
+    if let Some(serial) = config.pointer_mut("/serial") {
+        if let Some(obj) = serial.as_object_mut() {
+            if obj.get("mode").and_then(|v| v.as_str()) == Some("File") {
+                obj.insert(
+                    "file".to_string(),
+                    serde_json::json!(console_path.to_string_lossy()),
+                );
+            }
+        }
+    }
+
+    // Remove container-specific disks from snapshot config.
+    // Keep only disk 0 (guest rootfs at /opt/cloudhv/rootfs.erofs or rootfs.ext4).
+    // Container rootfs disks are hot-plugged after restore.
+    if let Some(disks) = config.pointer_mut("/disks") {
+        if let Some(arr) = disks.as_array_mut() {
+            arr.retain(|d| {
+                d.get("path")
+                    .and_then(|p| p.as_str())
+                    .map(|p| p.starts_with("/opt/cloudhv/"))
+                    .unwrap_or(false)
+            });
+        }
+    }
+
     std::fs::write(
         work_dir.join("config.json"),
         serde_json::to_string_pretty(&config)?,
