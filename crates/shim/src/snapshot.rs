@@ -33,7 +33,9 @@
 //!   {key}.lock          flock for serializing snapshot creation
 //! ```
 //!
-//! Cache key = hash of (kernel, rootfs, vcpus, memory, container_image).
+//! Cache key = hash of (kernel, rootfs, vcpus, memory) for the base VM
+//! identity. Instance code combines this with the container image identity
+//! (erofs_id) to produce a per-workload snapshot key.
 //! Same workload image → same snapshot → instant restore.
 
 use std::path::{Path, PathBuf};
@@ -43,14 +45,58 @@ use anyhow::{Context, Result};
 use crate::instance::stable_hash_hex;
 use cloudhv_common::types::RuntimeConfig;
 
+// ---------------------------------------------------------------------------
+// Snapshot container metadata
+// ---------------------------------------------------------------------------
+
+/// Per-container identity persisted alongside a warm workload snapshot.
+/// On restore the shim matches by `image_key` to find the old container ID,
+/// then calls `AdoptContainer` on the agent to re-register it under the new ID.
+#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotContainerInfo {
+    pub image_key: String,
+    pub container_id: String,
+    pub pid: u32,
+}
+
+/// Metadata stored in `containers.json` inside the snapshot cache directory.
+#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotMetadata {
+    pub containers: Vec<SnapshotContainerInfo>,
+}
+
+/// Persist container metadata alongside a cached snapshot.
+#[allow(dead_code)]
+pub fn save_snapshot_metadata(key: &str, metadata: &SnapshotMetadata) -> Result<()> {
+    let path = snapshot_cache_dir(key).join("containers.json");
+    let json = serde_json::to_string_pretty(metadata)?;
+    std::fs::write(&path, json)?;
+    Ok(())
+}
+
+/// Load container metadata from a cached snapshot (if present).
+#[allow(dead_code)]
+pub fn load_snapshot_metadata(key: &str) -> Result<Option<SnapshotMetadata>> {
+    let path = snapshot_cache_dir(key).join("containers.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let json = std::fs::read_to_string(&path)?;
+    Ok(Some(serde_json::from_str(&json)?))
+}
+
 /// Base directory for cached snapshots (tmpfs, fast, lost on reboot).
 const SNAPSHOT_CACHE_DIR: &str = "/run/cloudhv/snapshot-cache";
 
-/// Compute a content-addressable cache key for a VM snapshot.
+/// Compute a content-addressable **base** cache key for a VM snapshot.
 ///
 /// The key is based on the immutable inputs that define the VM's boot state:
-/// kernel binary, guest rootfs, vCPU count, and memory size.
-/// Two VMs with the same key will produce identical boot states.
+/// kernel binary, guest rootfs, vCPU count, and memory size. This base key
+/// does NOT include container image identity — callers that need per-image
+/// snapshots should combine this with an image-specific identifier (see
+/// `instance.rs` which appends `erofs_id`).
 pub fn snapshot_cache_key(config: &RuntimeConfig) -> String {
     let input = format!(
         "{}:{}:{}:{}",
@@ -75,32 +121,41 @@ pub fn snapshot_cache_hit(key: &str) -> bool {
 /// Acquire an exclusive lock for snapshot creation.
 /// Returns the lock file (held until dropped).
 /// If the lock is already held, blocks until available.
-pub fn snapshot_cache_lock(key: &str) -> Result<std::fs::File> {
-    let cache_dir = PathBuf::from(SNAPSHOT_CACHE_DIR);
-    std::fs::create_dir_all(&cache_dir).context("create snapshot cache dir")?;
+///
+/// Uses `spawn_blocking` to avoid blocking a tokio worker thread during
+/// filesystem operations and `flock(LOCK_EX)`.
+pub async fn snapshot_cache_lock(key: &str) -> Result<std::fs::File> {
+    let key = key.to_owned();
 
-    let lock_path = cache_dir.join(format!("{key}.lock"));
-    let lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .context("open snapshot lock")?;
+    tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
+        let cache_dir = PathBuf::from(SNAPSHOT_CACHE_DIR);
+        std::fs::create_dir_all(&cache_dir).context("create snapshot cache dir")?;
 
-    use std::os::unix::io::AsRawFd;
-    loop {
-        let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
-        if rc == 0 {
-            break;
+        let lock_path = cache_dir.join(format!("{key}.lock"));
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .context("open snapshot lock")?;
+
+        use std::os::unix::io::AsRawFd;
+        loop {
+            let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
+            if rc == 0 {
+                break;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err).context("flock snapshot lock");
         }
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        return Err(err).context("flock snapshot lock");
-    }
 
-    Ok(lock_file)
+        Ok(lock_file)
+    })
+    .await
+    .context("spawn_blocking snapshot_cache_lock")?
 }
 
 /// Store a snapshot in the cache. The source directory is renamed into
@@ -114,11 +169,19 @@ pub fn snapshot_cache_store(key: &str, source_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // Rename atomically (same filesystem — both on /run tmpfs)
+    // Rename atomically (same filesystem — both on /run tmpfs). If this fails
+    // with EXDEV (cross-device), fall back to a copy-and-remove of the source.
     std::fs::rename(source_dir, &dest)
-        .or_else(|_| {
-            // If rename fails (cross-device), fall back to copy
-            copy_dir_all(source_dir, &dest)
+        .or_else(|err| {
+            // Only fall back on cross-device errors; propagate all others.
+            if let Some(code) = err.raw_os_error() {
+                if code == libc::EXDEV {
+                    copy_dir_all(source_dir, &dest)?;
+                    std::fs::remove_dir_all(source_dir)?;
+                    return Ok(());
+                }
+            }
+            Err(err)
         })
         .with_context(|| format!("store snapshot {key}"))?;
 
@@ -168,7 +231,8 @@ pub fn prepare_snapshot_for_vm(
     // fails with ENOENT if it points to the old VM's state directory.
     let console_path = vm_state_dir.join("console.log");
     // Create the file so CH can open it
-    let _ = std::fs::File::create(&console_path);
+    std::fs::File::create(&console_path)
+        .with_context(|| format!("create serial console log at {}", console_path.display()))?;
     if let Some(serial) = config.pointer_mut("/serial") {
         if let Some(obj) = serial.as_object_mut() {
             if obj.get("mode").and_then(|v| v.as_str()) == Some("File") {

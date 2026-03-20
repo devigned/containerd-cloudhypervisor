@@ -41,6 +41,13 @@ service AgentService {
     // Used after snapshot-restore when a TAP device is hot-plugged and the
     // guest kernel needs its interface configured with the pod's IP address.
     rpc ConfigureNetwork(ConfigureNetworkRequest) returns (ConfigureNetworkResponse);
+
+    // AdoptContainer re-registers a running container under a new ID.
+    // Used after warm snapshot restore: the container process is already
+    // running under the old (snapshotted) ID, but the new pod assigns a
+    // different container ID. The agent moves the internal bookkeeping so
+    // that kill/wait/state RPCs work with the new ID.
+    rpc AdoptContainer(AdoptContainerRequest) returns (AdoptContainerResponse);
 }
 
 // HealthService provides health checking for the guest agent.
@@ -247,3 +254,14 @@ message ConfigureNetworkRequest {
 }
 
 message ConfigureNetworkResponse {}
+
+// --- AdoptContainer ---
+
+message AdoptContainerRequest {
+    string old_container_id = 1;  // container ID from the snapshot
+    string new_container_id = 2;  // container ID assigned by the new pod
+}
+
+message AdoptContainerResponse {
+    uint32 pid = 1;  // PID of the adopted container process
+}

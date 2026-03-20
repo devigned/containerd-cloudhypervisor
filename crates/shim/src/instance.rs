@@ -81,6 +81,9 @@ struct SharedVmState {
     gateway: Option<String>,
     netns: Option<String>,
     cgroups_path: Option<String>,
+    /// Containers running in this VM, for snapshot metadata.
+    /// Each entry: (container_id, image_key, pid)
+    container_info: tokio::sync::Mutex<Vec<(String, String, u32)>>,
 }
 
 /// Lazily connect to the guest agent over vsock, caching the client in the
@@ -472,6 +475,7 @@ impl CloudHvInstance {
             gateway: gateway_val,
             netns: sandbox_spec.netns.clone(),
             cgroups_path: sandbox_spec.cgroups_path.clone(),
+            container_info: tokio::sync::Mutex::new(Vec::new()),
         });
 
         VMS.write()
@@ -728,7 +732,8 @@ impl CloudHvInstance {
                 // so different workload images get separate snapshots.
                 let snap_key = {
                     let base = crate::snapshot::snapshot_cache_key(vm_state.vm.config());
-                    let erofs_id = erofs_cache_key(&rootfs_path).unwrap_or_default();
+                    let erofs_id = erofs_cache_key(&rootfs_path)
+                        .unwrap_or_else(|| stable_hash_hex(&rootfs_path.to_string_lossy()));
                     stable_hash_hex(&format!("{base}:{erofs_id}"))
                 };
 
@@ -830,9 +835,13 @@ impl CloudHvInstance {
                 if !restored && !crate::snapshot::snapshot_cache_hit(&snap_key) {
                     let vm_api = vm_state.api_socket.clone();
                     let key = snap_key.clone();
+                    let vm_state_ref = vm_state.clone();
                     tokio::spawn(async move {
                         tokio::time::sleep(std::time::Duration::from_secs(20)).await;
-                        if let Err(e) = create_snapshot_for_cache(&vm_api, &key).await {
+                        if let Err(e) =
+                            create_snapshot_for_cache(&vm_api, &key, &vm_state_ref.container_info)
+                                .await
+                        {
                             log::info!("snapshot cache creation failed (non-fatal): {e:#}");
                         }
                     });
@@ -898,19 +907,56 @@ impl CloudHvInstance {
 
         if is_first_container && restored_from_snapshot {
             // Warm restore: container is already alive in the snapshot.
-            // We still need to track it and set up log forwarding.
-            info!("warm restore: skipping RunContainer (workload already running in snapshot)");
-            vm_state.container_count.fetch_add(1, Ordering::SeqCst);
+            // Use AdoptContainer to re-register it under the new container ID.
+            info!("warm restore: adopting container from snapshot metadata");
+
+            let image_key = erofs_cache_key(&rootfs_path)
+                .unwrap_or_else(|| stable_hash_hex(&rootfs_path.to_string_lossy()));
+
+            // Recompute snap_key (same formula as in BootRole::First)
+            let snap_key = {
+                let base = crate::snapshot::snapshot_cache_key(vm_state.vm.config());
+                stable_hash_hex(&format!("{base}:{image_key}"))
+            };
+
+            let metadata =
+                crate::snapshot::load_snapshot_metadata(&snap_key).ctx("load snapshot metadata")?;
+
+            if let Some(ref meta) = metadata {
+                if let Some(info) = meta.containers.iter().find(|c| c.image_key == image_key) {
+                    let agent = get_or_connect_agent(&vm_state).await?;
+                    let mut req = cloudhv_proto::AdoptContainerRequest::new();
+                    req.old_container_id = info.container_id.clone();
+                    req.new_container_id = container_id.to_string();
+                    let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(10));
+                    let resp = agent
+                        .adopt_container(ctx, &req)
+                        .await
+                        .ctx("adopt container after restore")?;
+
+                    let pid = resp.pid;
+                    info!(
+                        "warm restore: adopted container {} -> {} pid={}",
+                        info.container_id, container_id, pid
+                    );
+
+                    vm_state.container_count.fetch_add(1, Ordering::SeqCst);
+                    info!(
+                        "TIMING start_container {}: erofs={}ms rpc=0ms total={}ms first_boot=true (warm restore)",
+                        container_id, erofs_ms, t_total.elapsed().as_millis()
+                    );
+                    return Ok(pid);
+                }
+            }
+            // Fallback if metadata missing — fall through to RunContainer
             info!(
-                "TIMING start_container {}: erofs={}ms rpc=0ms total={}ms first_boot=true (warm restore)",
-                container_id, erofs_ms, t_total.elapsed().as_millis()
+                "warm restore: no metadata for image_key {}, falling back to RunContainer",
+                image_key
             );
-            // Return PID 1 — the actual container process is running inside the VM
-            // from the snapshot. We don't know its exact PID but shimkit only uses
-            // this for the TaskStart event.
-            Ok(1)
-        } else {
-            // Cold boot or subsequent container: normal RPC flow.
+        }
+
+        // ─── Normal container start (cold boot or metadata-fallback) ─────
+        {
             let agent = get_or_connect_agent(&vm_state).await?;
             let api_socket = vm_state.api_socket.clone();
 
@@ -1014,6 +1060,15 @@ impl CloudHvInstance {
 
             vm_state.container_count.fetch_add(1, Ordering::SeqCst);
 
+            // Record container info for snapshot metadata.
+            let image_key = erofs_cache_key(&rootfs_path)
+                .unwrap_or_else(|| stable_hash_hex(&rootfs_path.to_string_lossy()));
+            vm_state.container_info.lock().await.push((
+                container_id.to_string(),
+                image_key,
+                start_resp.pid,
+            ));
+
             // Stream container logs from agent via GetContainerLogs RPC.
             // Open FIFOs synchronously so containerd sees an active writer.
             let log_agent = agent.clone();
@@ -1112,7 +1167,7 @@ impl CloudHvInstance {
                 is_first_container
             );
             Ok(pid)
-        } // end else (cold boot / normal container path)
+        }
     }
 }
 
@@ -1556,6 +1611,7 @@ fn detect_block_fs_type(device: &str) -> Option<String> {
 /// Uses `mkfs.erofs` to create a read-only erofs image from the rootfs
 /// directory. The shim passes this to the VM as a read-only virtio-blk device.
 #[cfg(test)]
+#[allow(dead_code)]
 fn create_rootfs_erofs_image(
     rootfs_path: &std::path::Path,
     disk_path: &std::path::Path,
@@ -1688,10 +1744,11 @@ async fn try_restore(
 async fn create_snapshot_for_cache(
     api_socket: &std::path::Path,
     cache_key: &str,
+    container_info: &tokio::sync::Mutex<Vec<(String, String, u32)>>,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
 
-    let _lock = crate::snapshot::snapshot_cache_lock(cache_key)?;
+    let _lock = crate::snapshot::snapshot_cache_lock(cache_key).await?;
 
     // Check again under lock — another shim may have created it
     if crate::snapshot::snapshot_cache_hit(cache_key) {
@@ -1721,23 +1778,58 @@ async fn create_snapshot_for_cache(
     // Always resume, even if snapshot failed
     let _ = VmManager::api_request_to_socket(api_socket, "PUT", "/api/v1/vm.resume", None).await;
 
+    if let Err(_) = snap_result {
+        // Best-effort cleanup of temporary snapshot directory on snapshot failure.
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
     snap_result.context("vm.snapshot")?;
 
-    crate::snapshot::snapshot_cache_store(cache_key, &tmp_dir)?;
+    // Strip networking in the tmp_dir BEFORE caching, so the cache never
+    // contains a partially-prepared snapshot with stale networking config.
+    if let Err(e) = strip_networking_from_dir(&tmp_dir) {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(e.into());
+    }
 
-    // Strip networking so the cached snapshot is network-agnostic and can be
-    // restored for any pod regardless of IP / TAP device.
-    strip_networking_from_snapshot(cache_key)?;
+    if let Err(e) = crate::snapshot::snapshot_cache_store(cache_key, &tmp_dir) {
+        // Best-effort cleanup of temporary snapshot directory on cache store failure.
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(e.into());
+    }
+
+    // Save container metadata alongside the snapshot so warm restores can
+    // call AdoptContainer to re-register the running container under a new ID.
+    {
+        let infos = container_info.lock().await;
+        let metadata = crate::snapshot::SnapshotMetadata {
+            containers: infos
+                .iter()
+                .map(|(cid, key, pid)| crate::snapshot::SnapshotContainerInfo {
+                    image_key: key.clone(),
+                    container_id: cid.clone(),
+                    pid: *pid,
+                })
+                .collect(),
+        };
+        if let Err(e) = crate::snapshot::save_snapshot_metadata(cache_key, &metadata) {
+            log::info!("save snapshot metadata failed (non-fatal): {e:#}");
+        } else {
+            info!(
+                "snapshot metadata saved: {} container(s)",
+                metadata.containers.len()
+            );
+        }
+    }
 
     info!("golden snapshot created and cached: {cache_key}");
     Ok(())
 }
 
-/// Remove network devices and `ip=…` kernel cmdline params from a cached
-/// snapshot's `config.json` so it can be restored into any pod.
-fn strip_networking_from_snapshot(cache_key: &str) -> anyhow::Result<()> {
-    let cache_dir = crate::snapshot::snapshot_cache_dir(cache_key);
-    let config_path = cache_dir.join("config.json");
+/// Remove network devices and `ip=…` kernel cmdline params from a snapshot
+/// directory's `config.json` so it can be restored into any pod.
+fn strip_networking_from_dir(dir: &std::path::Path) -> anyhow::Result<()> {
+    let config_path = dir.join("config.json");
     let config_str = std::fs::read_to_string(&config_path)?;
     let mut config: serde_json::Value = serde_json::from_str(&config_str)?;
 
@@ -1759,7 +1851,7 @@ fn strip_networking_from_snapshot(cache_key: &str) -> anyhow::Result<()> {
     }
 
     std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
-    log::info!("stripped networking from cached snapshot {cache_key}");
+    log::info!("stripped networking from snapshot dir {}", dir.display());
     Ok(())
 }
 

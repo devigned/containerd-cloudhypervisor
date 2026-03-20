@@ -303,23 +303,56 @@ impl AgentService for AgentServiceHandler {
             device, req.ip_address, req.prefix_len, req.gateway
         );
 
-        wait_for_device(device).await.map_err(|e| {
-            ttrpc::Error::Others(format!("device wait: {e}"))
-        })?;
+        wait_for_device(device)
+            .await
+            .map_err(|e| ttrpc::Error::Others(format!("device wait: {e}")))?;
 
-        let ip: std::net::Ipv4Addr = req.ip_address.parse()
+        let ip: std::net::Ipv4Addr = req
+            .ip_address
+            .parse()
             .map_err(|e| ttrpc::Error::Others(format!("invalid IP: {e}")))?;
         let gw: Option<std::net::Ipv4Addr> = if req.gateway.is_empty() {
             None
         } else {
-            Some(req.gateway.parse().map_err(|e| ttrpc::Error::Others(format!("invalid gateway: {e}")))?)
+            Some(
+                req.gateway
+                    .parse()
+                    .map_err(|e| ttrpc::Error::Others(format!("invalid gateway: {e}")))?,
+            )
         };
 
-        cloudhv_common::netlink::configure_interface(device, ip, req.prefix_len as u8, gw)
+        let prefix_len: u8 = u8::try_from(req.prefix_len).map_err(|_| {
+            ttrpc::Error::Others("invalid prefix_len: must be between 0 and 32".to_string())
+        })?;
+        if prefix_len > 32 {
+            return Err(ttrpc::Error::Others(
+                "invalid prefix_len: must be between 0 and 32".to_string(),
+            ));
+        }
+
+        cloudhv_common::netlink::configure_interface(device, ip, prefix_len, gw)
             .map_err(|e| ttrpc::Error::Others(format!("configure_interface: {e:#}")))?;
 
         info!("configure_network: {} configured via netlink", device);
         Ok(ConfigureNetworkResponse::new())
+    }
+
+    async fn adopt_container(
+        &self,
+        _ctx: &TtrpcContext,
+        req: AdoptContainerRequest,
+    ) -> ttrpc::Result<AdoptContainerResponse> {
+        info!(
+            "RPC: adopt_container old={} new={}",
+            req.old_container_id, req.new_container_id
+        );
+        let mut mgr = self.container_manager.lock().await;
+        let pid = mgr
+            .adopt(&req.old_container_id, &req.new_container_id)
+            .map_err(|e| ttrpc::Error::Others(format!("adopt_container failed: {e:#}")))?;
+        let mut resp = AdoptContainerResponse::new();
+        resp.pid = pid;
+        Ok(resp)
     }
 }
 
@@ -337,7 +370,11 @@ async fn wait_for_device(device: &str) -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    anyhow::bail!("timed out waiting for device {} to appear at {}", device, path)
+    anyhow::bail!(
+        "timed out waiting for device {} to appear at {}",
+        device,
+        path
+    )
 }
 
 struct HealthServiceHandler;
