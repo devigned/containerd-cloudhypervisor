@@ -13,21 +13,22 @@
 //!
 //! ## How Networking Survives Restore
 //!
-//! The snapshot is stripped of pod-specific networking (TAP device, IP
-//! address). On restore:
+//! The cached snapshot RETAINS the virtio-net device config (TAP name + MAC).
+//! On restore, `prepare_snapshot_for_vm` patches the TAP name and MAC to
+//! the new pod's values. This means the restored guest wakes up with eth0
+//! already wired to the correct TAP — no PCI hot-plug, no device discovery.
 //!
-//! 1. A new TAP device is hot-plugged via `vm.add-net`
-//! 2. The guest IP is configured via the agent's `ConfigureNetwork` RPC
-//! 3. The workload (e.g. uvicorn) binds `0.0.0.0:<port>`, which accepts
-//!    on ALL interfaces — including the newly-configured eth0
-//! 4. No socket rebind needed: `0.0.0.0` is interface-agnostic
+//! The guest IP is then configured via the agent's `ConfigureNetwork` RPC:
+//! 1. Flush old IP, add new IP, update default route
+//! 2. The workload (e.g. uvicorn) binds `0.0.0.0:<port>`, which accepts
+//!    on ALL interfaces — traffic flows immediately
 //!
 //! ## Cache Structure
 //!
 //! ```text
 //! /run/cloudhv/snapshot-cache/
 //!   {key}/
-//!     config.json       CH VM config (networking stripped)
+//!     config.json       CH VM config (TAP patched per-pod on restore)
 //!     memory-ranges     Guest RAM (CoW-mapped via userfaultfd on restore)
 //!     state.json        vCPU + device state
 //!   {key}.lock          flock for serializing snapshot creation
@@ -196,6 +197,8 @@ pub fn prepare_snapshot_for_vm(
     vm_state_dir: &Path, // e.g. /run/cloudhv/<vm_id>/
     new_cid: u64,
     new_vsock_socket: &Path,
+    new_tap: Option<&str>,
+    new_mac: Option<&str>,
 ) -> Result<PathBuf> {
     let cache_dir = snapshot_cache_dir(cache_key);
     let work_dir = vm_state_dir.join("snapshot");
@@ -255,6 +258,26 @@ pub fn prepare_snapshot_for_vm(
                     .map(|p| p.starts_with("/opt/cloudhv/"))
                     .unwrap_or(false)
             });
+        }
+    }
+
+    // Patch the network device TAP name and MAC for the new pod.
+    // The cached snapshot retains the original net config (including the
+    // virtio-net device visible to the guest as eth0). By patching the TAP
+    // name and MAC in the config, CH wires the restored virtio-net device
+    // to the NEW pod's TAP. The guest sees the same eth0, just backed by
+    // a different TAP — no hot-plug, no PCI enumeration, no race.
+    if let (Some(tap), Some(mac)) = (new_tap, new_mac) {
+        if let Some(nets) = config.pointer_mut("/net") {
+            if let Some(arr) = nets.as_array_mut() {
+                if let Some(first) = arr.first_mut() {
+                    if let Some(obj) = first.as_object_mut() {
+                        obj.insert("tap".to_string(), serde_json::json!(tap));
+                        obj.insert("mac".to_string(), serde_json::json!(mac));
+                        log::info!("patched snapshot net: tap={tap} mac={mac}");
+                    }
+                }
+            }
         }
     }
 

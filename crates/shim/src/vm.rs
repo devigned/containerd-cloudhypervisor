@@ -438,7 +438,7 @@ impl VmManager {
     }
 
     /// Hot-plug a TAP network device into the VM.
-    /// Used after snapshot restore to add pod-specific networking.
+    #[allow(dead_code)]
     pub async fn add_net(&self, tap_name: &str, mac: Option<&str>) -> Result<()> {
         let mut net_config = serde_json::json!({
             "tap": tap_name,

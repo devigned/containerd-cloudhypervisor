@@ -797,13 +797,9 @@ impl CloudHvInstance {
                 }
 
                 // After snapshot restore, configure guest networking via agent RPC.
-                // The snapshot was stripped of networking; we re-apply the pod's IP.
-                //
-                // IMPORTANT: We send the TAP MAC address so the agent can find the
-                // correct hot-plugged device. The snapshot leaves a stale virtio-net
-                // device in guest kernel memory (old eth0). The new hot-plugged TAP
-                // gets a different name (e.g. eth1). MAC-based lookup ensures we
-                // configure the RIGHT device — the one backed by the actual TAP.
+                // The snapshot config's TAP was patched to use the new pod's TAP,
+                // so the guest's eth0 is already backed by the correct TAP device.
+                // We just need to flush the stale IP and configure the new one.
                 if restored {
                     if let (Some(ref ip_cidr), Some(ref gw)) =
                         (&vm_state.ip_cidr, &vm_state.gateway)
@@ -817,20 +813,12 @@ impl CloudHvInstance {
                         req.gateway = gw.clone();
                         req.prefix_len = prefix;
                         req.device = "eth0".to_string();
-                        // Send TAP MAC so the agent finds the hot-plugged device by MAC
-                        // rather than by name (which may not be eth0 after restore).
-                        if let Some(ref mac) = vm_state.tap_mac {
-                            req.mac = mac.clone();
-                        }
                         let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
                         agent
                             .configure_network(ctx, &req)
                             .await
                             .ctx("configure guest network after restore")?;
-                        info!(
-                            "guest network configured: ip={ip}/{prefix} gw={gw} mac={:?}",
-                            vm_state.tap_mac
-                        );
+                        info!("guest network configured: ip={ip}/{prefix} gw={gw}");
                     }
                 }
 
@@ -1698,19 +1686,26 @@ fn read_volume_files(src: &std::path::Path) -> anyhow::Result<Vec<(String, Vec<u
 }
 
 /// Attempt to restore a VM from a cached snapshot.
-/// Patches the snapshot config with this VM's CID/vsock, restores, resumes,
-/// hot-plugs the TAP device, and hot-plugs container rootfs disks.
+/// Patches the snapshot config with this VM's CID/vsock and TAP device,
+/// restores, resumes, and hot-plugs container rootfs disks.
+///
+/// Networking is handled by patching the TAP name and MAC in the snapshot
+/// config BEFORE restore. This means the restored VM wakes up with its
+/// virtio-net device (eth0) already wired to the new pod's TAP — no PCI
+/// hot-plug needed, no device discovery race.
 async fn try_restore(
     vm_state: &SharedVmState,
     snap_key: &str,
     rootfs_disks: &[(std::path::PathBuf, String, bool)],
 ) -> Result<(), Error> {
-    // Patch snapshot config with this VM's CID and vsock socket
+    // Patch snapshot config with this VM's CID, vsock socket, and TAP device
     let patched_dir = crate::snapshot::prepare_snapshot_for_vm(
         snap_key,
         vm_state.vm.state_dir(),
         vm_state.vm.cid(),
         &vm_state.vsock_socket,
+        vm_state.tap_name.as_deref(),
+        vm_state.tap_mac.as_deref(),
     )
     .ctx("prepare snapshot")?;
 
@@ -1723,15 +1718,6 @@ async fn try_restore(
 
     // Resume the VM
     vm_state.vm.resume().await.ctx("resume after restore")?;
-
-    // Hot-plug TAP device if we have networking
-    if let (Some(ref tap), Some(ref mac)) = (&vm_state.tap_name, &vm_state.tap_mac) {
-        vm_state
-            .vm
-            .add_net(tap, Some(mac.as_str()))
-            .await
-            .ctx("hot-plug TAP after restore")?;
-    }
 
     // Hot-plug container rootfs disks
     for (path, id, readonly) in rootfs_disks {
@@ -1799,9 +1785,10 @@ async fn create_snapshot_for_cache(
 
     snap_result.context("vm.snapshot")?;
 
-    // Strip networking in the tmp_dir BEFORE caching, so the cache never
-    // contains a partially-prepared snapshot with stale networking config.
-    if let Err(e) = strip_networking_from_dir(&tmp_dir) {
+    // Strip `ip=…` from kernel cmdline so the cached snapshot doesn't bake
+    // in a pod-specific IP. The TAP/net device config is KEPT — it will be
+    // patched to the new pod's TAP name and MAC during prepare_snapshot_for_vm.
+    if let Err(e) = strip_kernel_ip_from_dir(&tmp_dir) {
         let _ = std::fs::remove_dir_all(&tmp_dir);
         return Err(e.into());
     }
@@ -1840,17 +1827,14 @@ async fn create_snapshot_for_cache(
     Ok(())
 }
 
-/// Remove network devices and `ip=…` kernel cmdline params from a snapshot
-/// directory's `config.json` so it can be restored into any pod.
-fn strip_networking_from_dir(dir: &std::path::Path) -> anyhow::Result<()> {
+/// Remove `ip=…` kernel cmdline params from a snapshot directory's
+/// `config.json`. The TAP/net device config is intentionally KEPT so
+/// the restored VM wakes up with the same virtio-net device — we just
+/// patch the TAP name and MAC during prepare_snapshot_for_vm.
+fn strip_kernel_ip_from_dir(dir: &std::path::Path) -> anyhow::Result<()> {
     let config_path = dir.join("config.json");
     let config_str = std::fs::read_to_string(&config_path)?;
     let mut config: serde_json::Value = serde_json::from_str(&config_str)?;
-
-    // Remove network devices
-    if let Some(obj) = config.as_object_mut() {
-        obj.insert("net".to_string(), serde_json::json!([]));
-    }
 
     // Strip ip=... from kernel cmdline
     if let Some(cmdline) = config.pointer_mut("/payload/cmdline") {
@@ -1865,7 +1849,7 @@ fn strip_networking_from_dir(dir: &std::path::Path) -> anyhow::Result<()> {
     }
 
     std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
-    log::info!("stripped networking from snapshot dir {}", dir.display());
+    log::info!("stripped kernel ip= from snapshot dir {}", dir.display());
     Ok(())
 }
 
