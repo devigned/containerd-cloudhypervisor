@@ -88,7 +88,7 @@ impl Netlink {
         if n >= 20 && u16_at(&r, 4) == 2 {
             let e = i32_at(&r, 16);
             if e != 0 {
-                return Err(std::io::Error::from_raw_os_error(-e)).context("nl error");
+                return Err(std::io::Error::from_raw_os_error(-e)).context("netlink request");
             }
         }
         Ok(())
@@ -411,6 +411,58 @@ impl Netlink {
         m[40..44].copy_from_slice(&ifindex.to_ne_bytes());
         self.request(&m)
     }
+}
+
+// ── Public convenience API ──────────────────────────────────────────────────
+
+/// Configure a network interface: resolve link index (with retry for
+/// hot-plugged devices), add an IPv4 address, bring the link up, and
+/// optionally add a default route.
+pub fn configure_interface(
+    device: &str,
+    ip: Ipv4Addr,
+    prefix_len: u8,
+    gateway: Option<Ipv4Addr>,
+) -> Result<()> {
+    let nl = Netlink::open()?;
+
+    // Retry get_link_index — the hot-plugged device may not have appeared yet
+    let idx = retry_get_link_index(&nl, device, 20, 100)?;
+
+    nl.add_address(idx, ip, prefix_len)?;
+    nl.set_link_up(idx)?;
+    if let Some(gw) = gateway {
+        nl.add_default_route(gw, idx)?;
+    }
+    Ok(())
+}
+
+fn retry_get_link_index(
+    nl: &Netlink,
+    device: &str,
+    max_attempts: u32,
+    delay_ms: u64,
+) -> Result<u32> {
+    for attempt in 0..max_attempts {
+        match nl.get_link_index(device) {
+            Ok(idx) => {
+                if attempt > 0 {
+                    log::info!("device {device} appeared after {attempt} retries");
+                }
+                return Ok(idx);
+            }
+            Err(e) => {
+                if attempt < max_attempts - 1 {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                } else {
+                    return Err(e).context(format!(
+                        "device {device} not found after {max_attempts} retries"
+                    ));
+                }
+            }
+        }
+    }
+    unreachable!()
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

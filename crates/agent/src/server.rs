@@ -315,18 +315,8 @@ impl AgentService for AgentServiceHandler {
             Some(req.gateway.parse().map_err(|e| ttrpc::Error::Others(format!("invalid gateway: {e}")))?)
         };
 
-        let nl = cloudhv_common::netlink::Netlink::open()
-            .map_err(|e| ttrpc::Error::Others(format!("netlink: {e}")))?;
-        let idx = nl.get_link_index(device)
-            .map_err(|e| ttrpc::Error::Others(format!("get link index: {e}")))?;
-        nl.add_address(idx, ip, req.prefix_len as u8)
-            .map_err(|e| ttrpc::Error::Others(format!("add address: {e}")))?;
-        nl.set_link_up(idx)
-            .map_err(|e| ttrpc::Error::Others(format!("link up: {e}")))?;
-        if let Some(gw) = gw {
-            nl.add_default_route(gw, idx)
-                .map_err(|e| ttrpc::Error::Others(format!("add route: {e}")))?;
-        }
+        cloudhv_common::netlink::configure_interface(device, ip, req.prefix_len as u8, gw)
+            .map_err(|e| ttrpc::Error::Others(format!("configure_interface: {e:#}")))?;
 
         info!("configure_network: {} configured via netlink", device);
         Ok(ConfigureNetworkResponse::new())
