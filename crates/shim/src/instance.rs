@@ -13,6 +13,14 @@ use tokio::sync::OnceCell;
 use crate::config::load_config;
 use crate::vm::VmManager;
 
+/// Milliseconds since Unix epoch for absolute timestamps in TIMING logs.
+fn epoch_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
 /// Directory for cached erofs images shared across sandboxes.
 /// Same container image → same erofs image (keyed by content hash of
 /// the overlayfs lowerdir paths).
@@ -298,8 +306,9 @@ impl Instance for CloudHvInstance {
                 let vm_ms = t_vm.elapsed().as_millis();
 
                 info!(
-                    "TIMING delete {}: rpc={}ms tap_cleanup={}ms vm_cleanup={}ms total={}ms",
+                    "TIMING delete {} @{}: rpc={}ms tap_cleanup={}ms vm_cleanup={}ms total={}ms",
                     self.id,
+                    epoch_ms(),
                     rpc_ms,
                     tap_ms,
                     vm_ms,
@@ -307,8 +316,9 @@ impl Instance for CloudHvInstance {
                 );
             } else {
                 info!(
-                    "TIMING delete {}: rpc={}ms total={}ms (container only, {} remaining)",
+                    "TIMING delete {} @{}: rpc={}ms total={}ms (container only, {} remaining)",
                     self.id,
+                    epoch_ms(),
                     rpc_ms,
                     t_total.elapsed().as_millis(),
                     prev - 1
@@ -505,7 +515,8 @@ impl CloudHvInstance {
 
                 let total_ms = t0.elapsed().as_millis();
                 log::info!(
-                    "eager boot complete: vm_boot={}ms agent_connect={}ms total={}ms",
+                    "TIMING eager_boot @{}: vm_boot={}ms agent_connect={}ms total={}ms",
+                    crate::instance::epoch_ms(),
                     boot_ms,
                     total_ms - boot_ms,
                     total_ms
@@ -521,8 +532,8 @@ impl CloudHvInstance {
 
         info!("sandbox VM {} ready (ch_pid={})", sandbox_id, ch_pid);
         info!(
-            "TIMING start_sandbox {}: tap={}ms config={}ms swtpm={}ms vmm_spawn={}ms vmm_ready={}ms total={}ms",
-            sandbox_id, tap_ms, config_ms, swtpm_ms, spawn_ms, vmm_ready_ms, t_total.elapsed().as_millis()
+            "TIMING start_sandbox {} @{}: tap={}ms config={}ms swtpm={}ms vmm_spawn={}ms vmm_ready={}ms total={}ms",
+            sandbox_id, epoch_ms(), tap_ms, config_ms, swtpm_ms, spawn_ms, vmm_ready_ms, t_total.elapsed().as_millis()
         );
         Ok(ch_pid)
     }
@@ -531,7 +542,11 @@ impl CloudHvInstance {
     async fn start_container(&self) -> Result<u32, Error> {
         let container_id = &self.id;
         let t_total = std::time::Instant::now();
-        info!("starting app container: {}", container_id);
+        info!(
+            "TIMING start_container_enter {} @{}",
+            container_id,
+            epoch_ms()
+        );
 
         let vm_state = get_vm(&self.sandbox_id).ok_or_else(|| {
             Error::Any(anyhow::anyhow!("sandbox VM not found: {}", self.sandbox_id))
@@ -878,8 +893,12 @@ impl CloudHvInstance {
                 let agent_ms = t_agent.elapsed().as_millis();
 
                 info!(
-                    "TIMING first_boot {}: vm_boot={}ms agent_connect={}ms restored={}",
-                    container_id, boot_ms, agent_ms, restored
+                    "TIMING first_boot {} @{}: vm_boot={}ms agent_connect={}ms restored={}",
+                    container_id,
+                    epoch_ms(),
+                    boot_ms,
+                    agent_ms,
+                    restored
                 );
 
                 // After a successful cold boot, create a snapshot for future pods.
@@ -1022,8 +1041,8 @@ impl CloudHvInstance {
 
                     vm_state.container_count.fetch_add(1, Ordering::SeqCst);
                     info!(
-                        "TIMING start_container {}: erofs={}ms rpc=0ms total={}ms first_boot=true (warm restore)",
-                        container_id, erofs_ms, t_total.elapsed().as_millis()
+                        "TIMING start_container {} @{}: erofs={}ms rpc=0ms total={}ms first_boot=true (warm restore)",
+                        container_id, epoch_ms(), erofs_ms, t_total.elapsed().as_millis()
                     );
                     return Ok(pid);
                 }
@@ -1239,8 +1258,9 @@ impl CloudHvInstance {
             let rpc_ms = t_rpc.elapsed().as_millis();
             info!("started container {} pid={}", container_id, pid);
             info!(
-                "TIMING start_container {}: erofs={}ms rpc={}ms total={}ms first_boot={}",
+                "TIMING start_container {} @{}: erofs={}ms rpc={}ms total={}ms first_boot={}",
                 container_id,
+                epoch_ms(),
                 erofs_ms,
                 rpc_ms,
                 t_total.elapsed().as_millis(),
