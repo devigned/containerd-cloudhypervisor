@@ -1812,7 +1812,7 @@ async fn create_snapshot_for_cache(
         log::error!("vm.resume after snapshot failed: {e:#}");
     }
 
-    if let Err(_) = snap_result {
+    if snap_result.is_err() {
         // Best-effort cleanup of temporary snapshot directory on snapshot failure.
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
@@ -1824,13 +1824,13 @@ async fn create_snapshot_for_cache(
     // patched to the new pod's TAP name and MAC during prepare_snapshot_for_vm.
     if let Err(e) = strip_kernel_ip_from_dir(&tmp_dir) {
         let _ = std::fs::remove_dir_all(&tmp_dir);
-        return Err(e.into());
+        return Err(e);
     }
 
     if let Err(e) = crate::snapshot::snapshot_cache_store(cache_key, &tmp_dir) {
         // Best-effort cleanup of temporary snapshot directory on cache store failure.
         let _ = std::fs::remove_dir_all(&tmp_dir);
-        return Err(e.into());
+        return Err(e);
     }
 
     // Save container metadata alongside the snapshot so warm restores can
