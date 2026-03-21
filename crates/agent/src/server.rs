@@ -344,7 +344,10 @@ impl AgentService for AgentServiceHandler {
         cloudhv_common::netlink::configure_interface(device, ip, prefix_len, gw, mac)
             .map_err(|e| ttrpc::Error::Others(format!("configure_interface: {e:#}")))?;
 
-        info!("configure_network: {} configured via netlink (mac={:?})", device, mac);
+        info!(
+            "configure_network: {} configured via netlink (mac={:?})",
+            device, mac
+        );
         Ok(ConfigureNetworkResponse::new())
     }
 

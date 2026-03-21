@@ -55,30 +55,59 @@ sandbox creation and application containers:
 
 - **Sandbox** (`container-type=sandbox`): boots the Cloud Hypervisor VM. The VM **is** the
   sandbox — no pause container needed. Networking (TAP + TC redirect) is set up at this stage.
-- **App container** (`container-type=container`): clones a cached rootfs ext4 image,
+- **App container** (`container-type=container`): converts the rootfs to erofs (cached),
   hot-plugs it into the running VM, and sends config.json + volume data inline via the
   CreateContainer RPC. The guest agent writes metadata to tmpfs and runs the container with crun.
 
+## Warm Snapshot Restore
+
+The shim supports **warm workload snapshots** for near-instant pod startup.
+
+### How it works
+
+1. **Cold boot** (first pod per workload image per node): VM boots normally,
+   agent starts, workload initializes (e.g., Python server starts listening).
+   After 20s warmup, the VM is paused, snapshotted, and resumed. The snapshot
+   is cached at `/run/cloudhv/snapshot-cache/<key>/`.
+
+2. **Warm restore** (all subsequent pods): The snapshot config is patched with
+   the new pod's TAP name, MAC, vsock CID, and serial console path. The VM is
+   restored with CoW memory (userfaultfd), resumed, and the guest IP is
+   reconfigured via the agent's `ConfigureNetwork` RPC. The workload wakes up
+   **already running** — no kernel boot, no agent init, no workload startup.
+
+### Why 0.0.0.0 makes this work
+
+The workload binds `0.0.0.0:<port>`, which accepts on ALL interfaces. The
+snapshot's TAP is patched to the new pod's TAP in the config before restore.
+The guest sees the same eth0 backed by a different TAP. Since the workload
+listens on `0.0.0.0`, traffic flows immediately — no rebind, no restart.
+
+### Container adoption
+
+The `AdoptContainer` RPC re-registers the snapshot's running container under
+the new container ID so that kill/wait/state RPCs work correctly. An exit
+watcher is spawned for clean termination on scale-down.
+
 ## Container Rootfs Delivery
 
-The shim supports two rootfs delivery tiers, automatically selecting the best path:
+The shim converts container rootfs to erofs images, cached at
+`/run/cloudhv/erofs-cache/<hash>.erofs`. The cache is content-addressed
+by the overlayfs lowerdir paths (FNV-1a 128-bit hash) and flock-serialized
+for concurrent builds. One build per unique image; all subsequent pods
+hardlink the cached image.
 
-### Tier 1: Block Device Passthrough (devmapper snapshotter)
+### Block Device Passthrough (devmapper snapshotter)
 
 When containerd uses the devmapper snapshotter, the container rootfs is already
-a thin-provisioned block device. The shim detects this via `findmnt` and passes
-the device path directly to Cloud Hypervisor's `vm.add-disk` API — zero image
-creation, zero copying, zero host CPU for rootfs delivery.
+a thin-provisioned block device. The shim detects this via `/proc/self/mountinfo`
+and passes the device path directly to Cloud Hypervisor's `vm.add-disk` API.
 
-The guest agent detects the flat disk layout (no `rootfs/` subdirectory),
-remounts at the correct path, and runs the container.
+### erofs Cache (overlayfs snapshotter)
 
-### Tier 2: Cached Image (overlayfs snapshotter)
-
-When the snapshotter produces a directory mount, the shim creates an ext4
-image (journal-free, cached) per unique container image at
-`/opt/cloudhv/cache/<hash>.img`. Subsequent containers clone the cached
-image via `cp`.
+When the snapshotter produces a directory mount, the shim runs `mkfs.erofs`
+to convert it into a compact read-only image. The erofs image is cached and
+hardlinked for all subsequent pods using the same container image.
 
 In both tiers, config.json and volume data (ConfigMaps, Secrets) are delivered
 inline via the CreateContainer RPC — the agent writes them to the bundle
