@@ -58,10 +58,13 @@ no memory sharing and requires full workload startup each time.
 
 #### Architecture Notes
 
-- The default `kernel_args` console device is set at compile time based on the target
-  architecture. On **x86_64** it defaults to `console=hvc0` (virtio console); on
-  **ARM64 (aarch64)** it defaults to `console=ttyAMA0` (PL011 UART). If you override
-  `kernel_args` in the config file, use the correct console for your architecture.
+- **Console device:** The example above uses `console=ttyS0`, which is correct for
+  Cloud Hypervisor's serial port output and is what the installer writes. The compile-time
+  default in code is `console=hvc0` for historical reasons (virtio-console mode), but
+  `ttyS0` is the recommended setting for production and is required for `cloud-hypervisor
+  --serial tty` output. On **ARM64 (aarch64)** use `console=ttyAMA0` (PL011 UART).
+  If you override `kernel_args` in the config file, use the correct console for your
+  architecture.
 - The kernel config used to build the guest kernel also differs per architecture:
   `guest/kernel/configs/microvm.config` for x86_64 and
   `guest/kernel/configs/microvm-aarch64.config` for ARM64.

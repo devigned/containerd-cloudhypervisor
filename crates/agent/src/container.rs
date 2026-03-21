@@ -764,7 +764,9 @@ async fn wait_for_dev_inotify(dev_path: &str) -> Result<()> {
         let _fd_guard = FdGuard(fd);
 
         let dir_cstr = std::ffi::CString::new(watch_dir.to_string_lossy().as_bytes())?;
-        let wd = unsafe { libc::inotify_add_watch(fd, dir_cstr.as_ptr(), libc::IN_CREATE) };
+        let wd = unsafe {
+            libc::inotify_add_watch(fd, dir_cstr.as_ptr(), libc::IN_CREATE | libc::IN_MOVED_TO)
+        };
         if wd < 0 {
             anyhow::bail!(
                 "inotify_add_watch({}): {}",
@@ -775,7 +777,7 @@ async fn wait_for_dev_inotify(dev_path: &str) -> Result<()> {
 
         // Check again after adding watch (device may have appeared between
         // our initial check and the watch registration)
-        if std::path::Path::new(&format!("{}/{}", watch_dir.display(), dev_name)).exists() {
+        if watch_dir.join(&dev_name).exists() {
             return Ok(());
         }
 
@@ -804,7 +806,7 @@ async fn wait_for_dev_inotify(dev_path: &str) -> Result<()> {
             }
             if ret == 0 {
                 // Timeout on this poll — check if device appeared
-                if std::path::Path::new(&format!("{}/{}", watch_dir.display(), dev_name)).exists() {
+                if watch_dir.join(&dev_name).exists() {
                     return Ok(());
                 }
                 continue;

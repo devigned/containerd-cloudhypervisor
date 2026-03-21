@@ -125,8 +125,12 @@ async fn get_or_connect_agent(
                     }
                     Err(_) => {
                         tight_attempts += 1;
-                        // Yield to let other tasks run, then retry immediately
-                        tokio::task::yield_now().await;
+                        if tight_attempts.is_multiple_of(50) {
+                            // Brief sleep every 50 attempts to prevent CPU spike
+                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        } else {
+                            tokio::task::yield_now().await;
+                        }
                     }
                 }
             }
@@ -287,6 +291,15 @@ impl Instance for CloudHvInstance {
                         Err(e) => info!("failed to remove disk image: {e}"),
                     }
                 }
+            }
+
+            // Abort any in-flight eager boot to release the Arc<SharedVmState>
+            if let Some(handle) = vm_state.eager_boot.lock().await.take() {
+                handle.abort();
+                info!(
+                    "aborted in-flight eager boot for sandbox {}",
+                    self.sandbox_id
+                );
             }
 
             // Decrement container count; clean up VM if zero

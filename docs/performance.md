@@ -42,6 +42,15 @@ Best case: **26ms** (boot finished during containerd gap).
 
 Warm snapshot restore eliminates kernel boot and workload startup for all
 pods after the first. The first pod cold-boots and creates a snapshot; all
+
+> **Note:** The cold boot path with async eager boot is faster for single-pod
+> shim latency (~240ms vs ~344ms) because warm restore serializes a larger VM
+> state. Warm restore's value is at **scale**: CoW memory sharing (~5 MiB/pod
+> vs ~60 MiB/pod) and **instant workload readiness** — workloads like Python
+> or Node.js that take 10–15s to start are already running in the restored
+> snapshot. For single-pod benchmarks, cold boot wins on wall-clock time; for
+> production deployments with many pods of the same image, warm restore wins
+> on total resource cost and application-level latency.
 subsequent pods restore from it with CoW (copy-on-write) memory.
 
 Measured on AKS (3 × D8ds_v5, Kubernetes v1.33.7, containerd 2.0.0):
