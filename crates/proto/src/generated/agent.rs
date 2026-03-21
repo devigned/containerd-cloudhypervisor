@@ -3409,6 +3409,565 @@ impl ::protobuf::reflect::ProtobufValue for GetContainerLogsResponse {
     type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
 }
 
+// @@protoc_insertion_point(message:cloudhv.agent.ConfigureNetworkRequest)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct ConfigureNetworkRequest {
+    // message fields
+    // @@protoc_insertion_point(field:cloudhv.agent.ConfigureNetworkRequest.ip_address)
+    pub ip_address: ::std::string::String,
+    // @@protoc_insertion_point(field:cloudhv.agent.ConfigureNetworkRequest.gateway)
+    pub gateway: ::std::string::String,
+    // @@protoc_insertion_point(field:cloudhv.agent.ConfigureNetworkRequest.prefix_len)
+    pub prefix_len: u32,
+    // @@protoc_insertion_point(field:cloudhv.agent.ConfigureNetworkRequest.device)
+    pub device: ::std::string::String,
+    // @@protoc_insertion_point(field:cloudhv.agent.ConfigureNetworkRequest.mac)
+    pub mac: ::std::string::String,
+    // special fields
+    // @@protoc_insertion_point(special_field:cloudhv.agent.ConfigureNetworkRequest.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a ConfigureNetworkRequest {
+    fn default() -> &'a ConfigureNetworkRequest {
+        <ConfigureNetworkRequest as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl ConfigureNetworkRequest {
+    pub fn new() -> ConfigureNetworkRequest {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(5);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "ip_address",
+            |m: &ConfigureNetworkRequest| { &m.ip_address },
+            |m: &mut ConfigureNetworkRequest| { &mut m.ip_address },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "gateway",
+            |m: &ConfigureNetworkRequest| { &m.gateway },
+            |m: &mut ConfigureNetworkRequest| { &mut m.gateway },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "prefix_len",
+            |m: &ConfigureNetworkRequest| { &m.prefix_len },
+            |m: &mut ConfigureNetworkRequest| { &mut m.prefix_len },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "device",
+            |m: &ConfigureNetworkRequest| { &m.device },
+            |m: &mut ConfigureNetworkRequest| { &mut m.device },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "mac",
+            |m: &ConfigureNetworkRequest| { &m.mac },
+            |m: &mut ConfigureNetworkRequest| { &mut m.mac },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<ConfigureNetworkRequest>(
+            "ConfigureNetworkRequest",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for ConfigureNetworkRequest {
+    const NAME: &'static str = "ConfigureNetworkRequest";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                10 => {
+                    self.ip_address = is.read_string()?;
+                },
+                18 => {
+                    self.gateway = is.read_string()?;
+                },
+                24 => {
+                    self.prefix_len = is.read_uint32()?;
+                },
+                34 => {
+                    self.device = is.read_string()?;
+                },
+                42 => {
+                    self.mac = is.read_string()?;
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if !self.ip_address.is_empty() {
+            my_size += ::protobuf::rt::string_size(1, &self.ip_address);
+        }
+        if !self.gateway.is_empty() {
+            my_size += ::protobuf::rt::string_size(2, &self.gateway);
+        }
+        if self.prefix_len != 0 {
+            my_size += ::protobuf::rt::uint32_size(3, self.prefix_len);
+        }
+        if !self.device.is_empty() {
+            my_size += ::protobuf::rt::string_size(4, &self.device);
+        }
+        if !self.mac.is_empty() {
+            my_size += ::protobuf::rt::string_size(5, &self.mac);
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if !self.ip_address.is_empty() {
+            os.write_string(1, &self.ip_address)?;
+        }
+        if !self.gateway.is_empty() {
+            os.write_string(2, &self.gateway)?;
+        }
+        if self.prefix_len != 0 {
+            os.write_uint32(3, self.prefix_len)?;
+        }
+        if !self.device.is_empty() {
+            os.write_string(4, &self.device)?;
+        }
+        if !self.mac.is_empty() {
+            os.write_string(5, &self.mac)?;
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> ConfigureNetworkRequest {
+        ConfigureNetworkRequest::new()
+    }
+
+    fn clear(&mut self) {
+        self.ip_address.clear();
+        self.gateway.clear();
+        self.prefix_len = 0;
+        self.device.clear();
+        self.mac.clear();
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static ConfigureNetworkRequest {
+        static instance: ConfigureNetworkRequest = ConfigureNetworkRequest {
+            ip_address: ::std::string::String::new(),
+            gateway: ::std::string::String::new(),
+            prefix_len: 0,
+            device: ::std::string::String::new(),
+            mac: ::std::string::String::new(),
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for ConfigureNetworkRequest {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("ConfigureNetworkRequest").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for ConfigureNetworkRequest {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for ConfigureNetworkRequest {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+// @@protoc_insertion_point(message:cloudhv.agent.ConfigureNetworkResponse)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct ConfigureNetworkResponse {
+    // special fields
+    // @@protoc_insertion_point(special_field:cloudhv.agent.ConfigureNetworkResponse.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a ConfigureNetworkResponse {
+    fn default() -> &'a ConfigureNetworkResponse {
+        <ConfigureNetworkResponse as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl ConfigureNetworkResponse {
+    pub fn new() -> ConfigureNetworkResponse {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(0);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<ConfigureNetworkResponse>(
+            "ConfigureNetworkResponse",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for ConfigureNetworkResponse {
+    const NAME: &'static str = "ConfigureNetworkResponse";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> ConfigureNetworkResponse {
+        ConfigureNetworkResponse::new()
+    }
+
+    fn clear(&mut self) {
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static ConfigureNetworkResponse {
+        static instance: ConfigureNetworkResponse = ConfigureNetworkResponse {
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for ConfigureNetworkResponse {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("ConfigureNetworkResponse").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for ConfigureNetworkResponse {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for ConfigureNetworkResponse {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+// @@protoc_insertion_point(message:cloudhv.agent.AdoptContainerRequest)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct AdoptContainerRequest {
+    // message fields
+    // @@protoc_insertion_point(field:cloudhv.agent.AdoptContainerRequest.old_container_id)
+    pub old_container_id: ::std::string::String,
+    // @@protoc_insertion_point(field:cloudhv.agent.AdoptContainerRequest.new_container_id)
+    pub new_container_id: ::std::string::String,
+    // special fields
+    // @@protoc_insertion_point(special_field:cloudhv.agent.AdoptContainerRequest.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a AdoptContainerRequest {
+    fn default() -> &'a AdoptContainerRequest {
+        <AdoptContainerRequest as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl AdoptContainerRequest {
+    pub fn new() -> AdoptContainerRequest {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(2);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "old_container_id",
+            |m: &AdoptContainerRequest| { &m.old_container_id },
+            |m: &mut AdoptContainerRequest| { &mut m.old_container_id },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "new_container_id",
+            |m: &AdoptContainerRequest| { &m.new_container_id },
+            |m: &mut AdoptContainerRequest| { &mut m.new_container_id },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<AdoptContainerRequest>(
+            "AdoptContainerRequest",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for AdoptContainerRequest {
+    const NAME: &'static str = "AdoptContainerRequest";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                10 => {
+                    self.old_container_id = is.read_string()?;
+                },
+                18 => {
+                    self.new_container_id = is.read_string()?;
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if !self.old_container_id.is_empty() {
+            my_size += ::protobuf::rt::string_size(1, &self.old_container_id);
+        }
+        if !self.new_container_id.is_empty() {
+            my_size += ::protobuf::rt::string_size(2, &self.new_container_id);
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if !self.old_container_id.is_empty() {
+            os.write_string(1, &self.old_container_id)?;
+        }
+        if !self.new_container_id.is_empty() {
+            os.write_string(2, &self.new_container_id)?;
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> AdoptContainerRequest {
+        AdoptContainerRequest::new()
+    }
+
+    fn clear(&mut self) {
+        self.old_container_id.clear();
+        self.new_container_id.clear();
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static AdoptContainerRequest {
+        static instance: AdoptContainerRequest = AdoptContainerRequest {
+            old_container_id: ::std::string::String::new(),
+            new_container_id: ::std::string::String::new(),
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for AdoptContainerRequest {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("AdoptContainerRequest").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for AdoptContainerRequest {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for AdoptContainerRequest {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+// @@protoc_insertion_point(message:cloudhv.agent.AdoptContainerResponse)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct AdoptContainerResponse {
+    // message fields
+    // @@protoc_insertion_point(field:cloudhv.agent.AdoptContainerResponse.pid)
+    pub pid: u32,
+    // special fields
+    // @@protoc_insertion_point(special_field:cloudhv.agent.AdoptContainerResponse.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a AdoptContainerResponse {
+    fn default() -> &'a AdoptContainerResponse {
+        <AdoptContainerResponse as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl AdoptContainerResponse {
+    pub fn new() -> AdoptContainerResponse {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(1);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "pid",
+            |m: &AdoptContainerResponse| { &m.pid },
+            |m: &mut AdoptContainerResponse| { &mut m.pid },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<AdoptContainerResponse>(
+            "AdoptContainerResponse",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for AdoptContainerResponse {
+    const NAME: &'static str = "AdoptContainerResponse";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                8 => {
+                    self.pid = is.read_uint32()?;
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if self.pid != 0 {
+            my_size += ::protobuf::rt::uint32_size(1, self.pid);
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if self.pid != 0 {
+            os.write_uint32(1, self.pid)?;
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> AdoptContainerResponse {
+        AdoptContainerResponse::new()
+    }
+
+    fn clear(&mut self) {
+        self.pid = 0;
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static AdoptContainerResponse {
+        static instance: AdoptContainerResponse = AdoptContainerResponse {
+            pid: 0,
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for AdoptContainerResponse {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("AdoptContainerResponse").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for AdoptContainerResponse {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for AdoptContainerResponse {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
 #[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
 // @@protoc_insertion_point(enum:cloudhv.agent.VolumeType)
 pub enum VolumeType {
@@ -3606,28 +4165,39 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     set\"t\n\x18GetContainerLogsResponse\x12\x16\n\x06stdout\x18\x01\x20\x01\
     (\x0cR\x06stdout\x12\x16\n\x06stderr\x18\x02\x20\x01(\x0cR\x06stderr\x12\
     \x16\n\x06offset\x18\x03\x20\x01(\x04R\x06offset\x12\x10\n\x03eof\x18\
-    \x04\x20\x01(\x08R\x03eof*'\n\nVolumeType\x12\x0e\n\nFILESYSTEM\x10\0\
-    \x12\t\n\x05BLOCK\x10\x01*P\n\x0eContainerState\x12\x0b\n\x07UNKNOWN\x10\
-    \0\x12\x0b\n\x07CREATED\x10\x01\x12\x0b\n\x07RUNNING\x10\x02\x12\x0b\n\
-    \x07STOPPED\x10\x03\x12\n\n\x06PAUSED\x10\x042\xb4\x07\n\x0cAgentService\
-    \x12`\n\x0fCreateContainer\x12%.cloudhv.agent.CreateContainerRequest\x1a\
-    &.cloudhv.agent.CreateContainerResponse\x12]\n\x0eStartContainer\x12$.cl\
-    oudhv.agent.StartContainerRequest\x1a%.cloudhv.agent.StartContainerRespo\
-    nse\x12\\\n\x0cRunContainer\x12%.cloudhv.agent.CreateContainerRequest\
-    \x1a%.cloudhv.agent.StartContainerResponse\x12Z\n\rKillContainer\x12#.cl\
-    oudhv.agent.KillContainerRequest\x1a$.cloudhv.agent.KillContainerRespons\
-    e\x12`\n\x0fDeleteContainer\x12%.cloudhv.agent.DeleteContainerRequest\
-    \x1a&.cloudhv.agent.DeleteContainerResponse\x12Z\n\rWaitContainer\x12#.c\
-    loudhv.agent.WaitContainerRequest\x1a$.cloudhv.agent.WaitContainerRespon\
-    se\x12T\n\x0bExecProcess\x12!.cloudhv.agent.ExecProcessRequest\x1a\".clo\
-    udhv.agent.ExecProcessResponse\x12]\n\x0eStateContainer\x12$.cloudhv.age\
-    nt.StateContainerRequest\x1a%.cloudhv.agent.StateContainerResponse\x12Q\
-    \n\nGetMemInfo\x12\x20.cloudhv.agent.GetMemInfoRequest\x1a!.cloudhv.agen\
-    t.GetMemInfoResponse\x12c\n\x10GetContainerLogs\x12&.cloudhv.agent.GetCo\
-    ntainerLogsRequest\x1a'.cloudhv.agent.GetContainerLogsResponse2S\n\rHeal\
-    thService\x12B\n\x05Check\x12\x1b.cloudhv.agent.CheckRequest\x1a\x1c.clo\
-    udhv.agent.CheckResponseB6Z4github.com/devigned/containerd-cloudhypervis\
-    or/protob\x06proto3\
+    \x04\x20\x01(\x08R\x03eof\"\x9b\x01\n\x17ConfigureNetworkRequest\x12\x1d\
+    \n\nip_address\x18\x01\x20\x01(\tR\tipAddress\x12\x18\n\x07gateway\x18\
+    \x02\x20\x01(\tR\x07gateway\x12\x1d\n\nprefix_len\x18\x03\x20\x01(\rR\tp\
+    refixLen\x12\x16\n\x06device\x18\x04\x20\x01(\tR\x06device\x12\x10\n\x03\
+    mac\x18\x05\x20\x01(\tR\x03mac\"\x1a\n\x18ConfigureNetworkResponse\"k\n\
+    \x15AdoptContainerRequest\x12(\n\x10old_container_id\x18\x01\x20\x01(\tR\
+    \x0eoldContainerId\x12(\n\x10new_container_id\x18\x02\x20\x01(\tR\x0enew\
+    ContainerId\"*\n\x16AdoptContainerResponse\x12\x10\n\x03pid\x18\x01\x20\
+    \x01(\rR\x03pid*'\n\nVolumeType\x12\x0e\n\nFILESYSTEM\x10\0\x12\t\n\x05B\
+    LOCK\x10\x01*P\n\x0eContainerState\x12\x0b\n\x07UNKNOWN\x10\0\x12\x0b\n\
+    \x07CREATED\x10\x01\x12\x0b\n\x07RUNNING\x10\x02\x12\x0b\n\x07STOPPED\
+    \x10\x03\x12\n\n\x06PAUSED\x10\x042\xf8\x08\n\x0cAgentService\x12`\n\x0f\
+    CreateContainer\x12%.cloudhv.agent.CreateContainerRequest\x1a&.cloudhv.a\
+    gent.CreateContainerResponse\x12]\n\x0eStartContainer\x12$.cloudhv.agent\
+    .StartContainerRequest\x1a%.cloudhv.agent.StartContainerResponse\x12\\\n\
+    \x0cRunContainer\x12%.cloudhv.agent.CreateContainerRequest\x1a%.cloudhv.\
+    agent.StartContainerResponse\x12Z\n\rKillContainer\x12#.cloudhv.agent.Ki\
+    llContainerRequest\x1a$.cloudhv.agent.KillContainerResponse\x12`\n\x0fDe\
+    leteContainer\x12%.cloudhv.agent.DeleteContainerRequest\x1a&.cloudhv.age\
+    nt.DeleteContainerResponse\x12Z\n\rWaitContainer\x12#.cloudhv.agent.Wait\
+    ContainerRequest\x1a$.cloudhv.agent.WaitContainerResponse\x12T\n\x0bExec\
+    Process\x12!.cloudhv.agent.ExecProcessRequest\x1a\".cloudhv.agent.ExecPr\
+    ocessResponse\x12]\n\x0eStateContainer\x12$.cloudhv.agent.StateContainer\
+    Request\x1a%.cloudhv.agent.StateContainerResponse\x12Q\n\nGetMemInfo\x12\
+    \x20.cloudhv.agent.GetMemInfoRequest\x1a!.cloudhv.agent.GetMemInfoRespon\
+    se\x12c\n\x10GetContainerLogs\x12&.cloudhv.agent.GetContainerLogsRequest\
+    \x1a'.cloudhv.agent.GetContainerLogsResponse\x12c\n\x10ConfigureNetwork\
+    \x12&.cloudhv.agent.ConfigureNetworkRequest\x1a'.cloudhv.agent.Configure\
+    NetworkResponse\x12]\n\x0eAdoptContainer\x12$.cloudhv.agent.AdoptContain\
+    erRequest\x1a%.cloudhv.agent.AdoptContainerResponse2S\n\rHealthService\
+    \x12B\n\x05Check\x12\x1b.cloudhv.agent.CheckRequest\x1a\x1c.cloudhv.agen\
+    t.CheckResponseB6Z4github.com/devigned/containerd-cloudhypervisor/protob\
+    \x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file
@@ -3645,7 +4215,7 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
     file_descriptor.get(|| {
         let generated_file_descriptor = generated_file_descriptor_lazy.get(|| {
             let mut deps = ::std::vec::Vec::with_capacity(0);
-            let mut messages = ::std::vec::Vec::with_capacity(22);
+            let mut messages = ::std::vec::Vec::with_capacity(26);
             messages.push(CreateContainerRequest::generated_message_descriptor_data());
             messages.push(VolumeMount::generated_message_descriptor_data());
             messages.push(InlineFile::generated_message_descriptor_data());
@@ -3668,6 +4238,10 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
             messages.push(GetMemInfoResponse::generated_message_descriptor_data());
             messages.push(GetContainerLogsRequest::generated_message_descriptor_data());
             messages.push(GetContainerLogsResponse::generated_message_descriptor_data());
+            messages.push(ConfigureNetworkRequest::generated_message_descriptor_data());
+            messages.push(ConfigureNetworkResponse::generated_message_descriptor_data());
+            messages.push(AdoptContainerRequest::generated_message_descriptor_data());
+            messages.push(AdoptContainerResponse::generated_message_descriptor_data());
             let mut enums = ::std::vec::Vec::with_capacity(2);
             enums.push(VolumeType::generated_enum_descriptor_data());
             enums.push(ContainerState::generated_enum_descriptor_data());

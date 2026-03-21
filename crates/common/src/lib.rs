@@ -1,4 +1,5 @@
 pub mod error;
+pub mod netlink;
 pub mod types;
 
 /// Default vsock port for the guest agent ttrpc server.

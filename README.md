@@ -5,10 +5,12 @@ that runs container workloads inside lightweight microVMs with maximum density a
 
 ## Highlights
 
-- **~530ms end-to-end container lifecycle (single pod via crictl)**
+- **Warm snapshot restore** — first pod cold-boots (~20s), all subsequent pods restore from a CoW snapshot in **~344ms** with ~5 MiB incremental memory per pod
+- **150/150 pods** on 3 × D8ds_v5 nodes (96 GiB total RAM), clean scale-up in 77s and scale-down in 12s
+- **~530ms cold-boot** (single pod via crictl), **~344ms warm restore** (AKS at scale)
 - **VM isolation** — each pod runs in its own Cloud Hypervisor microVM with dedicated kernel
-- **Rootfs delivery** — devmapper block passthrough (zero-copy) with ext4 cache fallback
-- **Block device rootfs** — container images delivered as hot-plugged virtio-blk disks; devmapper snapshots passed directly, overlayfs cached as ext4
+- **erofs rootfs cache** — content-addressable, flock-serialized, shared across pods
+- **Pure libc networking** — TAP/tc setup via in-process netlink (~46ms, no subprocess)
 - **Dual hypervisor** — same binary runs on KVM (Linux) and MSHV (Azure/Hyper-V)
 - **Multi-container pods** — up to 5 containers per VM with mount + PID isolation
 - **Pod networking** — transparent CNI integration via TAP + TC redirect
@@ -18,17 +20,20 @@ that runs container workloads inside lightweight microVMs with maximum density a
 ## When to Use
 
 Choose this shim when you're building a **platform** where you control the stack and need
-VM isolation without the overhead of a full-featured VMM stack. Ideal for serverless/FaaS
-platforms, container-as-a-service offerings, and security-sensitive workloads.
+VM isolation without the overhead of a full-featured VMM stack. Ideal for AI agent sandboxes,
+serverless/FaaS platforms, and security-sensitive workloads where density matters.
 
 For general-purpose Kubernetes with multi-hypervisor support, GPU passthrough, or live
 migration, consider [Kata Containers](https://katacontainers.io/) instead.
 
 | | containerd-cloudhypervisor | Kata Containers |
 | --- | --- | --- |
+| **Warm restore** | ~344ms (CoW snapshot) | N/A |
 | **Cold start** | ~530ms (crictl) | ~500ms–1s |
-| **Shim binary** | 2.4 MB | ~50 MB |
-| **Guest rootfs** | 16 MB (agent + crun) | ~150 MB |
+| **Memory per pod** | ~5 MiB (CoW) / ~29 MiB (cold) | ~312 MiB |
+| **150-pod scale** | 150/150 in 77s | 130/150 (OOM) |
+| **Shim binary** | 4.6 MB | ~50 MB |
+| **Guest rootfs** | 5.4 MB (agent + crun, erofs) | ~150 MB |
 | **Language** | Rust | Go |
 
 ## Quick Start

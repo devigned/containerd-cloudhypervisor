@@ -77,8 +77,13 @@ struct SharedVmState {
     // Store sandbox boot config for deferred boot
     tap_name: Option<String>,
     tap_mac: Option<String>,
+    ip_cidr: Option<String>,
+    gateway: Option<String>,
     netns: Option<String>,
     cgroups_path: Option<String>,
+    /// Containers running in this VM, for snapshot metadata.
+    /// Each entry: (container_id, image_key, pid)
+    container_info: tokio::sync::Mutex<Vec<(String, String, u32)>>,
 }
 
 /// Lazily connect to the guest agent over vsock, caching the client in the
@@ -451,6 +456,10 @@ impl CloudHvInstance {
             std::mem::forget(shutdown_tx);
         }
 
+        let (ip_cidr_val, gateway_val) = match &ip_config {
+            Some((cidr, gw)) => (Some(cidr.clone()), Some(gw.clone())),
+            None => (None, None),
+        };
         let vm_state = Arc::new(SharedVmState {
             vm,
             agent: OnceCell::new(),
@@ -462,8 +471,11 @@ impl CloudHvInstance {
             boot_complete: tokio::sync::Notify::new(),
             tap_name,
             tap_mac,
+            ip_cidr: ip_cidr_val,
+            gateway: gateway_val,
             netns: sandbox_spec.netns.clone(),
             cgroups_path: sandbox_spec.cgroups_path.clone(),
+            container_info: tokio::sync::Mutex::new(Vec::new()),
         });
 
         VMS.write()
@@ -672,35 +684,104 @@ impl CloudHvInstance {
             }
         };
         let is_first_container = matches!(boot_role, BootRole::First);
+        let mut restored_from_snapshot = false;
 
         match boot_role {
             BootRole::First => {
-                // First container — boot VM with rootfs disks pre-attached
                 let t_boot = std::time::Instant::now();
-                let extra_disks: Vec<VmDisk> = rootfs_disks
-                    .iter()
-                    .map(|(path, id, readonly)| VmDisk {
-                        path: path.to_string_lossy().to_string(),
-                        readonly: *readonly,
-                        id: Some(id.clone()),
-                    })
-                    .collect();
-                let boot_result = vm_state
-                    .vm
-                    .create_and_boot_vm(
-                        vm_state.tap_name.as_deref(),
-                        vm_state.tap_mac.as_deref(),
-                        extra_disks,
-                    )
-                    .await;
 
-                if let Err(e) = boot_result {
-                    let msg = format!("{e:#}");
-                    *vm_state.boot_state.lock().await = BootState::Failed(msg.clone());
-                    vm_state.boot_complete.notify_waiters();
-                    return Err(Error::Any(anyhow::anyhow!("boot with rootfs: {msg}")));
+                // ─── Warm Workload Snapshot/Restore ─────────────────────────
+                //
+                // HOW IT WORKS:
+                //
+                // The snapshot cache stores a fully-warmed VM state: kernel booted,
+                // agent running, AND the container workload fully started (e.g. Python
+                // server listening on 0.0.0.0:8888). This is the "golden" state.
+                //
+                // COLD BOOT (first pod per image on this node):
+                //   1. Boot VM with networking + rootfs pre-attached
+                //   2. Agent connects, container starts, workload warms up
+                //   3. After 20s warmup: pause VM → snapshot → resume → cache
+                //   4. The snapshot includes the RUNNING workload process
+                //
+                // RESTORE (all subsequent pods with same image):
+                //   1. Restore VM from cached snapshot with patched config
+                //      (TAP name + MAC updated in config.json, CoW memory, ~150ms)
+                //   2. Resume VM — eth0 already wired to new TAP, workload
+                //      process wakes up ALREADY RUNNING
+                //   3. Configure guest IP via ConfigureNetwork agent RPC
+                //   4. SKIP RunContainer — the container is already alive
+                //   5. Traffic flows immediately (workload binds 0.0.0.0)
+                //
+                // WHY THIS WORKS:
+                //
+                // The workload (e.g. Python uvicorn) binds to 0.0.0.0:<port>,
+                // which accepts connections on ALL interfaces. The snapshot's
+                // config.json is patched at restore time to reference the new
+                // pod's TAP device and MAC address. On restore the VM boots
+                // with the patched TAP already attached as eth0. Since the
+                // workload listens on 0.0.0.0, it automatically accepts
+                // connections on the new interface — no rebind needed.
+                //
+                // The container rootfs (erofs image) is part of the snapshot memory
+                // (it was mounted when the workload started). The same image is used
+                // for all pods with the same container image, so the rootfs in the
+                // snapshot matches what the new pod expects.
+                //
+                // ────────────────────────────────────────────────────────────
+
+                // Snapshot cache key includes VM config AND container image identity
+                // so different workload images get separate snapshots.
+                let snap_key = {
+                    let base = crate::snapshot::snapshot_cache_key(vm_state.vm.config());
+                    let erofs_id = erofs_cache_key(&rootfs_path)
+                        .unwrap_or_else(|| stable_hash_hex(&rootfs_path.to_string_lossy()));
+                    stable_hash_hex(&format!("{base}:{erofs_id}"))
+                };
+
+                // Try snapshot restore first (CoW — near-instant boot)
+                let restored = if crate::snapshot::snapshot_cache_hit(&snap_key) {
+                    let snap_dir = crate::snapshot::snapshot_cache_dir(&snap_key);
+                    info!("snapshot cache hit: {}", snap_dir.display());
+                    match try_restore(&vm_state, &snap_key, &rootfs_disks).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            info!("snapshot restore failed, falling back to cold boot: {e:#}");
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+
+                if !restored {
+                    // Cold boot path — create and boot VM with pre-attached rootfs
+                    let extra_disks: Vec<VmDisk> = rootfs_disks
+                        .iter()
+                        .map(|(path, id, readonly)| VmDisk {
+                            path: path.to_string_lossy().to_string(),
+                            readonly: *readonly,
+                            id: Some(id.clone()),
+                        })
+                        .collect();
+                    let boot_result = vm_state
+                        .vm
+                        .create_and_boot_vm(
+                            vm_state.tap_name.as_deref(),
+                            vm_state.tap_mac.as_deref(),
+                            extra_disks,
+                        )
+                        .await;
+
+                    if let Err(e) = boot_result {
+                        let msg = format!("{e:#}");
+                        *vm_state.boot_state.lock().await = BootState::Failed(msg.clone());
+                        vm_state.boot_complete.notify_waiters();
+                        return Err(Error::Any(anyhow::anyhow!("boot with rootfs: {msg}")));
+                    }
                 }
-                info!("VM booted with pre-attached rootfs: {disk_id}");
+                info!("VM booted (restored={restored}): {disk_id}");
+                restored_from_snapshot = restored;
                 let boot_ms = t_boot.elapsed().as_millis();
 
                 // Connect to agent — confirms VM is fully booted and agent is responsive
@@ -717,15 +798,58 @@ impl CloudHvInstance {
                     }
                 }
 
+                // After snapshot restore, configure guest networking via agent RPC.
+                // The snapshot config's TAP was patched to use the new pod's TAP,
+                // so the guest's eth0 is already backed by the correct TAP device.
+                // We just need to flush the stale IP and configure the new one.
+                if restored {
+                    if let (Some(ref ip_cidr), Some(ref gw)) =
+                        (&vm_state.ip_cidr, &vm_state.gateway)
+                    {
+                        let parts: Vec<&str> = ip_cidr.split('/').collect();
+                        let ip = parts[0];
+                        let prefix: u32 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(24);
+                        let agent = get_or_connect_agent(&vm_state).await?;
+                        let mut req = cloudhv_proto::ConfigureNetworkRequest::new();
+                        req.ip_address = ip.to_string();
+                        req.gateway = gw.clone();
+                        req.prefix_len = prefix;
+                        req.device = "eth0".to_string();
+                        let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
+                        agent
+                            .configure_network(ctx, &req)
+                            .await
+                            .ctx("configure guest network after restore")?;
+                        info!("guest network configured: ip={ip}/{prefix} gw={gw}");
+                    }
+                }
+
                 // Mark boot as complete and wake any waiting containers
                 *vm_state.boot_state.lock().await = BootState::Booted;
                 vm_state.boot_complete.notify_waiters();
                 let agent_ms = t_agent.elapsed().as_millis();
 
                 info!(
-                    "TIMING first_boot {}: vm_boot={}ms agent_connect={}ms",
-                    container_id, boot_ms, agent_ms
+                    "TIMING first_boot {}: vm_boot={}ms agent_connect={}ms restored={}",
+                    container_id, boot_ms, agent_ms, restored
                 );
+
+                // After a successful cold boot, create a snapshot for future pods.
+                // Wait for the workload to warm up before snapshotting.
+                if !restored && !crate::snapshot::snapshot_cache_hit(&snap_key) {
+                    let vm_api = vm_state.api_socket.clone();
+                    let key = snap_key.clone();
+                    let vm_state_ref = vm_state.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                        if let Err(e) =
+                            create_snapshot_for_cache(&vm_api, &key, &vm_state_ref.container_info)
+                                .await
+                        {
+                            log::info!("snapshot cache creation failed (non-fatal): {e:#}");
+                        }
+                    });
+                }
 
                 // Place CH in pod cgroup now that the VM is running
                 if let Some(ref cg) = vm_state.cgroups_path {
@@ -776,207 +900,306 @@ impl CloudHvInstance {
             }
         }
 
-        let agent = get_or_connect_agent(&vm_state).await?;
-        let api_socket = vm_state.api_socket.clone();
+        // ─── Container start ────────────────────────────────────────────
+        //
+        // If restored from a warm workload snapshot, the container process is
+        // ALREADY RUNNING inside the VM. Sending RunContainer again would try
+        // to start a second instance → port conflicts (EADDRINUSE).
+        //
+        // For cold boot or non-first containers, we run the normal RPC flow.
+        // ─────────────────────────────────────────────────────────────────
 
-        // Hot-plug separate empty disks for emptyDir volumes.
-        for vol in &volumes {
-            if !vol.is_empty_dir {
-                continue;
-            }
-            let edir_id = format!("edir-{}", &vol.volume_id[..8.min(vol.volume_id.len())]);
-            let edir_path = parent_dir.join(format!("{}.img", edir_id));
+        if is_first_container && restored_from_snapshot {
+            // Warm restore: container is already alive in the snapshot.
+            // Use AdoptContainer to re-register it under the new container ID.
+            info!("warm restore: adopting container from snapshot metadata");
 
-            let f = std::fs::File::create(&edir_path).ctx("create emptyDir image")?;
-            f.set_len(16 * 1024 * 1024)?; // 16MB default
-            drop(f);
-            let status = std::process::Command::new("mkfs.ext4")
-                .args(["-q", "-F", "-O", "^has_journal"])
-                .arg(&edir_path)
-                .status();
-            if status.map(|s| !s.success()).unwrap_or(true) {
-                info!("mkfs.ext4 failed for emptyDir {}", vol.destination);
-                continue;
-            }
+            let image_key = erofs_cache_key(&rootfs_path)
+                .unwrap_or_else(|| stable_hash_hex(&rootfs_path.to_string_lossy()));
 
-            let edir_json = serde_json::json!({
-                "path": edir_path.to_string_lossy(),
-                "readonly": false,
-                "id": edir_id,
-            });
-            VmManager::api_request_to_socket(
-                &api_socket,
-                "PUT",
-                "/api/v1/vm.add-disk",
-                Some(&edir_json.to_string()),
-            )
-            .await
-            .ctx("hot-plug emptyDir disk")?;
-            info!("emptyDir hot-plugged: {} for {}", edir_id, vol.destination);
-        }
-
-        let bundle_guest = format!("/run/containers/{}", container_id);
-
-        // Read config.json to send inline via the RPC
-        let config_json_bytes =
-            std::fs::read(&spec_path).ctx("read config.json for inline delivery")?;
-
-        // Build the CreateContainerRequest
-        let mut create_req = cloudhv_proto::CreateContainerRequest::new();
-        create_req.container_id = container_id.to_string();
-        create_req.bundle_path = bundle_guest.clone();
-        create_req.config_json = config_json_bytes;
-        create_req.rootfs_preattached = is_first_container;
-        create_req.erofs_layers = rootfs_disks.len() as u32;
-        for vol in &volumes {
-            let mut vm = cloudhv_proto::VolumeMount::new();
-            vm.destination = vol.destination.clone();
-            if vol.is_block || vol.is_empty_dir {
-                vm.source = vol.source.clone();
-                vm.volume_type = cloudhv_proto::VolumeType::BLOCK.into();
-                vm.fs_type = if vol.is_empty_dir {
-                    "ext4".to_string()
-                } else {
-                    vol.fs_type.clone()
-                };
-            } else {
-                // Filesystem volume: send files inline, agent writes to tmpfs
-                vm.source = format!("{}/volumes/{}", bundle_guest, vol.volume_id);
-                vm.volume_type = cloudhv_proto::VolumeType::FILESYSTEM.into();
-                let src = std::path::Path::new(&vol.source);
-                let entries =
-                    read_volume_files(src).ctx("read volume files for inline delivery")?;
-                for (rel_path, content, mode) in entries {
-                    let mut inline_file = cloudhv_proto::InlineFile::new();
-                    inline_file.path = rel_path;
-                    inline_file.content = content;
-                    inline_file.mode = mode;
-                    vm.files.push(inline_file);
-                }
-            }
-            vm.readonly = vol.readonly;
-            create_req.volumes.push(vm);
-        }
-
-        let t_rpc = std::time::Instant::now();
-        let start_resp = if is_first_container {
-            // First container — use RunContainer (create + start atomically)
-            let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
-            agent.run_container(ctx, &create_req).await
-        } else {
-            // Subsequent containers — create then start separately
-            {
-                let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
-                agent.create_container(ctx, &create_req).await
-            }
-            .ctx("CreateContainer RPC error")?;
-            let mut start_req = cloudhv_proto::StartContainerRequest::new();
-            start_req.container_id = container_id.to_string();
-            let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
-            agent.start_container(ctx, &start_req).await
-        }
-        .ctx("start container RPC error")?;
-
-        vm_state.container_count.fetch_add(1, Ordering::SeqCst);
-
-        // Stream container logs from agent via GetContainerLogs RPC.
-        // Open FIFOs synchronously so containerd sees an active writer.
-        let log_agent = agent.clone();
-        let log_cid = container_id.to_string();
-        let stdout_fifo = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.stdout)
-            .ok();
-        let stderr_fifo = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.stderr)
-            .ok();
-        let log_handle = tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
-            let mut stdout_writer = stdout_fifo.map(tokio::fs::File::from_std);
-            let mut stderr_writer = stderr_fifo.map(tokio::fs::File::from_std);
-            let mut offset = 0u64;
-            loop {
-                let mut req = cloudhv_proto::GetContainerLogsRequest::new();
-                req.container_id = log_cid.clone();
-                req.offset = offset;
-                let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(5));
-                match log_agent.get_container_logs(ctx, &req).await {
-                    Ok(resp) => {
-                        if let Some(ref mut w) = stdout_writer {
-                            if !resp.stdout.is_empty() {
-                                let _ = w.write_all(&resp.stdout).await;
-                            }
-                        }
-                        if let Some(ref mut w) = stderr_writer {
-                            if !resp.stderr.is_empty() {
-                                let _ = w.write_all(&resp.stderr).await;
-                            }
-                        }
-                        offset = resp.offset;
-                        if resp.eof {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        });
-
-        // Watch for container exit via WaitContainer RPC
-        let exit = self.exit.clone();
-        let cid = container_id.to_string();
-        let agent_clone = agent.clone();
-        tokio::spawn(async move {
-            let t0 = std::time::Instant::now();
-            let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
-            wait_req.container_id = cid.clone();
-            let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(86400));
-            let exit_code = match agent_clone.wait_container(ctx, &wait_req).await {
-                Ok(resp) => resp.exit_status,
-                Err(e) => {
-                    log::info!("wait_container RPC error for {}: {e}", cid);
-                    137
-                }
+            // Recompute snap_key (same formula as in BootRole::First)
+            let snap_key = {
+                let base = crate::snapshot::snapshot_cache_key(vm_state.vm.config());
+                stable_hash_hex(&format!("{base}:{image_key}"))
             };
-            let rpc_ms = t0.elapsed().as_millis();
-            let t1 = std::time::Instant::now();
-            let log_result =
-                tokio::time::timeout(std::time::Duration::from_millis(100), log_handle).await;
-            let log_ms = t1.elapsed().as_millis();
-            let t2 = std::time::Instant::now();
-            let _ = exit.set((exit_code, Utc::now()));
-            let set_ms = t2.elapsed().as_millis();
-            log::info!(
-                "container {} exit path: rpc={}ms log_wait={}ms({}), set={}ms, total={}ms",
-                cid,
-                rpc_ms,
-                log_ms,
-                if log_result.is_ok() {
-                    "completed"
-                } else {
-                    "timeout"
-                },
-                set_ms,
-                t0.elapsed().as_millis()
-            );
-        });
 
-        let pid = start_resp.pid;
-        let rpc_ms = t_rpc.elapsed().as_millis();
-        info!("started container {} pid={}", container_id, pid);
-        info!(
-            "TIMING start_container {}: erofs={}ms rpc={}ms total={}ms first_boot={}",
-            container_id,
-            erofs_ms,
-            rpc_ms,
-            t_total.elapsed().as_millis(),
-            is_first_container
-        );
-        Ok(pid)
+            let metadata =
+                crate::snapshot::load_snapshot_metadata(&snap_key).ctx("load snapshot metadata")?;
+
+            if let Some(ref meta) = metadata {
+                if let Some(info) = meta.containers.iter().find(|c| c.image_key == image_key) {
+                    let agent = get_or_connect_agent(&vm_state).await?;
+                    let mut req = cloudhv_proto::AdoptContainerRequest::new();
+                    req.old_container_id = info.container_id.clone();
+                    req.new_container_id = container_id.to_string();
+                    let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(10));
+                    let resp = agent
+                        .adopt_container(ctx, &req)
+                        .await
+                        .ctx("adopt container after restore")?;
+
+                    let pid = resp.pid;
+                    info!(
+                        "warm restore: adopted container {} -> {} pid={}",
+                        info.container_id, container_id, pid
+                    );
+
+                    // Set up exit watcher for warm-restored container.
+                    // Without this, wait() blocks forever and delete() is never called,
+                    // causing pods to stay Terminating indefinitely.
+                    let exit = self.exit.clone();
+                    let cid = container_id.to_string();
+                    let agent_clone = agent.clone();
+                    tokio::spawn(async move {
+                        let t0 = std::time::Instant::now();
+                        let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
+                        wait_req.container_id = cid.clone();
+                        let ctx =
+                            ttrpc::context::with_duration(std::time::Duration::from_secs(86400));
+                        let exit_code = match agent_clone.wait_container(ctx, &wait_req).await {
+                            Ok(resp) => resp.exit_status,
+                            Err(e) => {
+                                log::info!("wait_container RPC error for {}: {e}", cid);
+                                137
+                            }
+                        };
+                        let _ = exit.set((exit_code, Utc::now()));
+                        log::info!(
+                            "warm-restored container {} exited: code={} rpc={}ms",
+                            cid,
+                            exit_code,
+                            t0.elapsed().as_millis()
+                        );
+                    });
+
+                    vm_state.container_count.fetch_add(1, Ordering::SeqCst);
+                    info!(
+                        "TIMING start_container {}: erofs={}ms rpc=0ms total={}ms first_boot=true (warm restore)",
+                        container_id, erofs_ms, t_total.elapsed().as_millis()
+                    );
+                    return Ok(pid);
+                }
+            }
+            // Fallback if metadata missing — fall through to RunContainer
+            info!(
+                "warm restore: no metadata for image_key {}, falling back to RunContainer",
+                image_key
+            );
+        }
+
+        // ─── Normal container start (cold boot or metadata-fallback) ─────
+        {
+            let agent = get_or_connect_agent(&vm_state).await?;
+            let api_socket = vm_state.api_socket.clone();
+
+            // Hot-plug separate empty disks for emptyDir volumes.
+            for vol in &volumes {
+                if !vol.is_empty_dir {
+                    continue;
+                }
+                let edir_id = format!("edir-{}", &vol.volume_id[..8.min(vol.volume_id.len())]);
+                let edir_path = parent_dir.join(format!("{}.img", edir_id));
+
+                let f = std::fs::File::create(&edir_path).ctx("create emptyDir image")?;
+                f.set_len(16 * 1024 * 1024)?; // 16MB default
+                drop(f);
+                let status = std::process::Command::new("mkfs.ext4")
+                    .args(["-q", "-F", "-O", "^has_journal"])
+                    .arg(&edir_path)
+                    .status();
+                if status.map(|s| !s.success()).unwrap_or(true) {
+                    info!("mkfs.ext4 failed for emptyDir {}", vol.destination);
+                    continue;
+                }
+
+                let edir_json = serde_json::json!({
+                    "path": edir_path.to_string_lossy(),
+                    "readonly": false,
+                    "id": edir_id,
+                });
+                VmManager::api_request_to_socket(
+                    &api_socket,
+                    "PUT",
+                    "/api/v1/vm.add-disk",
+                    Some(&edir_json.to_string()),
+                )
+                .await
+                .ctx("hot-plug emptyDir disk")?;
+                info!("emptyDir hot-plugged: {} for {}", edir_id, vol.destination);
+            }
+
+            let bundle_guest = format!("/run/containers/{}", container_id);
+
+            // Read config.json to send inline via the RPC
+            let config_json_bytes =
+                std::fs::read(&spec_path).ctx("read config.json for inline delivery")?;
+
+            // Build the CreateContainerRequest
+            let mut create_req = cloudhv_proto::CreateContainerRequest::new();
+            create_req.container_id = container_id.to_string();
+            create_req.bundle_path = bundle_guest.clone();
+            create_req.config_json = config_json_bytes;
+            create_req.rootfs_preattached = is_first_container;
+            create_req.erofs_layers = rootfs_disks.len() as u32;
+            for vol in &volumes {
+                let mut vm = cloudhv_proto::VolumeMount::new();
+                vm.destination = vol.destination.clone();
+                if vol.is_block || vol.is_empty_dir {
+                    vm.source = vol.source.clone();
+                    vm.volume_type = cloudhv_proto::VolumeType::BLOCK.into();
+                    vm.fs_type = if vol.is_empty_dir {
+                        "ext4".to_string()
+                    } else {
+                        vol.fs_type.clone()
+                    };
+                } else {
+                    // Filesystem volume: send files inline, agent writes to tmpfs
+                    vm.source = format!("{}/volumes/{}", bundle_guest, vol.volume_id);
+                    vm.volume_type = cloudhv_proto::VolumeType::FILESYSTEM.into();
+                    let src = std::path::Path::new(&vol.source);
+                    let entries =
+                        read_volume_files(src).ctx("read volume files for inline delivery")?;
+                    for (rel_path, content, mode) in entries {
+                        let mut inline_file = cloudhv_proto::InlineFile::new();
+                        inline_file.path = rel_path;
+                        inline_file.content = content;
+                        inline_file.mode = mode;
+                        vm.files.push(inline_file);
+                    }
+                }
+                vm.readonly = vol.readonly;
+                create_req.volumes.push(vm);
+            }
+
+            let t_rpc = std::time::Instant::now();
+            let start_resp = if is_first_container {
+                // First container — use RunContainer (create + start atomically)
+                let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
+                agent.run_container(ctx, &create_req).await
+            } else {
+                // Subsequent containers — create then start separately
+                {
+                    let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
+                    agent.create_container(ctx, &create_req).await
+                }
+                .ctx("CreateContainer RPC error")?;
+                let mut start_req = cloudhv_proto::StartContainerRequest::new();
+                start_req.container_id = container_id.to_string();
+                let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
+                agent.start_container(ctx, &start_req).await
+            }
+            .ctx("start container RPC error")?;
+
+            vm_state.container_count.fetch_add(1, Ordering::SeqCst);
+
+            // Record container info for snapshot metadata.
+            let image_key = erofs_cache_key(&rootfs_path)
+                .unwrap_or_else(|| stable_hash_hex(&rootfs_path.to_string_lossy()));
+            vm_state.container_info.lock().await.push((
+                container_id.to_string(),
+                image_key,
+                start_resp.pid,
+            ));
+
+            // Stream container logs from agent via GetContainerLogs RPC.
+            // Open FIFOs synchronously so containerd sees an active writer.
+            let log_agent = agent.clone();
+            let log_cid = container_id.to_string();
+            let stdout_fifo = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.stdout)
+                .ok();
+            let stderr_fifo = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.stderr)
+                .ok();
+            let log_handle = tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let mut stdout_writer = stdout_fifo.map(tokio::fs::File::from_std);
+                let mut stderr_writer = stderr_fifo.map(tokio::fs::File::from_std);
+                let mut offset = 0u64;
+                loop {
+                    let mut req = cloudhv_proto::GetContainerLogsRequest::new();
+                    req.container_id = log_cid.clone();
+                    req.offset = offset;
+                    let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(5));
+                    match log_agent.get_container_logs(ctx, &req).await {
+                        Ok(resp) => {
+                            if let Some(ref mut w) = stdout_writer {
+                                if !resp.stdout.is_empty() {
+                                    let _ = w.write_all(&resp.stdout).await;
+                                }
+                            }
+                            if let Some(ref mut w) = stderr_writer {
+                                if !resp.stderr.is_empty() {
+                                    let _ = w.write_all(&resp.stderr).await;
+                                }
+                            }
+                            offset = resp.offset;
+                            if resp.eof {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            });
+
+            // Watch for container exit via WaitContainer RPC
+            let exit = self.exit.clone();
+            let cid = container_id.to_string();
+            let agent_clone = agent.clone();
+            tokio::spawn(async move {
+                let t0 = std::time::Instant::now();
+                let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
+                wait_req.container_id = cid.clone();
+                let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(86400));
+                let exit_code = match agent_clone.wait_container(ctx, &wait_req).await {
+                    Ok(resp) => resp.exit_status,
+                    Err(e) => {
+                        log::info!("wait_container RPC error for {}: {e}", cid);
+                        137
+                    }
+                };
+                let rpc_ms = t0.elapsed().as_millis();
+                let t1 = std::time::Instant::now();
+                let log_result =
+                    tokio::time::timeout(std::time::Duration::from_millis(100), log_handle).await;
+                let log_ms = t1.elapsed().as_millis();
+                let t2 = std::time::Instant::now();
+                let _ = exit.set((exit_code, Utc::now()));
+                let set_ms = t2.elapsed().as_millis();
+                log::info!(
+                    "container {} exit path: rpc={}ms log_wait={}ms({}), set={}ms, total={}ms",
+                    cid,
+                    rpc_ms,
+                    log_ms,
+                    if log_result.is_ok() {
+                        "completed"
+                    } else {
+                        "timeout"
+                    },
+                    set_ms,
+                    t0.elapsed().as_millis()
+                );
+            });
+
+            let pid = start_resp.pid;
+            let rpc_ms = t_rpc.elapsed().as_millis();
+            info!("started container {} pid={}", container_id, pid);
+            info!(
+                "TIMING start_container {}: erofs={}ms rpc={}ms total={}ms first_boot={}",
+                container_id,
+                erofs_ms,
+                rpc_ms,
+                t_total.elapsed().as_millis(),
+                is_first_container
+            );
+            Ok(pid)
+        }
     }
 }
 
@@ -1136,7 +1359,7 @@ fn erofs_cache_key_from_mountinfo(
 /// Stable 128-bit hash (SipHash-like, deterministic across Rust versions).
 /// Uses FNV-1a 128-bit, which is simple, stable, and collision-resistant
 /// enough for a filesystem cache key.
-fn stable_hash_hex(input: &str) -> String {
+pub fn stable_hash_hex(input: &str) -> String {
     const FNV_OFFSET: u128 = 0x6c62272e07bb0142_62b821756295c58d;
     const FNV_PRIME: u128 = 0x0000000001000000_000000000000013b;
     let mut hash = FNV_OFFSET;
@@ -1420,6 +1643,7 @@ fn detect_block_fs_type(device: &str) -> Option<String> {
 /// Uses `mkfs.erofs` to create a read-only erofs image from the rootfs
 /// directory. The shim passes this to the VM as a read-only virtio-blk device.
 #[cfg(test)]
+#[allow(dead_code)]
 fn create_rootfs_erofs_image(
     rootfs_path: &std::path::Path,
     disk_path: &std::path::Path,
@@ -1489,6 +1713,178 @@ fn read_volume_files(src: &std::path::Path) -> anyhow::Result<Vec<(String, Vec<u
     }
 
     Ok(files)
+}
+
+/// Attempt to restore a VM from a cached snapshot.
+/// Patches the snapshot config with this VM's CID/vsock and TAP device,
+/// restores, resumes, and hot-plugs container rootfs disks.
+///
+/// Networking is handled by patching the TAP name and MAC in the snapshot
+/// config BEFORE restore. This means the restored VM wakes up with its
+/// virtio-net device (eth0) already wired to the new pod's TAP — no PCI
+/// hot-plug needed, no device discovery race.
+async fn try_restore(
+    vm_state: &SharedVmState,
+    snap_key: &str,
+    rootfs_disks: &[(std::path::PathBuf, String, bool)],
+) -> Result<(), Error> {
+    // Patch snapshot config with this VM's CID, vsock socket, and TAP device
+    let patched_dir = crate::snapshot::prepare_snapshot_for_vm(
+        snap_key,
+        vm_state.vm.state_dir(),
+        vm_state.vm.cid(),
+        &vm_state.vsock_socket,
+        vm_state.tap_name.as_deref(),
+        vm_state.tap_mac.as_deref(),
+    )
+    .ctx("prepare snapshot")?;
+
+    // Restore from patched snapshot (CoW memory)
+    vm_state
+        .vm
+        .restore_from_snapshot(&patched_dir)
+        .await
+        .ctx("restore from snapshot")?;
+
+    // Resume the VM
+    vm_state.vm.resume().await.ctx("resume after restore")?;
+
+    // Hot-plug container rootfs disks
+    for (path, id, readonly) in rootfs_disks {
+        let disk_json = serde_json::json!({
+            "path": path.to_string_lossy(),
+            "readonly": *readonly,
+            "id": id,
+        });
+        VmManager::api_request_to_socket(
+            &vm_state.api_socket,
+            "PUT",
+            "/api/v1/vm.add-disk",
+            Some(&disk_json.to_string()),
+        )
+        .await
+        .ctx("hot-plug rootfs after restore")?;
+    }
+
+    Ok(())
+}
+
+/// Create a golden VM snapshot and store it in the cache.
+/// Called asynchronously after a successful cold boot — doesn't block pod startup.
+async fn create_snapshot_for_cache(
+    api_socket: &std::path::Path,
+    cache_key: &str,
+    container_info: &tokio::sync::Mutex<Vec<(String, String, u32)>>,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let _lock = crate::snapshot::snapshot_cache_lock(cache_key).await?;
+
+    // Check again under lock — another shim may have created it
+    if crate::snapshot::snapshot_cache_hit(cache_key) {
+        return Ok(());
+    }
+
+    // Snapshot into a temp dir, then move into cache
+    let tmp_dir = std::path::PathBuf::from("/run/cloudhv/snapshot-cache")
+        .join(format!("{cache_key}.{}.tmp", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir)?;
+
+    // Pause → snapshot → resume (VM stays running for the current pod)
+    VmManager::api_request_to_socket(api_socket, "PUT", "/api/v1/vm.pause", None)
+        .await
+        .context("pause for snapshot")?;
+
+    let url = format!("file://{}", tmp_dir.display());
+    let body = serde_json::json!({"destination_url": url});
+    let snap_result = VmManager::api_request_to_socket(
+        api_socket,
+        "PUT",
+        "/api/v1/vm.snapshot",
+        Some(&body.to_string()),
+    )
+    .await;
+
+    // Always resume, even if snapshot failed
+    if let Err(e) =
+        VmManager::api_request_to_socket(api_socket, "PUT", "/api/v1/vm.resume", None).await
+    {
+        log::error!("vm.resume after snapshot failed: {e:#}");
+    }
+
+    if snap_result.is_err() {
+        // Best-effort cleanup of temporary snapshot directory on snapshot failure.
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    snap_result.context("vm.snapshot")?;
+
+    // Strip `ip=…` from kernel cmdline so the cached snapshot doesn't bake
+    // in a pod-specific IP. The TAP/net device config is KEPT — it will be
+    // patched to the new pod's TAP name and MAC during prepare_snapshot_for_vm.
+    if let Err(e) = strip_kernel_ip_from_dir(&tmp_dir) {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(e);
+    }
+
+    if let Err(e) = crate::snapshot::snapshot_cache_store(cache_key, &tmp_dir) {
+        // Best-effort cleanup of temporary snapshot directory on cache store failure.
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(e);
+    }
+
+    // Save container metadata alongside the snapshot so warm restores can
+    // call AdoptContainer to re-register the running container under a new ID.
+    {
+        let infos = container_info.lock().await;
+        let metadata = crate::snapshot::SnapshotMetadata {
+            containers: infos
+                .iter()
+                .map(|(cid, key, pid)| crate::snapshot::SnapshotContainerInfo {
+                    image_key: key.clone(),
+                    container_id: cid.clone(),
+                    pid: *pid,
+                })
+                .collect(),
+        };
+        if let Err(e) = crate::snapshot::save_snapshot_metadata(cache_key, &metadata) {
+            log::info!("save snapshot metadata failed (non-fatal): {e:#}");
+        } else {
+            info!(
+                "snapshot metadata saved: {} container(s)",
+                metadata.containers.len()
+            );
+        }
+    }
+
+    info!("golden snapshot created and cached: {cache_key}");
+    Ok(())
+}
+
+/// Remove `ip=…` kernel cmdline params from a snapshot directory's
+/// `config.json`. The TAP/net device config is intentionally KEPT so
+/// the restored VM wakes up with the same virtio-net device — we just
+/// patch the TAP name and MAC during prepare_snapshot_for_vm.
+fn strip_kernel_ip_from_dir(dir: &std::path::Path) -> anyhow::Result<()> {
+    let config_path = dir.join("config.json");
+    let config_str = std::fs::read_to_string(&config_path)?;
+    let mut config: serde_json::Value = serde_json::from_str(&config_str)?;
+
+    // Strip ip=... from kernel cmdline
+    if let Some(cmdline) = config.pointer_mut("/payload/cmdline") {
+        if let Some(s) = cmdline.as_str() {
+            let stripped = s
+                .split_whitespace()
+                .filter(|part| !part.starts_with("ip="))
+                .collect::<Vec<_>>()
+                .join(" ");
+            *cmdline = serde_json::json!(stripped);
+        }
+    }
+
+    std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
+    log::info!("stripped kernel ip= from snapshot dir {}", dir.display());
+    Ok(())
 }
 
 /// Convert a CIDR prefix length to a dotted-decimal netmask.

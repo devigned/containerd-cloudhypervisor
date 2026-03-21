@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::proto::agent::*;
 use crate::proto::agent_ttrpc::{self, AgentService, HealthService};
@@ -286,6 +287,120 @@ impl AgentService for AgentServiceHandler {
         }
         Ok(resp)
     }
+
+    async fn configure_network(
+        &self,
+        _ctx: &TtrpcContext,
+        req: ConfigureNetworkRequest,
+    ) -> ttrpc::Result<ConfigureNetworkResponse> {
+        let device = if req.device.is_empty() {
+            "eth0"
+        } else {
+            &req.device
+        };
+
+        let mac = if req.mac.is_empty() {
+            None
+        } else {
+            Some(req.mac.as_str())
+        };
+
+        info!(
+            "RPC: configure_network dev={} mac={:?} ip={}/{} gw={}",
+            device, mac, req.ip_address, req.prefix_len, req.gateway
+        );
+
+        // Only wait for sysfs device if not using MAC-based lookup.
+        // MAC-based lookup retries internally via retry_find_by_mac.
+        if mac.is_none() {
+            wait_for_device(device)
+                .await
+                .map_err(|e| ttrpc::Error::Others(format!("device wait: {e}")))?;
+        }
+
+        let ip: std::net::Ipv4Addr = req
+            .ip_address
+            .parse()
+            .map_err(|e| ttrpc::Error::Others(format!("invalid IP: {e}")))?;
+        let gw: Option<std::net::Ipv4Addr> = if req.gateway.is_empty() {
+            None
+        } else {
+            Some(
+                req.gateway
+                    .parse()
+                    .map_err(|e| ttrpc::Error::Others(format!("invalid gateway: {e}")))?,
+            )
+        };
+
+        let prefix_len: u8 = u8::try_from(req.prefix_len).map_err(|_| {
+            ttrpc::Error::Others("invalid prefix_len: must be between 0 and 32".to_string())
+        })?;
+        if prefix_len > 32 {
+            return Err(ttrpc::Error::Others(
+                "invalid prefix_len: must be between 0 and 32".to_string(),
+            ));
+        }
+
+        let device_owned = device.to_string();
+        let mac_owned = mac.map(|m| m.to_string());
+        tokio::task::spawn_blocking(move || {
+            cloudhv_common::netlink::configure_interface(
+                &device_owned,
+                ip,
+                prefix_len,
+                gw,
+                mac_owned.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| ttrpc::Error::Others(format!("spawn_blocking: {e}")))?
+        .map_err(|e| ttrpc::Error::Others(format!("configure_interface: {e:#}")))?;
+
+        info!(
+            "configure_network: {} configured via netlink (mac={:?})",
+            device, mac
+        );
+        Ok(ConfigureNetworkResponse::new())
+    }
+
+    async fn adopt_container(
+        &self,
+        _ctx: &TtrpcContext,
+        req: AdoptContainerRequest,
+    ) -> ttrpc::Result<AdoptContainerResponse> {
+        info!(
+            "RPC: adopt_container old={} new={}",
+            req.old_container_id, req.new_container_id
+        );
+        let mut mgr = self.container_manager.lock().await;
+        let pid = mgr
+            .adopt(&req.old_container_id, &req.new_container_id)
+            .map_err(|e| ttrpc::Error::Others(format!("adopt_container failed: {e:#}")))?;
+        let mut resp = AdoptContainerResponse::new();
+        resp.pid = pid;
+        Ok(resp)
+    }
+}
+
+/// Wait for a network device to appear in /sys/class/net/.
+/// Polls every 50ms for up to 5 seconds.
+async fn wait_for_device(device: &str) -> anyhow::Result<()> {
+    let path = format!("/sys/class/net/{}", device);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
+    while tokio::time::Instant::now() < deadline {
+        if std::path::Path::new(&path).exists() {
+            info!("network device {} appeared", device);
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    anyhow::bail!(
+        "timed out waiting for device {} to appear at {}",
+        device,
+        path
+    )
 }
 
 struct HealthServiceHandler;

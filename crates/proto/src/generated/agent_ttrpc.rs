@@ -80,6 +80,16 @@ impl AgentServiceClient {
         let mut cres = super::agent::GetContainerLogsResponse::new();
         ::ttrpc::async_client_request!(self, ctx, req, "cloudhv.agent.AgentService", "GetContainerLogs", cres);
     }
+
+    pub async fn configure_network(&self, ctx: ttrpc::context::Context, req: &super::agent::ConfigureNetworkRequest) -> ::ttrpc::Result<super::agent::ConfigureNetworkResponse> {
+        let mut cres = super::agent::ConfigureNetworkResponse::new();
+        ::ttrpc::async_client_request!(self, ctx, req, "cloudhv.agent.AgentService", "ConfigureNetwork", cres);
+    }
+
+    pub async fn adopt_container(&self, ctx: ttrpc::context::Context, req: &super::agent::AdoptContainerRequest) -> ::ttrpc::Result<super::agent::AdoptContainerResponse> {
+        let mut cres = super::agent::AdoptContainerResponse::new();
+        ::ttrpc::async_client_request!(self, ctx, req, "cloudhv.agent.AgentService", "AdoptContainer", cres);
+    }
 }
 
 struct CreateContainerMethod {
@@ -192,6 +202,28 @@ impl ::ttrpc::r#async::MethodHandler for GetContainerLogsMethod {
     }
 }
 
+struct ConfigureNetworkMethod {
+    service: Arc<Box<dyn AgentService + Send + Sync>>,
+}
+
+#[async_trait]
+impl ::ttrpc::r#async::MethodHandler for ConfigureNetworkMethod {
+    async fn handler(&self, ctx: ::ttrpc::r#async::TtrpcContext, req: ::ttrpc::Request) -> ::ttrpc::Result<::ttrpc::Response> {
+        ::ttrpc::async_request_handler!(self, ctx, req, agent, ConfigureNetworkRequest, configure_network);
+    }
+}
+
+struct AdoptContainerMethod {
+    service: Arc<Box<dyn AgentService + Send + Sync>>,
+}
+
+#[async_trait]
+impl ::ttrpc::r#async::MethodHandler for AdoptContainerMethod {
+    async fn handler(&self, ctx: ::ttrpc::r#async::TtrpcContext, req: ::ttrpc::Request) -> ::ttrpc::Result<::ttrpc::Response> {
+        ::ttrpc::async_request_handler!(self, ctx, req, agent, AdoptContainerRequest, adopt_container);
+    }
+}
+
 #[async_trait]
 pub trait AgentService: Sync {
     async fn create_container(&self, _ctx: &::ttrpc::r#async::TtrpcContext, _: super::agent::CreateContainerRequest) -> ::ttrpc::Result<super::agent::CreateContainerResponse> {
@@ -223,6 +255,12 @@ pub trait AgentService: Sync {
     }
     async fn get_container_logs(&self, _ctx: &::ttrpc::r#async::TtrpcContext, _: super::agent::GetContainerLogsRequest) -> ::ttrpc::Result<super::agent::GetContainerLogsResponse> {
         Err(::ttrpc::Error::RpcStatus(::ttrpc::get_status(::ttrpc::Code::NOT_FOUND, "/cloudhv.agent.AgentService/GetContainerLogs is not supported".to_string())))
+    }
+    async fn configure_network(&self, _ctx: &::ttrpc::r#async::TtrpcContext, _: super::agent::ConfigureNetworkRequest) -> ::ttrpc::Result<super::agent::ConfigureNetworkResponse> {
+        Err(::ttrpc::Error::RpcStatus(::ttrpc::get_status(::ttrpc::Code::NOT_FOUND, "/cloudhv.agent.AgentService/ConfigureNetwork is not supported".to_string())))
+    }
+    async fn adopt_container(&self, _ctx: &::ttrpc::r#async::TtrpcContext, _: super::agent::AdoptContainerRequest) -> ::ttrpc::Result<super::agent::AdoptContainerResponse> {
+        Err(::ttrpc::Error::RpcStatus(::ttrpc::get_status(::ttrpc::Code::NOT_FOUND, "/cloudhv.agent.AgentService/AdoptContainer is not supported".to_string())))
     }
 }
 
@@ -260,6 +298,12 @@ pub fn create_agent_service(service: Arc<Box<dyn AgentService + Send + Sync>>) -
 
     methods.insert("GetContainerLogs".to_string(),
                     Box::new(GetContainerLogsMethod{service: service.clone()}) as Box<dyn ::ttrpc::r#async::MethodHandler + Send + Sync>);
+
+    methods.insert("ConfigureNetwork".to_string(),
+                    Box::new(ConfigureNetworkMethod{service: service.clone()}) as Box<dyn ::ttrpc::r#async::MethodHandler + Send + Sync>);
+
+    methods.insert("AdoptContainer".to_string(),
+                    Box::new(AdoptContainerMethod{service: service.clone()}) as Box<dyn ::ttrpc::r#async::MethodHandler + Send + Sync>);
 
     ret.insert("cloudhv.agent.AgentService".to_string(), ::ttrpc::r#async::Service{ methods, streams });
     ret

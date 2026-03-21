@@ -279,7 +279,8 @@ impl VmManager {
         Ok(())
     }
 
-    /// Wait for the guest agent to become responsive.
+    /// Wait for the guest agent to start responding on vsock.
+    #[allow(dead_code)]
     pub async fn wait_for_agent(&self) -> Result<()> {
         info!(
             "waiting for guest agent on vsock (cid={}, timeout={}s)",
@@ -289,10 +290,6 @@ impl VmManager {
         let deadline = tokio::time::Instant::now()
             + Duration::from_secs(self.config.agent_startup_timeout_secs);
 
-        // Poll aggressively — the guest kernel boots in ~200ms and the
-        // agent starts immediately after. Each probe uses a blocking
-        // CONNECT handshake that returns instantly when the agent is
-        // listening, or returns 0 bytes / error when it's not.
         while tokio::time::Instant::now() < deadline {
             if self.check_agent_health().await.unwrap_or(false) {
                 info!("guest agent is ready (cid={})", self.cid);
@@ -308,9 +305,6 @@ impl VmManager {
     }
 
     /// Check if the guest agent is responding on vsock.
-    ///
-    /// Sends a CONNECT handshake to CH's vsock socket and checks
-    /// for an "OK" response from the guest agent.
     async fn check_agent_health(&self) -> Result<bool> {
         if !self.vsock_socket.exists() {
             return Ok(false);
@@ -320,8 +314,6 @@ impl VmManager {
             Ok(s) => s,
             Err(_) => return Ok(false),
         };
-
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (mut reader, mut writer) = stream.into_split();
         let cmd = format!("CONNECT {}\n", cloudhv_common::AGENT_VSOCK_PORT);
@@ -415,6 +407,82 @@ impl VmManager {
         Self::api_request_to_socket(&self.api_socket, method, path, body).await
     }
 
+    // --- Snapshot / Restore ---
+
+    /// Resume a paused VM.
+    pub async fn resume(&self) -> Result<()> {
+        self.api_request("PUT", "/api/v1/vm.resume", None)
+            .await
+            .context("vm.resume")?;
+        info!("VM {} resumed", self.vm_id);
+        Ok(())
+    }
+
+    /// Restore a VM from a snapshot directory. The VM is restored in a paused state.
+    /// Uses userfaultfd-based on-demand paging (CoW) for memory.
+    pub async fn restore_from_snapshot(&self, source_dir: &Path) -> Result<()> {
+        let url = format!("file://{}", source_dir.display());
+        let body = serde_json::json!({
+            "source_url": url,
+            "prefault": false,
+        });
+        self.api_request("PUT", "/api/v1/vm.restore", Some(&body.to_string()))
+            .await
+            .context("vm.restore")?;
+        info!(
+            "VM {} restored from {} (CoW)",
+            self.vm_id,
+            source_dir.display()
+        );
+        Ok(())
+    }
+
+    /// Hot-plug a TAP network device into the VM.
+    #[allow(dead_code)]
+    pub async fn add_net(&self, tap_name: &str, mac: Option<&str>) -> Result<()> {
+        let mut net_config = serde_json::json!({
+            "tap": tap_name,
+        });
+        if let Some(m) = mac {
+            net_config
+                .as_object_mut()
+                .unwrap()
+                .insert("mac".to_string(), serde_json::json!(m));
+        }
+        let body = net_config.to_string();
+        info!("hot-plugging TAP {} to VM {}", tap_name, self.vm_id);
+        self.api_request("PUT", "/api/v1/vm.add-net", Some(&body))
+            .await
+            .context("vm.add-net")?;
+        info!("TAP {} hot-plugged to VM {}", tap_name, self.vm_id);
+        Ok(())
+    }
+
+    /// Hot-plug a TAP device via API socket path (static method).
+    #[allow(dead_code)]
+    pub async fn add_net_to_socket(
+        api_socket: &Path,
+        tap_name: &str,
+        mac: Option<&str>,
+    ) -> Result<()> {
+        let mut net_config = serde_json::json!({"tap": tap_name});
+        if let Some(m) = mac {
+            net_config
+                .as_object_mut()
+                .unwrap()
+                .insert("mac".to_string(), serde_json::json!(m));
+        }
+        Self::api_request_to_socket(
+            api_socket,
+            "PUT",
+            "/api/v1/vm.add-net",
+            Some(&net_config.to_string()),
+        )
+        .await
+        .context("vm.add-net (static)")?;
+        Ok(())
+    }
+
     /// Shutdown the VM gracefully.
     pub async fn shutdown(&mut self) -> Result<()> {
         info!("shutting down VM {}", self.vm_id);
@@ -477,10 +545,6 @@ impl VmManager {
 
     // --- Accessors ---
 
-    pub fn vm_id(&self) -> &str {
-        &self.vm_id
-    }
-
     pub fn vsock_socket(&self) -> &Path {
         &self.vsock_socket
     }
@@ -489,16 +553,8 @@ impl VmManager {
         &self.shared_dir
     }
 
-    pub fn state_dir(&self) -> &Path {
-        &self.state_dir
-    }
-
     pub fn api_socket_path(&self) -> &Path {
         &self.api_socket
-    }
-
-    pub fn cid(&self) -> u64 {
-        self.cid
     }
 
     /// Append extra parameters to the kernel command line.
@@ -511,7 +567,26 @@ impl VmManager {
         self.ch_process.as_ref().and_then(|c| c.id())
     }
 
-    /// Hot-plug a block device into the VM.
+    /// Get the runtime config.
+    pub fn config(&self) -> &RuntimeConfig {
+        &self.config
+    }
+
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    pub fn cid(&self) -> u64 {
+        self.cid
+    }
+
+    #[allow(dead_code)]
+    pub fn vm_id(&self) -> &str {
+        &self.vm_id
+    }
+
+    /// Hot-plug a disk to the running VM via the Cloud Hypervisor API.
+    #[allow(dead_code)]
     pub async fn add_disk(&self, path: &str, disk_id: &str, readonly: bool) -> Result<()> {
         let disk = VmDisk {
             path: path.to_string(),
@@ -531,6 +606,7 @@ impl VmManager {
     }
 
     /// Resize the VM's vCPUs and/or memory.
+    #[allow(dead_code)]
     pub async fn resize(
         &self,
         desired_vcpus: Option<u32>,

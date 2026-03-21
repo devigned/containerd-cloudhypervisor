@@ -1,5 +1,5 @@
-// Suppress removed lints from ttrpc-codegen generated code
 #![allow(unknown_lints)]
+#![deny(dead_code)]
 
 use log::{error, info};
 use nix::unistd::getpid;

@@ -36,6 +36,18 @@ service AgentService {
 
     // GetContainerLogs returns buffered stdout/stderr from a container.
     rpc GetContainerLogs(GetContainerLogsRequest) returns (GetContainerLogsResponse);
+
+    // ConfigureNetwork sets up a network interface inside the guest VM.
+    // Used after snapshot-restore when a TAP device is hot-plugged and the
+    // guest kernel needs its interface configured with the pod's IP address.
+    rpc ConfigureNetwork(ConfigureNetworkRequest) returns (ConfigureNetworkResponse);
+
+    // AdoptContainer re-registers a running container under a new ID.
+    // Used after warm snapshot restore: the container process is already
+    // running under the old (snapshotted) ID, but the new pod assigns a
+    // different container ID. The agent moves the internal bookkeeping so
+    // that kill/wait/state RPCs work with the new ID.
+    rpc AdoptContainer(AdoptContainerRequest) returns (AdoptContainerResponse);
 }
 
 // HealthService provides health checking for the guest agent.
@@ -230,4 +242,27 @@ message GetContainerLogsResponse {
     bytes stderr = 2;
     uint64 offset = 3;   // new offset after this read
     bool eof = 4;         // true if container exited and all output captured
+}
+
+// --- ConfigureNetwork ---
+
+message ConfigureNetworkRequest {
+    string ip_address = 1;    // e.g. "10.224.0.51"
+    string gateway = 2;       // e.g. "169.254.1.1"
+    uint32 prefix_len = 3;    // e.g. 16
+    string device = 4;        // e.g. "eth0" (fallback if mac is empty)
+    string mac = 5;           // e.g. "66:de:08:19:b5:58" — if set, find device by MAC
+}
+
+message ConfigureNetworkResponse {}
+
+// --- AdoptContainer ---
+
+message AdoptContainerRequest {
+    string old_container_id = 1;  // container ID from the snapshot
+    string new_container_id = 2;  // container ID assigned by the new pod
+}
+
+message AdoptContainerResponse {
+    uint32 pid = 1;  // PID of the adopted container process
 }

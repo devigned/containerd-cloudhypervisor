@@ -13,24 +13,39 @@ spec:
       containers:
         - name: python-runtime
           image: us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/python-runtime-sandbox:latest-main
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8888
+          # Startup probe: aggressive polling (every 1s) to detect readiness
+          # as fast as possible. Handles both cold boot (~15-20s for Python)
+          # and warm restore (~400ms — workload already listening).
+          # failureThreshold × periodSeconds = 60s max startup budget.
+          startupProbe:
+            httpGet:
+              path: "/"
+              port: 8888
+            initialDelaySeconds: 1
+            periodSeconds: 1
+            timeoutSeconds: 2
+            failureThreshold: 60
+          # Readiness probe: only runs after startup probe passes.
+          # Light-touch check that the server is still accepting requests.
           readinessProbe:
             httpGet:
               path: "/"
               port: 8888
-            initialDelaySeconds: 15
             periodSeconds: 5
-            timeoutSeconds: 5
-            failureThreshold: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Liveness probe: only runs after startup probe passes.
+          # Restarts the container if the server becomes unresponsive.
           livenessProbe:
             httpGet:
               path: "/"
               port: 8888
-            initialDelaySeconds: 30
             periodSeconds: 10
             timeoutSeconds: 5
-            failureThreshold: 10
+            failureThreshold: 3
           resources:
             requests:
               cpu: "100m"

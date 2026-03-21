@@ -85,32 +85,4 @@ impl VsockClient {
         info!("ttrpc client connected to guest agent");
         Ok((agent_client, health_client))
     }
-
-    /// Send a health check to the guest agent via ttrpc.
-    /// Returns true if the agent is healthy and responding.
-    pub async fn health_check(&self) -> Result<bool> {
-        match self.connect_ttrpc().await {
-            Ok((_agent, health)) => {
-                let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(5));
-                let req = cloudhv_proto::CheckRequest::new();
-                match health.check(ctx, &req).await {
-                    Ok(resp) => {
-                        info!(
-                            "agent health check: ready={}, version={}",
-                            resp.ready, resp.version
-                        );
-                        Ok(resp.ready)
-                    }
-                    Err(e) => {
-                        debug!("health check RPC failed: {}", e);
-                        Ok(false)
-                    }
-                }
-            }
-            Err(e) => {
-                debug!("health check connection failed: {}", e);
-                Ok(false)
-            }
-        }
-    }
 }

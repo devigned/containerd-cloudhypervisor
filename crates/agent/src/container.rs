@@ -635,6 +635,31 @@ impl ContainerManager {
     }
 
     /// Get a clone of the exit receiver for a container.
+    /// Re-register a container under a new ID (used after warm snapshot
+    /// restore). Moves all bookkeeping — container state, exit receiver,
+    /// and log buffer — from `old_id` to `new_id`.
+    /// Returns the PID of the adopted container.
+    #[allow(dead_code)]
+    pub fn adopt(&mut self, old_id: &str, new_id: &str) -> Result<u32> {
+        let container = self
+            .containers
+            .remove(old_id)
+            .ok_or_else(|| anyhow::anyhow!("adopt: container {old_id} not found"))?;
+        let pid = container
+            .pid
+            .ok_or_else(|| anyhow::anyhow!("adopt: container {old_id} has no PID"))?;
+
+        if let Some(rx) = self.exit_receivers.remove(old_id) {
+            self.exit_receivers.insert(new_id.to_string(), rx);
+        }
+        if let Some(buf) = self.logs.remove(old_id) {
+            self.logs.insert(new_id.to_string(), buf);
+        }
+        self.containers.insert(new_id.to_string(), container);
+        info!("adopted container {old_id} -> {new_id} pid={pid}");
+        Ok(pid)
+    }
+
     pub fn get_exit_receiver(&self, id: &str) -> Option<watch::Receiver<Option<ExitStatus>>> {
         self.exit_receivers.get(id).cloned()
     }
