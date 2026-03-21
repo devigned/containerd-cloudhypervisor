@@ -311,15 +311,31 @@ impl ContainerManager {
                     wait_for_dev_inotify(&dev).await?;
                 }
 
-                mount(
-                    Some(dev.as_str()),
-                    &layer_mount,
-                    Some("erofs"),
-                    MsFlags::MS_RDONLY | MsFlags::MS_NOATIME,
-                    None::<&str>,
-                )
-                .with_context(|| format!("mount erofs {} at {}", dev, layer_mount.display()))?;
-                info!("mounted erofs layer {} at {}", dev, layer_mount.display());
+                // Retry mount — the device node may exist before the block device
+                // driver is fully initialized (ENXIO). Tight poll for up to 500ms.
+                let mount_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_millis(500);
+                loop {
+                    match mount(
+                        Some(dev.as_str()),
+                        &layer_mount,
+                        Some("erofs"),
+                        MsFlags::MS_RDONLY | MsFlags::MS_NOATIME,
+                        None::<&str>,
+                    ) {
+                        Ok(()) => {
+                            info!("mounted erofs layer {} at {}", dev, layer_mount.display());
+                            break;
+                        }
+                        Err(e) if std::time::Instant::now() < mount_deadline => {
+                            // Device node exists but driver not ready — yield and retry
+                            tokio::task::yield_now().await;
+                        }
+                        Err(e) => {
+                            anyhow::bail!("mount erofs {} at {}: {e}", dev, layer_mount.display());
+                        }
+                    }
+                }
 
                 lowerdirs.push(layer_mount.to_string_lossy().to_string());
             }
