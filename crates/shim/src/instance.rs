@@ -109,14 +109,34 @@ async fn get_or_connect_agent(
         .get_or_try_init(|| async {
             let vsock_client = crate::vsock::VsockClient::new(&vm_state.vsock_socket);
 
-            // Retry with exponential backoff + jitter.
-            // Base delay doubles each attempt: 200ms, 400ms, 800ms, 1600ms, 3000ms, ...
-            // Jitter adds ±50% to each delay to desynchronize concurrent boots.
-            // Overall deadline: 60s hard cap regardless of attempt count.
+            // Phase 1: Tight poll for the first 500ms — the agent is typically
+            // ready within 100-200ms after kernel boot. Yielding instead of sleeping
+            // eliminates the ~50-75ms backoff delay waste.
+            let tight_poll_deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+            let mut tight_attempts = 0u32;
+            while tokio::time::Instant::now() < tight_poll_deadline {
+                match vsock_client.connect_ttrpc().await {
+                    Ok((agent, _health)) => {
+                        if tight_attempts > 0 {
+                            info!("agent connected after {tight_attempts} tight-poll attempts");
+                        }
+                        return Ok(agent);
+                    }
+                    Err(_) => {
+                        tight_attempts += 1;
+                        // Yield to let other tasks run, then retry immediately
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+
+            // Phase 2: Exponential backoff for slow/contended boots (>500ms).
+            // This should be rare in normal operation.
             let max_attempts = 10u32;
-            let base_delay_ms = 50u64;
+            let base_delay_ms = 200u64;
             let max_delay_ms = 3000u64;
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(55);
             let mut last_err = String::new();
 
             for attempt in 0..max_attempts {
@@ -124,19 +144,17 @@ async fn get_or_connect_agent(
                     break;
                 }
 
-                // Try to connect directly — no separate health-check poll to avoid
-                // connection churn and log spam under load.
                 match vsock_client.connect_ttrpc().await {
                     Ok((agent, _health)) => {
-                        if attempt > 0 {
-                            info!("agent connected after {attempt} retries");
-                        }
+                        info!(
+                            "agent connected after {} tight + {} backoff attempts",
+                            tight_attempts, attempt
+                        );
                         return Ok(agent);
                     }
                     Err(e) => {
                         last_err = format!("{e:#}");
                         if attempt < max_attempts - 1 && tokio::time::Instant::now() < deadline {
-                            // Exponential backoff with jitter
                             let exp_delay = base_delay_ms * 2u64.pow(attempt);
                             let capped = exp_delay.min(max_delay_ms);
                             let jitter_seed = (std::process::id() as u64)
@@ -145,17 +163,17 @@ async fn get_or_connect_agent(
                             let jitter_frac = (jitter_seed % 100) as f64 / 100.0;
                             let jitter_ms = (capped as f64 * (0.5 + jitter_frac)) as u64;
                             info!(
-                                "agent connect attempt {attempt} failed, retrying in {jitter_ms}ms: {last_err}"
+                                "agent connect backoff attempt {attempt} failed, retrying in {jitter_ms}ms: {last_err}"
                             );
-                            tokio::time::sleep(std::time::Duration::from_millis(jitter_ms))
-                                .await;
+                            tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
                         }
                     }
                 }
             }
 
             Err(Error::Any(anyhow::anyhow!(
-                "agent connect: {last_err} (after {max_attempts} attempts)"
+                "agent connect: {last_err} (after {} tight + {max_attempts} backoff attempts)",
+                tight_attempts
             )))
         })
         .await
