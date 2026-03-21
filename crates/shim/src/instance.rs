@@ -10,8 +10,6 @@ use containerd_shimkit::sandbox::Error;
 use log::info;
 use tokio::sync::OnceCell;
 
-use cloudhv_common::types::VmDisk;
-
 use crate::config::load_config;
 use crate::vm::VmManager;
 
@@ -84,6 +82,9 @@ struct SharedVmState {
     /// Containers running in this VM, for snapshot metadata.
     /// Each entry: (container_id, image_key, pid)
     container_info: tokio::sync::Mutex<Vec<(String, String, u32)>>,
+    /// Handle for the async eager boot task spawned in start_sandbox.
+    /// The first container takes this handle and awaits it.
+    eager_boot: tokio::sync::Mutex<Option<tokio::task::JoinHandle<Result<(), anyhow::Error>>>>,
 }
 
 /// Lazily connect to the guest agent over vsock, caching the client in the
@@ -105,7 +106,7 @@ async fn get_or_connect_agent(
             // Jitter adds ±50% to each delay to desynchronize concurrent boots.
             // Overall deadline: 60s hard cap regardless of attempt count.
             let max_attempts = 10u32;
-            let base_delay_ms = 200u64;
+            let base_delay_ms = 50u64;
             let max_delay_ms = 3000u64;
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
             let mut last_err = String::new();
@@ -425,11 +426,6 @@ impl CloudHvInstance {
         vm.wait_vmm_ready().await.ctx("vmm")?;
         let vmm_ready_ms = t_vmm.elapsed().as_millis();
 
-        // VM boot is deferred to start_container() — the CH process is
-        // spawned and listening on the API socket, but the VM is not yet
-        // created/booted.  The first container's rootfs will be pre-attached
-        // at boot time as /dev/vdb, eliminating hot-plug discovery latency.
-
         let vsock_socket = vm.vsock_socket().to_path_buf();
         let shared_dir = vm.shared_dir().to_path_buf();
         let api_socket = vm.api_socket_path().to_path_buf();
@@ -476,7 +472,48 @@ impl CloudHvInstance {
             netns: sandbox_spec.netns.clone(),
             cgroups_path: sandbox_spec.cgroups_path.clone(),
             container_info: tokio::sync::Mutex::new(Vec::new()),
+            eager_boot: tokio::sync::Mutex::new(None),
         });
+
+        // Spawn eager boot: create and boot the VM with only the guest rootfs
+        // (no container disks). The agent connect also runs here. By the time
+        // start_container is called (~50-100ms later), boot is usually done.
+        // Container rootfs disks will be hot-plugged in start_container.
+        {
+            let vm_state_clone = vm_state.clone();
+            let handle = tokio::spawn(async move {
+                use anyhow::Context;
+                let t0 = std::time::Instant::now();
+
+                // Boot VM with no extra disks — only the guest rootfs (/dev/vda)
+                vm_state_clone
+                    .vm
+                    .create_and_boot_vm(
+                        vm_state_clone.tap_name.as_deref(),
+                        vm_state_clone.tap_mac.as_deref(),
+                        vec![], // no container disks — hot-plugged later
+                    )
+                    .await
+                    .context("eager boot: create_and_boot_vm")?;
+
+                let boot_ms = t0.elapsed().as_millis();
+
+                // Connect to agent — confirms kernel + agent are ready
+                get_or_connect_agent(&vm_state_clone)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+                let total_ms = t0.elapsed().as_millis();
+                log::info!(
+                    "eager boot complete: vm_boot={}ms agent_connect={}ms total={}ms",
+                    boot_ms,
+                    total_ms - boot_ms,
+                    total_ms
+                );
+                Ok(())
+            });
+            *vm_state.eager_boot.lock().await = Some(handle);
+        }
 
         VMS.write()
             .unwrap_or_else(|e| e.into_inner())
@@ -699,9 +736,10 @@ impl CloudHvInstance {
                 // server listening on 0.0.0.0:8888). This is the "golden" state.
                 //
                 // COLD BOOT (first pod per image on this node):
-                //   1. Boot VM with networking + rootfs pre-attached
-                //   2. Agent connects, container starts, workload warms up
-                //   3. After 20s warmup: pause VM → snapshot → resume → cache
+                //   1. VM booted eagerly in start_sandbox (no container disks)
+                //   2. Container rootfs hot-plugged here
+                //   3. Agent connects, container starts, workload warms up
+                //   4. After 20s warmup: pause VM → snapshot → resume → cache
                 //   4. The snapshot includes the RUNNING workload process
                 //
                 // RESTORE (all subsequent pods with same image):
@@ -712,21 +750,6 @@ impl CloudHvInstance {
                 //   3. Configure guest IP via ConfigureNetwork agent RPC
                 //   4. SKIP RunContainer — the container is already alive
                 //   5. Traffic flows immediately (workload binds 0.0.0.0)
-                //
-                // WHY THIS WORKS:
-                //
-                // The workload (e.g. Python uvicorn) binds to 0.0.0.0:<port>,
-                // which accepts connections on ALL interfaces. The snapshot's
-                // config.json is patched at restore time to reference the new
-                // pod's TAP device and MAC address. On restore the VM boots
-                // with the patched TAP already attached as eth0. Since the
-                // workload listens on 0.0.0.0, it automatically accepts
-                // connections on the new interface — no rebind needed.
-                //
-                // The container rootfs (erofs image) is part of the snapshot memory
-                // (it was mounted when the workload started). The same image is used
-                // for all pods with the same container image, so the rootfs in the
-                // snapshot matches what the new pod expects.
                 //
                 // ────────────────────────────────────────────────────────────
 
@@ -743,6 +766,14 @@ impl CloudHvInstance {
                 let restored = if crate::snapshot::snapshot_cache_hit(&snap_key) {
                     let snap_dir = crate::snapshot::snapshot_cache_dir(&snap_key);
                     info!("snapshot cache hit: {}", snap_dir.display());
+
+                    // Snapshot restore doesn't use the eagerly-booted VM — it restores
+                    // a complete VM from the snapshot. Cancel the eager boot.
+                    if let Some(handle) = vm_state.eager_boot.lock().await.take() {
+                        handle.abort();
+                        info!("cancelled eager boot (snapshot restore takes over)");
+                    }
+
                     match try_restore(&vm_state, &snap_key, &rootfs_disks).await {
                         Ok(()) => true,
                         Err(e) => {
@@ -755,29 +786,46 @@ impl CloudHvInstance {
                 };
 
                 if !restored {
-                    // Cold boot path — create and boot VM with pre-attached rootfs
-                    let extra_disks: Vec<VmDisk> = rootfs_disks
-                        .iter()
-                        .map(|(path, id, readonly)| VmDisk {
-                            path: path.to_string_lossy().to_string(),
-                            readonly: *readonly,
-                            id: Some(id.clone()),
-                        })
-                        .collect();
-                    let boot_result = vm_state
-                        .vm
-                        .create_and_boot_vm(
-                            vm_state.tap_name.as_deref(),
-                            vm_state.tap_mac.as_deref(),
-                            extra_disks,
-                        )
-                        .await;
+                    // Cold boot path — await the eager boot that started in start_sandbox,
+                    // then hot-plug the container rootfs disk(s).
+                    if let Some(handle) = vm_state.eager_boot.lock().await.take() {
+                        match handle.await {
+                            Ok(Ok(())) => {
+                                info!("eager boot ready");
+                            }
+                            Ok(Err(e)) => {
+                                let msg = format!("{e:#}");
+                                *vm_state.boot_state.lock().await = BootState::Failed(msg.clone());
+                                vm_state.boot_complete.notify_waiters();
+                                return Err(Error::Any(anyhow::anyhow!(
+                                    "eager boot failed: {msg}"
+                                )));
+                            }
+                            Err(e) => {
+                                let msg = format!("eager boot task panicked: {e}");
+                                *vm_state.boot_state.lock().await = BootState::Failed(msg.clone());
+                                vm_state.boot_complete.notify_waiters();
+                                return Err(Error::Any(anyhow::anyhow!("{msg}")));
+                            }
+                        }
+                    }
 
-                    if let Err(e) = boot_result {
-                        let msg = format!("{e:#}");
-                        *vm_state.boot_state.lock().await = BootState::Failed(msg.clone());
-                        vm_state.boot_complete.notify_waiters();
-                        return Err(Error::Any(anyhow::anyhow!("boot with rootfs: {msg}")));
+                    // Hot-plug container rootfs disk(s) into the running VM
+                    for (path, id, readonly) in &rootfs_disks {
+                        let disk_json = serde_json::json!({
+                            "path": path.to_string_lossy(),
+                            "readonly": *readonly,
+                            "id": id,
+                        });
+                        VmManager::api_request_to_socket(
+                            &vm_state.api_socket,
+                            "PUT",
+                            "/api/v1/vm.add-disk",
+                            Some(&disk_json.to_string()),
+                        )
+                        .await
+                        .ctx("hot-plug container rootfs")?;
+                        info!("hot-plugged container rootfs: {} ({})", id, path.display());
                     }
                 }
                 info!("VM booted (restored={restored}): {disk_id}");
