@@ -507,7 +507,17 @@ impl CloudHvInstance {
         // (no container disks). The agent connect also runs here. By the time
         // start_container is called (~50-100ms later), boot is usually done.
         // Container rootfs disks will be hot-plugged in start_container.
-        {
+        //
+        // SKIP eager boot if the snapshot cache is non-empty — snapshot restore
+        // requires a fresh CH process with no existing VM. If snapshots exist,
+        // the first container will likely restore from one, making eager boot
+        // wasted work that also breaks the restore path.
+        let has_snapshots = std::path::Path::new("/run/cloudhv/snapshot-cache")
+            .read_dir()
+            .map(|mut d| d.any(|e| e.is_ok()))
+            .unwrap_or(false);
+
+        if !has_snapshots {
             let vm_state_clone = vm_state.clone();
             let handle = tokio::spawn(async move {
                 use anyhow::Context;
@@ -542,6 +552,8 @@ impl CloudHvInstance {
                 Ok(())
             });
             *vm_state.eager_boot.lock().await = Some(handle);
+        } else {
+            info!("snapshot cache exists — skipping eager boot (restore likely)");
         }
 
         VMS.write()
@@ -799,13 +811,6 @@ impl CloudHvInstance {
                 let restored = if crate::snapshot::snapshot_cache_hit(&snap_key) {
                     let snap_dir = crate::snapshot::snapshot_cache_dir(&snap_key);
                     info!("snapshot cache hit: {}", snap_dir.display());
-
-                    // Snapshot restore doesn't use the eagerly-booted VM — it restores
-                    // a complete VM from the snapshot. Cancel the eager boot.
-                    if let Some(handle) = vm_state.eager_boot.lock().await.take() {
-                        handle.abort();
-                        info!("cancelled eager boot (snapshot restore takes over)");
-                    }
 
                     match try_restore(&vm_state, &snap_key, &rootfs_disks).await {
                         Ok(()) => true,
