@@ -508,16 +508,16 @@ impl CloudHvInstance {
         // start_container is called (~50-100ms later), boot is usually done.
         // Container rootfs disks will be hot-plugged in start_container.
         //
-        // SKIP eager boot if the snapshot cache is non-empty — snapshot restore
-        // requires a fresh CH process with no existing VM. If snapshots exist,
-        // the first container will likely restore from one, making eager boot
-        // wasted work that also breaks the restore path.
-        let has_snapshots = std::path::Path::new("/run/cloudhv/snapshot-cache")
-            .read_dir()
-            .map(|mut d| d.any(|e| e.is_ok()))
-            .unwrap_or(false);
+        // SKIP eager boot if warm_restore is enabled AND the snapshot cache is
+        // non-empty — snapshot restore requires a fresh CH process with no
+        // existing VM. If warm_restore is disabled, always eager boot.
+        let skip_eager_boot = config.warm_restore
+            && std::path::Path::new("/run/cloudhv/snapshot-cache")
+                .read_dir()
+                .map(|mut d| d.any(|e| e.is_ok()))
+                .unwrap_or(false);
 
-        if !has_snapshots {
+        if !skip_eager_boot {
             let vm_state_clone = vm_state.clone();
             let handle = tokio::spawn(async move {
                 use anyhow::Context;
@@ -800,6 +800,7 @@ impl CloudHvInstance {
 
                 // Snapshot cache key includes VM config AND container image identity
                 // so different workload images get separate snapshots.
+                let warm_restore_enabled = vm_state.vm.config().warm_restore;
                 let snap_key = {
                     let base = crate::snapshot::snapshot_cache_key(vm_state.vm.config());
                     let erofs_id = erofs_cache_key(&rootfs_path)
@@ -808,20 +809,21 @@ impl CloudHvInstance {
                 };
 
                 // Try snapshot restore first (CoW — near-instant boot)
-                let restored = if crate::snapshot::snapshot_cache_hit(&snap_key) {
-                    let snap_dir = crate::snapshot::snapshot_cache_dir(&snap_key);
-                    info!("snapshot cache hit: {}", snap_dir.display());
+                let restored =
+                    if warm_restore_enabled && crate::snapshot::snapshot_cache_hit(&snap_key) {
+                        let snap_dir = crate::snapshot::snapshot_cache_dir(&snap_key);
+                        info!("snapshot cache hit: {}", snap_dir.display());
 
-                    match try_restore(&vm_state, &snap_key, &rootfs_disks).await {
-                        Ok(()) => true,
-                        Err(e) => {
-                            info!("snapshot restore failed, falling back to cold boot: {e:#}");
-                            false
+                        match try_restore(&vm_state, &snap_key, &rootfs_disks).await {
+                            Ok(()) => true,
+                            Err(e) => {
+                                info!("snapshot restore failed, falling back to cold boot: {e:#}");
+                                false
+                            }
                         }
-                    }
-                } else {
-                    false
-                };
+                    } else {
+                        false
+                    };
 
                 if !restored {
                     // Cold boot path — await the eager boot if it was started,
@@ -955,7 +957,10 @@ impl CloudHvInstance {
 
                 // After a successful cold boot, create a snapshot for future pods.
                 // Wait for the workload to warm up before snapshotting.
-                if !restored && !crate::snapshot::snapshot_cache_hit(&snap_key) {
+                if warm_restore_enabled
+                    && !restored
+                    && !crate::snapshot::snapshot_cache_hit(&snap_key)
+                {
                     let vm_api = vm_state.api_socket.clone();
                     let key = snap_key.clone();
                     let vm_state_ref = vm_state.clone();

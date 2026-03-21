@@ -8,14 +8,16 @@ The shim loads its configuration from `/opt/cloudhv/config.json` at startup.
 |-------|---------|-------------|
 | `cloud_hypervisor_binary` | `/usr/local/bin/cloud-hypervisor` | Path to CH binary |
 | `kernel_path` | — | Path to guest vmlinux |
-| `rootfs_path` | — | Path to guest rootfs.ext4 |
-| `kernel_args` | `console=hvc0 root=/dev/vda rw quiet init=/init net.ifnames=0` | Guest kernel cmdline (see [Architecture Notes](#architecture-notes)) |
+| `rootfs_path` | — | Path to guest rootfs.erofs |
+| `kernel_args` | `console=hvc0 root=/dev/vda rw quiet init=/init net.ifnames=0` | Guest kernel cmdline |
 | `default_vcpus` | `1` | Boot vCPUs per VM |
+| `max_default_vcpus` | `0` | Max vCPUs when no CPU limit (0 = host CPU count) |
 | `default_memory_mb` | `128` | Boot memory in MiB |
 | `max_containers_per_vm` | `5` | Max containers sharing a VM |
 | `hotplug_memory_mb` | `0` | Hotpluggable memory (0 = disabled) |
 | `hotplug_method` | `acpi` | `acpi` or `virtio-mem` |
 | `tpm_enabled` | `false` | Enable TPM 2.0 via swtpm |
+| `warm_restore` | `true` | Enable warm workload snapshots (see below) |
 
 ### Example
 
@@ -23,14 +25,30 @@ The shim loads its configuration from `/opt/cloudhv/config.json` at startup.
 {
   "cloud_hypervisor_binary": "/usr/local/bin/cloud-hypervisor",
   "kernel_path": "/opt/cloudhv/vmlinux",
-  "rootfs_path": "/opt/cloudhv/rootfs.ext4",
-  "kernel_args": "console=hvc0 root=/dev/vda rw quiet init=/init net.ifnames=0",
+  "rootfs_path": "/opt/cloudhv/rootfs.erofs",
+  "kernel_args": "console=ttyS0 root=/dev/vda rw init=/init net.ifnames=0",
   "default_vcpus": 1,
   "default_memory_mb": 512,
   "max_containers_per_vm": 5,
-  "tpm_enabled": false
+  "tpm_enabled": false,
+  "warm_restore": true
 }
 ```
+
+### Warm Restore
+
+When `warm_restore` is `true` (default), the shim snapshots the VM after
+the first pod's workload is fully running (~20s warmup). Subsequent pods
+with the same image restore from the snapshot with CoW memory (~300ms),
+waking up with the workload already serving. This provides:
+
+- **~5 MiB incremental memory per pod** (CoW page sharing)
+- **150/150 pods** on 3 × D8ds_v5 nodes
+- **Instant workload readiness** (no Python/Node startup)
+
+Set `warm_restore` to `false` to disable snapshots and use eager cold boot
+for every pod. This gives faster single-pod latency (~70ms vs ~300ms) but
+no memory sharing and requires full workload startup each time.
 
 ### Notes
 

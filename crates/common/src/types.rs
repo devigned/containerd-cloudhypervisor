@@ -58,6 +58,14 @@ pub struct RuntimeConfig {
     /// Enable TPM 2.0 device (requires swtpm installed on host)
     #[serde(default)]
     pub tpm_enabled: bool,
+
+    /// Enable warm workload snapshots for near-instant pod startup.
+    /// When enabled (default), the shim snapshots the VM after the first
+    /// pod's workload is fully running and restores subsequent pods from
+    /// the snapshot with CoW memory. Disable to use eager cold boot for
+    /// every pod (faster single-pod latency, no memory sharing).
+    #[serde(default = "default_warm_restore")]
+    pub warm_restore: bool,
 }
 
 fn default_ch_binary() -> String {
@@ -91,6 +99,9 @@ fn default_hotplug_memory_mb() -> u64 {
 }
 fn default_hotplug_method() -> String {
     "acpi".to_string()
+}
+fn default_warm_restore() -> bool {
+    true
 }
 
 /// Cloud Hypervisor VM configuration (JSON sent to CH API)
