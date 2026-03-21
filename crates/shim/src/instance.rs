@@ -10,10 +10,16 @@ use containerd_shimkit::sandbox::Error;
 use log::info;
 use tokio::sync::OnceCell;
 
-use cloudhv_common::types::VmDisk;
-
 use crate::config::load_config;
 use crate::vm::VmManager;
+
+/// Milliseconds since Unix epoch for absolute timestamps in TIMING logs.
+fn epoch_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
 
 /// Directory for cached erofs images shared across sandboxes.
 /// Same container image → same erofs image (keyed by content hash of
@@ -84,6 +90,9 @@ struct SharedVmState {
     /// Containers running in this VM, for snapshot metadata.
     /// Each entry: (container_id, image_key, pid)
     container_info: tokio::sync::Mutex<Vec<(String, String, u32)>>,
+    /// Handle for the async eager boot task spawned in start_sandbox.
+    /// The first container takes this handle and awaits it.
+    eager_boot: tokio::sync::Mutex<Option<tokio::task::JoinHandle<Result<(), anyhow::Error>>>>,
 }
 
 /// Lazily connect to the guest agent over vsock, caching the client in the
@@ -100,14 +109,38 @@ async fn get_or_connect_agent(
         .get_or_try_init(|| async {
             let vsock_client = crate::vsock::VsockClient::new(&vm_state.vsock_socket);
 
-            // Retry with exponential backoff + jitter.
-            // Base delay doubles each attempt: 200ms, 400ms, 800ms, 1600ms, 3000ms, ...
-            // Jitter adds ±50% to each delay to desynchronize concurrent boots.
-            // Overall deadline: 60s hard cap regardless of attempt count.
+            // Phase 1: Tight poll for the first 500ms — the agent is typically
+            // ready within 100-200ms after kernel boot. Yielding instead of sleeping
+            // eliminates the ~50-75ms backoff delay waste.
+            let tight_poll_deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+            let mut tight_attempts = 0u32;
+            while tokio::time::Instant::now() < tight_poll_deadline {
+                match vsock_client.connect_ttrpc().await {
+                    Ok((agent, _health)) => {
+                        if tight_attempts > 0 {
+                            info!("agent connected after {tight_attempts} tight-poll attempts");
+                        }
+                        return Ok(agent);
+                    }
+                    Err(_) => {
+                        tight_attempts += 1;
+                        if tight_attempts.is_multiple_of(50) {
+                            // Brief sleep every 50 attempts to prevent CPU spike
+                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        } else {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                }
+            }
+
+            // Phase 2: Exponential backoff for slow/contended boots (>500ms).
+            // This should be rare in normal operation.
             let max_attempts = 10u32;
             let base_delay_ms = 200u64;
             let max_delay_ms = 3000u64;
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(55);
             let mut last_err = String::new();
 
             for attempt in 0..max_attempts {
@@ -115,19 +148,17 @@ async fn get_or_connect_agent(
                     break;
                 }
 
-                // Try to connect directly — no separate health-check poll to avoid
-                // connection churn and log spam under load.
                 match vsock_client.connect_ttrpc().await {
                     Ok((agent, _health)) => {
-                        if attempt > 0 {
-                            info!("agent connected after {attempt} retries");
-                        }
+                        info!(
+                            "agent connected after {} tight + {} backoff attempts",
+                            tight_attempts, attempt
+                        );
                         return Ok(agent);
                     }
                     Err(e) => {
                         last_err = format!("{e:#}");
                         if attempt < max_attempts - 1 && tokio::time::Instant::now() < deadline {
-                            // Exponential backoff with jitter
                             let exp_delay = base_delay_ms * 2u64.pow(attempt);
                             let capped = exp_delay.min(max_delay_ms);
                             let jitter_seed = (std::process::id() as u64)
@@ -136,17 +167,17 @@ async fn get_or_connect_agent(
                             let jitter_frac = (jitter_seed % 100) as f64 / 100.0;
                             let jitter_ms = (capped as f64 * (0.5 + jitter_frac)) as u64;
                             info!(
-                                "agent connect attempt {attempt} failed, retrying in {jitter_ms}ms: {last_err}"
+                                "agent connect backoff attempt {attempt} failed, retrying in {jitter_ms}ms: {last_err}"
                             );
-                            tokio::time::sleep(std::time::Duration::from_millis(jitter_ms))
-                                .await;
+                            tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
                         }
                     }
                 }
             }
 
             Err(Error::Any(anyhow::anyhow!(
-                "agent connect: {last_err} (after {max_attempts} attempts)"
+                "agent connect: {last_err} (after {} tight + {max_attempts} backoff attempts)",
+                tight_attempts
             )))
         })
         .await
@@ -262,6 +293,15 @@ impl Instance for CloudHvInstance {
                 }
             }
 
+            // Abort any in-flight eager boot to release the Arc<SharedVmState>
+            if let Some(handle) = vm_state.eager_boot.lock().await.take() {
+                handle.abort();
+                info!(
+                    "aborted in-flight eager boot for sandbox {}",
+                    self.sandbox_id
+                );
+            }
+
             // Decrement container count; clean up VM if zero
             let prev = vm_state.container_count.fetch_sub(1, Ordering::SeqCst);
             if prev <= 1 {
@@ -297,8 +337,9 @@ impl Instance for CloudHvInstance {
                 let vm_ms = t_vm.elapsed().as_millis();
 
                 info!(
-                    "TIMING delete {}: rpc={}ms tap_cleanup={}ms vm_cleanup={}ms total={}ms",
+                    "TIMING delete {} @{}: rpc={}ms tap_cleanup={}ms vm_cleanup={}ms total={}ms",
                     self.id,
+                    epoch_ms(),
                     rpc_ms,
                     tap_ms,
                     vm_ms,
@@ -306,8 +347,9 @@ impl Instance for CloudHvInstance {
                 );
             } else {
                 info!(
-                    "TIMING delete {}: rpc={}ms total={}ms (container only, {} remaining)",
+                    "TIMING delete {} @{}: rpc={}ms total={}ms (container only, {} remaining)",
                     self.id,
+                    epoch_ms(),
                     rpc_ms,
                     t_total.elapsed().as_millis(),
                     prev - 1
@@ -425,11 +467,6 @@ impl CloudHvInstance {
         vm.wait_vmm_ready().await.ctx("vmm")?;
         let vmm_ready_ms = t_vmm.elapsed().as_millis();
 
-        // VM boot is deferred to start_container() — the CH process is
-        // spawned and listening on the API socket, but the VM is not yet
-        // created/booted.  The first container's rootfs will be pre-attached
-        // at boot time as /dev/vdb, eliminating hot-plug discovery latency.
-
         let vsock_socket = vm.vsock_socket().to_path_buf();
         let shared_dir = vm.shared_dir().to_path_buf();
         let api_socket = vm.api_socket_path().to_path_buf();
@@ -476,7 +513,61 @@ impl CloudHvInstance {
             netns: sandbox_spec.netns.clone(),
             cgroups_path: sandbox_spec.cgroups_path.clone(),
             container_info: tokio::sync::Mutex::new(Vec::new()),
+            eager_boot: tokio::sync::Mutex::new(None),
         });
+
+        // Spawn eager boot: create and boot the VM with only the guest rootfs
+        // (no container disks). The agent connect also runs here. By the time
+        // start_container is called (~50-100ms later), boot is usually done.
+        // Container rootfs disks will be hot-plugged in start_container.
+        //
+        // SKIP eager boot if warm_restore is enabled AND the snapshot cache is
+        // non-empty — snapshot restore requires a fresh CH process with no
+        // existing VM. If warm_restore is disabled, always eager boot.
+        let skip_eager_boot = config.warm_restore
+            && std::path::Path::new("/run/cloudhv/snapshot-cache")
+                .read_dir()
+                .map(|mut d| d.any(|e| e.is_ok()))
+                .unwrap_or(false);
+
+        if !skip_eager_boot {
+            let vm_state_clone = vm_state.clone();
+            let handle = tokio::spawn(async move {
+                use anyhow::Context;
+                let t0 = std::time::Instant::now();
+
+                // Boot VM with no extra disks — only the guest rootfs (/dev/vda)
+                vm_state_clone
+                    .vm
+                    .create_and_boot_vm(
+                        vm_state_clone.tap_name.as_deref(),
+                        vm_state_clone.tap_mac.as_deref(),
+                        vec![], // no container disks — hot-plugged later
+                    )
+                    .await
+                    .context("eager boot: create_and_boot_vm")?;
+
+                let boot_ms = t0.elapsed().as_millis();
+
+                // Connect to agent — confirms kernel + agent are ready
+                get_or_connect_agent(&vm_state_clone)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+                let total_ms = t0.elapsed().as_millis();
+                log::info!(
+                    "TIMING eager_boot @{}: vm_boot={}ms agent_connect={}ms total={}ms",
+                    crate::instance::epoch_ms(),
+                    boot_ms,
+                    total_ms - boot_ms,
+                    total_ms
+                );
+                Ok(())
+            });
+            *vm_state.eager_boot.lock().await = Some(handle);
+        } else {
+            info!("snapshot cache exists — skipping eager boot (restore likely)");
+        }
 
         VMS.write()
             .unwrap_or_else(|e| e.into_inner())
@@ -484,8 +575,8 @@ impl CloudHvInstance {
 
         info!("sandbox VM {} ready (ch_pid={})", sandbox_id, ch_pid);
         info!(
-            "TIMING start_sandbox {}: tap={}ms config={}ms swtpm={}ms vmm_spawn={}ms vmm_ready={}ms total={}ms",
-            sandbox_id, tap_ms, config_ms, swtpm_ms, spawn_ms, vmm_ready_ms, t_total.elapsed().as_millis()
+            "TIMING start_sandbox {} @{}: tap={}ms config={}ms swtpm={}ms vmm_spawn={}ms vmm_ready={}ms total={}ms",
+            sandbox_id, epoch_ms(), tap_ms, config_ms, swtpm_ms, spawn_ms, vmm_ready_ms, t_total.elapsed().as_millis()
         );
         Ok(ch_pid)
     }
@@ -494,7 +585,11 @@ impl CloudHvInstance {
     async fn start_container(&self) -> Result<u32, Error> {
         let container_id = &self.id;
         let t_total = std::time::Instant::now();
-        info!("starting app container: {}", container_id);
+        info!(
+            "TIMING start_container_enter {} @{}",
+            container_id,
+            epoch_ms()
+        );
 
         let vm_state = get_vm(&self.sandbox_id).ok_or_else(|| {
             Error::Any(anyhow::anyhow!("sandbox VM not found: {}", self.sandbox_id))
@@ -699,9 +794,10 @@ impl CloudHvInstance {
                 // server listening on 0.0.0.0:8888). This is the "golden" state.
                 //
                 // COLD BOOT (first pod per image on this node):
-                //   1. Boot VM with networking + rootfs pre-attached
-                //   2. Agent connects, container starts, workload warms up
-                //   3. After 20s warmup: pause VM → snapshot → resume → cache
+                //   1. VM booted eagerly in start_sandbox (no container disks)
+                //   2. Container rootfs hot-plugged here
+                //   3. Agent connects, container starts, workload warms up
+                //   4. After 20s warmup: pause VM → snapshot → resume → cache
                 //   4. The snapshot includes the RUNNING workload process
                 //
                 // RESTORE (all subsequent pods with same image):
@@ -713,25 +809,11 @@ impl CloudHvInstance {
                 //   4. SKIP RunContainer — the container is already alive
                 //   5. Traffic flows immediately (workload binds 0.0.0.0)
                 //
-                // WHY THIS WORKS:
-                //
-                // The workload (e.g. Python uvicorn) binds to 0.0.0.0:<port>,
-                // which accepts connections on ALL interfaces. The snapshot's
-                // config.json is patched at restore time to reference the new
-                // pod's TAP device and MAC address. On restore the VM boots
-                // with the patched TAP already attached as eth0. Since the
-                // workload listens on 0.0.0.0, it automatically accepts
-                // connections on the new interface — no rebind needed.
-                //
-                // The container rootfs (erofs image) is part of the snapshot memory
-                // (it was mounted when the workload started). The same image is used
-                // for all pods with the same container image, so the rootfs in the
-                // snapshot matches what the new pod expects.
-                //
                 // ────────────────────────────────────────────────────────────
 
                 // Snapshot cache key includes VM config AND container image identity
                 // so different workload images get separate snapshots.
+                let warm_restore_enabled = vm_state.vm.config().warm_restore;
                 let snap_key = {
                     let base = crate::snapshot::snapshot_cache_key(vm_state.vm.config());
                     let erofs_id = erofs_cache_key(&rootfs_path)
@@ -740,44 +822,92 @@ impl CloudHvInstance {
                 };
 
                 // Try snapshot restore first (CoW — near-instant boot)
-                let restored = if crate::snapshot::snapshot_cache_hit(&snap_key) {
-                    let snap_dir = crate::snapshot::snapshot_cache_dir(&snap_key);
-                    info!("snapshot cache hit: {}", snap_dir.display());
-                    match try_restore(&vm_state, &snap_key, &rootfs_disks).await {
-                        Ok(()) => true,
-                        Err(e) => {
-                            info!("snapshot restore failed, falling back to cold boot: {e:#}");
-                            false
+                let restored =
+                    if warm_restore_enabled && crate::snapshot::snapshot_cache_hit(&snap_key) {
+                        let snap_dir = crate::snapshot::snapshot_cache_dir(&snap_key);
+                        info!("snapshot cache hit: {}", snap_dir.display());
+
+                        match try_restore(&vm_state, &snap_key, &rootfs_disks).await {
+                            Ok(()) => true,
+                            Err(e) => {
+                                info!("snapshot restore failed, falling back to cold boot: {e:#}");
+                                false
+                            }
                         }
-                    }
-                } else {
-                    false
-                };
+                    } else {
+                        false
+                    };
 
                 if !restored {
-                    // Cold boot path — create and boot VM with pre-attached rootfs
-                    let extra_disks: Vec<VmDisk> = rootfs_disks
-                        .iter()
-                        .map(|(path, id, readonly)| VmDisk {
-                            path: path.to_string_lossy().to_string(),
-                            readonly: *readonly,
-                            id: Some(id.clone()),
-                        })
-                        .collect();
-                    let boot_result = vm_state
-                        .vm
-                        .create_and_boot_vm(
-                            vm_state.tap_name.as_deref(),
-                            vm_state.tap_mac.as_deref(),
-                            extra_disks,
-                        )
-                        .await;
+                    // Cold boot path — await the eager boot if it was started,
+                    // otherwise boot synchronously with rootfs pre-attached.
+                    let eager_handle = vm_state.eager_boot.lock().await.take();
+                    if let Some(handle) = eager_handle {
+                        // Eager boot was started — await it, then hot-plug rootfs
+                        match handle.await {
+                            Ok(Ok(())) => {
+                                info!("eager boot ready");
+                            }
+                            Ok(Err(e)) => {
+                                let msg = format!("{e:#}");
+                                *vm_state.boot_state.lock().await = BootState::Failed(msg.clone());
+                                vm_state.boot_complete.notify_waiters();
+                                return Err(Error::Any(anyhow::anyhow!(
+                                    "eager boot failed: {msg}"
+                                )));
+                            }
+                            Err(e) => {
+                                let msg = format!("eager boot task panicked: {e}");
+                                *vm_state.boot_state.lock().await = BootState::Failed(msg.clone());
+                                vm_state.boot_complete.notify_waiters();
+                                return Err(Error::Any(anyhow::anyhow!("{msg}")));
+                            }
+                        }
 
-                    if let Err(e) = boot_result {
-                        let msg = format!("{e:#}");
-                        *vm_state.boot_state.lock().await = BootState::Failed(msg.clone());
-                        vm_state.boot_complete.notify_waiters();
-                        return Err(Error::Any(anyhow::anyhow!("boot with rootfs: {msg}")));
+                        // Hot-plug container rootfs disk(s) into the running VM
+                        for (path, id, readonly) in &rootfs_disks {
+                            let disk_json = serde_json::json!({
+                                "path": path.to_string_lossy(),
+                                "readonly": *readonly,
+                                "id": id,
+                            });
+                            VmManager::api_request_to_socket(
+                                &vm_state.api_socket,
+                                "PUT",
+                                "/api/v1/vm.add-disk",
+                                Some(&disk_json.to_string()),
+                            )
+                            .await
+                            .ctx("hot-plug container rootfs")?;
+                            info!("hot-plugged container rootfs: {} ({})", id, path.display());
+                        }
+                    } else {
+                        // No eager boot (snapshot cache existed but no hit for this image).
+                        // Boot synchronously with rootfs pre-attached at boot time.
+                        info!("no eager boot — cold boot with pre-attached rootfs");
+                        let extra_disks: Vec<cloudhv_common::types::VmDisk> = rootfs_disks
+                            .iter()
+                            .map(|(path, id, readonly)| cloudhv_common::types::VmDisk {
+                                path: path.to_string_lossy().to_string(),
+                                readonly: *readonly,
+                                id: Some(id.clone()),
+                            })
+                            .collect();
+                        let boot_result = vm_state
+                            .vm
+                            .create_and_boot_vm(
+                                vm_state.tap_name.as_deref(),
+                                vm_state.tap_mac.as_deref(),
+                                extra_disks,
+                            )
+                            .await;
+
+                        if let Err(e) = boot_result {
+                            let msg = format!("{e:#}");
+                            *vm_state.boot_state.lock().await = BootState::Failed(msg.clone());
+                            vm_state.boot_complete.notify_waiters();
+                            return Err(Error::Any(anyhow::anyhow!("boot with rootfs: {msg}")));
+                        }
                     }
                 }
                 info!("VM booted (restored={restored}): {disk_id}");
@@ -830,13 +960,20 @@ impl CloudHvInstance {
                 let agent_ms = t_agent.elapsed().as_millis();
 
                 info!(
-                    "TIMING first_boot {}: vm_boot={}ms agent_connect={}ms restored={}",
-                    container_id, boot_ms, agent_ms, restored
+                    "TIMING first_boot {} @{}: vm_boot={}ms agent_connect={}ms restored={}",
+                    container_id,
+                    epoch_ms(),
+                    boot_ms,
+                    agent_ms,
+                    restored
                 );
 
                 // After a successful cold boot, create a snapshot for future pods.
                 // Wait for the workload to warm up before snapshotting.
-                if !restored && !crate::snapshot::snapshot_cache_hit(&snap_key) {
+                if warm_restore_enabled
+                    && !restored
+                    && !crate::snapshot::snapshot_cache_hit(&snap_key)
+                {
                     let vm_api = vm_state.api_socket.clone();
                     let key = snap_key.clone();
                     let vm_state_ref = vm_state.clone();
@@ -974,8 +1111,8 @@ impl CloudHvInstance {
 
                     vm_state.container_count.fetch_add(1, Ordering::SeqCst);
                     info!(
-                        "TIMING start_container {}: erofs={}ms rpc=0ms total={}ms first_boot=true (warm restore)",
-                        container_id, erofs_ms, t_total.elapsed().as_millis()
+                        "TIMING start_container {} @{}: erofs={}ms rpc=0ms total={}ms first_boot=true (warm restore)",
+                        container_id, epoch_ms(), erofs_ms, t_total.elapsed().as_millis()
                     );
                     return Ok(pid);
                 }
@@ -1191,8 +1328,9 @@ impl CloudHvInstance {
             let rpc_ms = t_rpc.elapsed().as_millis();
             info!("started container {} pid={}", container_id, pid);
             info!(
-                "TIMING start_container {}: erofs={}ms rpc={}ms total={}ms first_boot={}",
+                "TIMING start_container {} @{}: erofs={}ms rpc={}ms total={}ms first_boot={}",
                 container_id,
+                epoch_ms(),
                 erofs_ms,
                 rpc_ms,
                 t_total.elapsed().as_millis(),

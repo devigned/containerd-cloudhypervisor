@@ -8,14 +8,16 @@ The shim loads its configuration from `/opt/cloudhv/config.json` at startup.
 |-------|---------|-------------|
 | `cloud_hypervisor_binary` | `/usr/local/bin/cloud-hypervisor` | Path to CH binary |
 | `kernel_path` | — | Path to guest vmlinux |
-| `rootfs_path` | — | Path to guest rootfs.ext4 |
-| `kernel_args` | `console=hvc0 root=/dev/vda rw quiet init=/init net.ifnames=0` | Guest kernel cmdline (see [Architecture Notes](#architecture-notes)) |
+| `rootfs_path` | — | Path to guest rootfs.erofs |
+| `kernel_args` | `console=hvc0 root=/dev/vda rw quiet init=/init net.ifnames=0` | Guest kernel cmdline |
 | `default_vcpus` | `1` | Boot vCPUs per VM |
+| `max_default_vcpus` | `0` | Max vCPUs when no CPU limit (0 = host CPU count) |
 | `default_memory_mb` | `128` | Boot memory in MiB |
 | `max_containers_per_vm` | `5` | Max containers sharing a VM |
 | `hotplug_memory_mb` | `0` | Hotpluggable memory (0 = disabled) |
 | `hotplug_method` | `acpi` | `acpi` or `virtio-mem` |
 | `tpm_enabled` | `false` | Enable TPM 2.0 via swtpm |
+| `warm_restore` | `false` | Enable warm workload snapshots (**experimental**, see below) |
 
 ### Example
 
@@ -23,14 +25,35 @@ The shim loads its configuration from `/opt/cloudhv/config.json` at startup.
 {
   "cloud_hypervisor_binary": "/usr/local/bin/cloud-hypervisor",
   "kernel_path": "/opt/cloudhv/vmlinux",
-  "rootfs_path": "/opt/cloudhv/rootfs.ext4",
-  "kernel_args": "console=hvc0 root=/dev/vda rw quiet init=/init net.ifnames=0",
+  "rootfs_path": "/opt/cloudhv/rootfs.erofs",
+  "kernel_args": "console=ttyS0 root=/dev/vda rw init=/init net.ifnames=0",
   "default_vcpus": 1,
   "default_memory_mb": 512,
   "max_containers_per_vm": 5,
-  "tpm_enabled": false
+  "tpm_enabled": false,
+  "warm_restore": false
 }
 ```
+
+### Warm Restore (Experimental)
+
+When `warm_restore` is `true`, the shim snapshots the VM after the first
+pod's workload is fully running (~20s warmup). Subsequent pods with the
+same image restore from the snapshot with CoW memory (~300ms), waking up
+with the workload already serving. This provides:
+
+- **~5 MiB incremental memory per pod** (CoW page sharing)
+- **150/150 pods** on 3 × D8ds_v5 nodes
+- **Instant workload readiness** (no Python/Node startup)
+
+This feature is **experimental** and disabled by default. Known limitations:
+- Snapshot cache is global (not per-image) which can prevent eager boot
+  for unrelated images
+- Log streaming is not set up for warm-restored containers
+- The snapshot workload warmup delay (20s) is not configurable
+
+Set `warm_restore` to `true` to enable. When disabled (default), every pod
+uses eager cold boot (~70ms container start with erofs cache hit).
 
 ### Notes
 
@@ -40,10 +63,13 @@ The shim loads its configuration from `/opt/cloudhv/config.json` at startup.
 
 #### Architecture Notes
 
-- The default `kernel_args` console device is set at compile time based on the target
-  architecture. On **x86_64** it defaults to `console=hvc0` (virtio console); on
-  **ARM64 (aarch64)** it defaults to `console=ttyAMA0` (PL011 UART). If you override
-  `kernel_args` in the config file, use the correct console for your architecture.
+- **Console device:** The example above uses `console=ttyS0`, which is correct for
+  Cloud Hypervisor's serial port output and is what the installer writes. The compile-time
+  default in code is `console=hvc0` for historical reasons (virtio-console mode), but
+  `ttyS0` is the recommended setting for production and is required for `cloud-hypervisor
+  --serial tty` output. On **ARM64 (aarch64)** use `console=ttyAMA0` (PL011 UART).
+  If you override `kernel_args` in the config file, use the correct console for your
+  architecture.
 - The kernel config used to build the guest kernel also differs per architecture:
   `guest/kernel/configs/microvm.config` for x86_64 and
   `guest/kernel/configs/microvm-aarch64.config` for ARM64.
