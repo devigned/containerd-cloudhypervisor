@@ -60,10 +60,9 @@ pub struct RuntimeConfig {
     pub tpm_enabled: bool,
 
     /// Enable warm workload snapshots for near-instant pod startup.
-    /// When enabled (default), the shim snapshots the VM after the first
-    /// pod's workload is fully running and restores subsequent pods from
-    /// the snapshot with CoW memory. Disable to use eager cold boot for
-    /// every pod (faster single-pod latency, no memory sharing).
+    /// **Experimental.** When enabled, the shim snapshots the VM after the
+    /// first pod's workload is fully running and restores subsequent pods
+    /// from the snapshot with CoW memory. Disabled by default.
     #[serde(default = "default_warm_restore")]
     pub warm_restore: bool,
 }
@@ -101,7 +100,7 @@ fn default_hotplug_method() -> String {
     "acpi".to_string()
 }
 fn default_warm_restore() -> bool {
-    true
+    false
 }
 
 /// Cloud Hypervisor VM configuration (JSON sent to CH API)

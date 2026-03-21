@@ -17,7 +17,7 @@ The shim loads its configuration from `/opt/cloudhv/config.json` at startup.
 | `hotplug_memory_mb` | `0` | Hotpluggable memory (0 = disabled) |
 | `hotplug_method` | `acpi` | `acpi` or `virtio-mem` |
 | `tpm_enabled` | `false` | Enable TPM 2.0 via swtpm |
-| `warm_restore` | `true` | Enable warm workload snapshots (see below) |
+| `warm_restore` | `false` | Enable warm workload snapshots (**experimental**, see below) |
 
 ### Example
 
@@ -31,24 +31,29 @@ The shim loads its configuration from `/opt/cloudhv/config.json` at startup.
   "default_memory_mb": 512,
   "max_containers_per_vm": 5,
   "tpm_enabled": false,
-  "warm_restore": true
+  "warm_restore": false
 }
 ```
 
-### Warm Restore
+### Warm Restore (Experimental)
 
-When `warm_restore` is `true` (default), the shim snapshots the VM after
-the first pod's workload is fully running (~20s warmup). Subsequent pods
-with the same image restore from the snapshot with CoW memory (~300ms),
-waking up with the workload already serving. This provides:
+When `warm_restore` is `true`, the shim snapshots the VM after the first
+pod's workload is fully running (~20s warmup). Subsequent pods with the
+same image restore from the snapshot with CoW memory (~300ms), waking up
+with the workload already serving. This provides:
 
 - **~5 MiB incremental memory per pod** (CoW page sharing)
 - **150/150 pods** on 3 × D8ds_v5 nodes
 - **Instant workload readiness** (no Python/Node startup)
 
-Set `warm_restore` to `false` to disable snapshots and use eager cold boot
-for every pod. This gives faster single-pod latency (~70ms vs ~300ms) but
-no memory sharing and requires full workload startup each time.
+This feature is **experimental** and disabled by default. Known limitations:
+- Snapshot cache is global (not per-image) which can prevent eager boot
+  for unrelated images
+- Log streaming is not set up for warm-restored containers
+- The snapshot workload warmup delay (20s) is not configurable
+
+Set `warm_restore` to `true` to enable. When disabled (default), every pod
+uses eager cold boot (~70ms container start with erofs cache hit).
 
 ### Notes
 
