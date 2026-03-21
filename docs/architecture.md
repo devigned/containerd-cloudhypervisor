@@ -53,11 +53,37 @@ containerd           │                                                        
 The shim uses the `io.kubernetes.cri.container-type` annotation to distinguish between
 sandbox creation and application containers:
 
-- **Sandbox** (`container-type=sandbox`): boots the Cloud Hypervisor VM. The VM **is** the
-  sandbox — no pause container needed. Networking (TAP + TC redirect) is set up at this stage.
-- **App container** (`container-type=container`): converts the rootfs to erofs (cached),
-  hot-plugs it into the running VM, and sends config.json + volume data inline via the
-  CreateContainer RPC. The guest agent writes metadata to tmpfs and runs the container with crun.
+- **Sandbox** (`container-type=sandbox`): spawns the Cloud Hypervisor process and
+  **eagerly boots the VM** with only the guest rootfs (`/dev/vda`). The VM boots
+  asynchronously — `start_sandbox` returns immediately (~7ms) while boot + agent
+  connect proceed in the background (~175ms). Networking (TAP + TC redirect) is
+  set up before boot.
+- **App container** (`container-type=container`): awaits the async boot (usually
+  complete by now — 0ms wait), converts the rootfs to erofs (cached), hot-plugs
+  it into the running VM, and sends config.json + volume data inline via the
+  RunContainer RPC. The guest agent discovers hot-plugged disks via inotify (<1ms)
+  and runs the container with crun.
+
+### Async Eager Boot
+
+The VM boots in the background during sandbox creation, overlapping with
+containerd's internal work (~90ms gap between RunPodSandbox and StartContainer).
+By the time `start_container` runs, the VM is usually booted and the agent is
+connected, making the container start nearly instant:
+
+```
+start_sandbox (7ms):
+  TAP setup → config → spawn VMM → SPAWN boot+agent (async) → return
+
+  ─── containerd gap (~90ms) ─── boot running in background ───
+
+start_container (~26-110ms):
+  erofs lookup (0ms cached) → await boot (0-90ms) → hot-plug disk → RPC
+```
+
+The agent connect uses a two-phase strategy: tight-poll with `yield_now()`
+for the first 500ms (catches the agent the instant it's ready), then
+exponential backoff for slow/contended boots.
 
 ## Warm Snapshot Restore
 

@@ -5,12 +5,13 @@ that runs container workloads inside lightweight microVMs with maximum density a
 
 ## Highlights
 
+- **Async eager boot** — VM boots asynchronously during sandbox creation; by the time the container starts, the agent is already connected. Cold-boot lifecycle: **~26-110ms** (cached erofs), **~59ms** (uncached, parallel erofs)
 - **Warm snapshot restore** — first pod cold-boots (~20s), all subsequent pods restore from a CoW snapshot in **~344ms** with ~5 MiB incremental memory per pod
 - **150/150 pods** on 3 × D8ds_v5 nodes (96 GiB total RAM), clean scale-up in 77s and scale-down in 12s
-- **~530ms cold-boot** (single pod via crictl), **~344ms warm restore** (AKS at scale)
 - **VM isolation** — each pod runs in its own Cloud Hypervisor microVM with dedicated kernel
 - **erofs rootfs cache** — content-addressable, flock-serialized, shared across pods
-- **Pure libc networking** — TAP/tc setup via in-process netlink (~46ms, no subprocess)
+- **inotify device discovery** — hot-plugged container disks detected in <1ms via inotify (no polling)
+- **Pure libc networking** — TAP/tc setup via in-process netlink (<1ms, no subprocess)
 - **Dual hypervisor** — same binary runs on KVM (Linux) and MSHV (Azure/Hyper-V)
 - **Multi-container pods** — up to 5 containers per VM with mount + PID isolation
 - **Pod networking** — transparent CNI integration via TAP + TC redirect
@@ -28,8 +29,8 @@ migration, consider [Kata Containers](https://katacontainers.io/) instead.
 
 | | containerd-cloudhypervisor | Kata Containers |
 | --- | --- | --- |
+| **Cold start (cached)** | ~26-110ms | ~500ms–1s |
 | **Warm restore** | ~344ms (CoW snapshot) | N/A |
-| **Cold start** | ~530ms (crictl) | ~500ms–1s |
 | **Memory per pod** | ~5 MiB (CoW) / ~29 MiB (cold) | ~312 MiB |
 | **150-pod scale** | 150/150 in 77s | 130/150 (OOM) |
 | **Shim binary** | 4.6 MB | ~50 MB |

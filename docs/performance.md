@@ -1,5 +1,43 @@
 # Performance
 
+## Cold Boot with Async Eager Boot (crictl, single pod)
+
+The shim boots the VM asynchronously during sandbox creation, overlapping
+with containerd's internal processing. Container rootfs disks are hot-plugged
+after boot; the agent discovers them via inotify (<1ms).
+
+Measured on hl-dev (Azure D8s_v5, KVM, Cloud Hypervisor v44.0, 1 vCPU):
+
+### Cached erofs (5 runs)
+
+| Phase | Min | Max | Avg |
+|-------|----:|----:|----:|
+| start_sandbox (async boot spawned) | 7ms | 8ms | 7ms |
+| containerd gap (not our code) | 82ms | 93ms | 88ms |
+| Boot await (residual after overlap) | 0ms | 90ms | 55ms |
+| Hot-plug + inotify + mount + crun | 14ms | 24ms | 18ms |
+| **start_container total** | **26ms** | **110ms** | **80ms** |
+
+Best case: **26ms** (boot finished during containerd gap).
+
+### Uncached erofs (first image)
+
+| Phase | Time |
+|-------|-----:|
+| start_sandbox | 7ms |
+| Boot await (overlapped with erofs) | 0ms |
+| erofs conversion (mkfs.erofs) | 43ms |
+| Hot-plug + mount + crun | 14ms |
+| **start_container total** | **59ms** |
+
+### Optimization breakdown
+
+| Version | start_container (cached) | Key change |
+|---------|------------------------:|------------|
+| v0.10.0 | ~530ms | Baseline (sequential boot) |
+| v0.11.0 | ~340ms | Warm snapshots, tight netlink |
+| v0.12.0-dev | **~26-110ms** | Async boot, tight-poll agent, inotify mount |
+
 ## Warm Snapshot Restore (AKS)
 
 Warm snapshot restore eliminates kernel boot and workload startup for all
@@ -13,10 +51,10 @@ Measured on AKS (3 × D8ds_v5, Kubernetes v1.33.7, containerd 2.0.0):
 | TAP setup (netlink) | <1ms | <1ms |
 | VMM spawn + ready | 6ms | 6ms |
 | VM boot / restore | ~35ms | ~293ms |
-| Agent connect | ~361ms | ~17ms |
+| Agent connect | ~170ms | ~17ms |
 | ConfigureNetwork | — | ~17ms |
-| Container start | ~5ms | 0ms (skipped) |
-| **Total shim time** | **~420ms** | **~344ms** |
+| Container start | ~18ms | 0ms (skipped) |
+| **Total shim time** | **~240ms** | **~344ms** |
 
 ### Scale Performance
 
@@ -25,20 +63,6 @@ Measured on AKS (3 × D8ds_v5, Kubernetes v1.33.7, containerd 2.0.0):
 | 150 pods → all Ready | **77s** (3 × D8ds_v5) |
 | Scale-down 150 → 0 | **12s** (clean termination) |
 | 10 consecutive sandbox runs | **10/10 pass** |
-
-## Cold Boot (crictl, single pod)
-
-Full VM lifecycle from scratch — kernel boots, agent starts, container runs.
-
-Measured on hl-dev (Azure D8s_v5, KVM, Cloud Hypervisor v44.0):
-
-| Phase | Cache Hit | Cache Miss (first image) |
-|-------|-----------|--------------------------|
-| Sandbox (VM boot) | **~97ms** | **~97ms** |
-| Container create (erofs cache) | **~3ms** | **~64ms** |
-| Container start (agent RPC) | **~160ms** | **~160ms** |
-| Exit detection | **~100ms** | **~100ms** |
-| **Total e2e** | **~365ms** | **~420ms** |
 
 ## Rootfs Delivery Performance
 
@@ -87,8 +111,8 @@ With warm snapshot restore at 150 VMs across 3 nodes (50 per node):
 
 | | containerd-cloudhypervisor | Kata Containers |
 |---|---|---|
+| **Cold start (cached)** | ~26-110ms (async boot) | ~500ms–1s |
 | **Warm restore** | ~344ms | N/A |
-| **Cold boot e2e** | ~420ms | ~1,134ms |
 | **150-pod scale** | 150/150 (77s) | 130/150 (stuck) |
 | **Memory per pod** | ~5 MiB (CoW) / ~57 MiB (cold) | ~312 MiB |
 | **Shim binary** | ~4.6 MB | ~65 MB |
