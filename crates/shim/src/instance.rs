@@ -824,9 +824,11 @@ impl CloudHvInstance {
                 };
 
                 if !restored {
-                    // Cold boot path — await the eager boot that started in start_sandbox,
-                    // then hot-plug the container rootfs disk(s).
-                    if let Some(handle) = vm_state.eager_boot.lock().await.take() {
+                    // Cold boot path — await the eager boot if it was started,
+                    // otherwise boot synchronously with rootfs pre-attached.
+                    let eager_handle = vm_state.eager_boot.lock().await.take();
+                    if let Some(handle) = eager_handle {
+                        // Eager boot was started — await it, then hot-plug rootfs
                         match handle.await {
                             Ok(Ok(())) => {
                                 info!("eager boot ready");
@@ -846,24 +848,51 @@ impl CloudHvInstance {
                                 return Err(Error::Any(anyhow::anyhow!("{msg}")));
                             }
                         }
-                    }
 
-                    // Hot-plug container rootfs disk(s) into the running VM
-                    for (path, id, readonly) in &rootfs_disks {
-                        let disk_json = serde_json::json!({
-                            "path": path.to_string_lossy(),
-                            "readonly": *readonly,
-                            "id": id,
-                        });
-                        VmManager::api_request_to_socket(
-                            &vm_state.api_socket,
-                            "PUT",
-                            "/api/v1/vm.add-disk",
-                            Some(&disk_json.to_string()),
-                        )
-                        .await
-                        .ctx("hot-plug container rootfs")?;
-                        info!("hot-plugged container rootfs: {} ({})", id, path.display());
+                        // Hot-plug container rootfs disk(s) into the running VM
+                        for (path, id, readonly) in &rootfs_disks {
+                            let disk_json = serde_json::json!({
+                                "path": path.to_string_lossy(),
+                                "readonly": *readonly,
+                                "id": id,
+                            });
+                            VmManager::api_request_to_socket(
+                                &vm_state.api_socket,
+                                "PUT",
+                                "/api/v1/vm.add-disk",
+                                Some(&disk_json.to_string()),
+                            )
+                            .await
+                            .ctx("hot-plug container rootfs")?;
+                            info!("hot-plugged container rootfs: {} ({})", id, path.display());
+                        }
+                    } else {
+                        // No eager boot (snapshot cache existed but no hit for this image).
+                        // Boot synchronously with rootfs pre-attached at boot time.
+                        info!("no eager boot — cold boot with pre-attached rootfs");
+                        let extra_disks: Vec<cloudhv_common::types::VmDisk> = rootfs_disks
+                            .iter()
+                            .map(|(path, id, readonly)| cloudhv_common::types::VmDisk {
+                                path: path.to_string_lossy().to_string(),
+                                readonly: *readonly,
+                                id: Some(id.clone()),
+                            })
+                            .collect();
+                        let boot_result = vm_state
+                            .vm
+                            .create_and_boot_vm(
+                                vm_state.tap_name.as_deref(),
+                                vm_state.tap_mac.as_deref(),
+                                extra_disks,
+                            )
+                            .await;
+
+                        if let Err(e) = boot_result {
+                            let msg = format!("{e:#}");
+                            *vm_state.boot_state.lock().await = BootState::Failed(msg.clone());
+                            vm_state.boot_complete.notify_waiters();
+                            return Err(Error::Any(anyhow::anyhow!("boot with rootfs: {msg}")));
+                        }
                     }
                 }
                 info!("VM booted (restored={restored}): {disk_id}");
