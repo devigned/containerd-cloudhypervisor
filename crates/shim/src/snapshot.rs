@@ -165,9 +165,17 @@ pub async fn snapshot_cache_lock(key: &str) -> Result<std::fs::File> {
 pub fn snapshot_cache_store(key: &str, source_dir: &Path) -> Result<()> {
     let dest = snapshot_cache_dir(key);
     if dest.exists() {
-        // Another process already cached it
-        log::info!("snapshot cache: {key} already exists, skipping store");
-        return Ok(());
+        let required = ["config.json", "memory-ranges", "state.json"];
+        let complete = required.iter().all(|f| dest.join(f).exists());
+        if complete {
+            log::info!("snapshot already cached: {}", dest.display());
+            return Ok(());
+        }
+        log::warn!(
+            "partial snapshot cache found, replacing: {}",
+            dest.display()
+        );
+        let _ = std::fs::remove_dir_all(&dest);
     }
 
     // Rename atomically (same filesystem — both on /run tmpfs). If this fails
@@ -209,7 +217,16 @@ pub fn prepare_snapshot_for_vm(
         let src = cache_dir.join(name);
         let dst = work_dir.join(name);
         std::fs::hard_link(&src, &dst)
-            .or_else(|_| std::fs::copy(&src, &dst).map(|_| ()))
+            .or_else(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    let _ = std::fs::remove_file(&dst);
+                    std::fs::hard_link(&src, &dst)
+                } else if e.raw_os_error() == Some(libc::EXDEV) {
+                    std::fs::copy(&src, &dst).map(|_| ())
+                } else {
+                    Err(e)
+                }
+            })
             .with_context(|| format!("link {name} from cache"))?;
     }
 

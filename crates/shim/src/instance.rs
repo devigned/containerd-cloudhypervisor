@@ -705,21 +705,23 @@ impl CloudHvInstance {
                 //   4. The snapshot includes the RUNNING workload process
                 //
                 // RESTORE (all subsequent pods with same image):
-                //   1. Restore VM from cached snapshot (CoW memory, ~150ms)
-                //   2. Resume VM — workload process wakes up ALREADY RUNNING
-                //   3. Hot-plug new TAP device for this pod's network
-                //   4. Configure guest IP via agent netlink RPC
-                //   5. SKIP RunContainer — the container is already alive
-                //   6. Traffic flows immediately (workload binds 0.0.0.0)
+                //   1. Restore VM from cached snapshot with patched config
+                //      (TAP name + MAC updated in config.json, CoW memory, ~150ms)
+                //   2. Resume VM — eth0 already wired to new TAP, workload
+                //      process wakes up ALREADY RUNNING
+                //   3. Configure guest IP via ConfigureNetwork agent RPC
+                //   4. SKIP RunContainer — the container is already alive
+                //   5. Traffic flows immediately (workload binds 0.0.0.0)
                 //
                 // WHY THIS WORKS:
                 //
                 // The workload (e.g. Python uvicorn) binds to 0.0.0.0:<port>,
-                // which accepts connections on ALL interfaces. The snapshot strips
-                // the old pod's network config (TAP + IP). On restore, we hot-plug
-                // a NEW TAP with the NEW pod's IP. The kernel sees a new eth0.
-                // Since the workload listens on 0.0.0.0, it automatically accepts
-                // on the new interface — no rebind needed.
+                // which accepts connections on ALL interfaces. The snapshot's
+                // config.json is patched at restore time to reference the new
+                // pod's TAP device and MAC address. On restore the VM boots
+                // with the patched TAP already attached as eth0. Since the
+                // workload listens on 0.0.0.0, it automatically accepts
+                // connections on the new interface — no rebind needed.
                 //
                 // The container rootfs (erofs image) is part of the snapshot memory
                 // (it was mounted when the workload started). The same image is used
@@ -1804,7 +1806,11 @@ async fn create_snapshot_for_cache(
     .await;
 
     // Always resume, even if snapshot failed
-    let _ = VmManager::api_request_to_socket(api_socket, "PUT", "/api/v1/vm.resume", None).await;
+    if let Err(e) =
+        VmManager::api_request_to_socket(api_socket, "PUT", "/api/v1/vm.resume", None).await
+    {
+        log::error!("vm.resume after snapshot failed: {e:#}");
+    }
 
     if let Err(_) = snap_result {
         // Best-effort cleanup of temporary snapshot directory on snapshot failure.

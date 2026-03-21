@@ -341,8 +341,20 @@ impl AgentService for AgentServiceHandler {
             ));
         }
 
-        cloudhv_common::netlink::configure_interface(device, ip, prefix_len, gw, mac)
-            .map_err(|e| ttrpc::Error::Others(format!("configure_interface: {e:#}")))?;
+        let device_owned = device.to_string();
+        let mac_owned = mac.map(|m| m.to_string());
+        tokio::task::spawn_blocking(move || {
+            cloudhv_common::netlink::configure_interface(
+                &device_owned,
+                ip,
+                prefix_len,
+                gw,
+                mac_owned.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| ttrpc::Error::Others(format!("spawn_blocking: {e}")))?
+        .map_err(|e| ttrpc::Error::Others(format!("configure_interface: {e:#}")))?;
 
         info!(
             "configure_network: {} configured via netlink (mac={:?})",
