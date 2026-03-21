@@ -140,6 +140,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install sysext test dependencies
+        run: sudo apt-get update && sudo apt-get install -y qemu-system python3
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -232,6 +235,12 @@ jobs:
           # Stop daemon
           sudo kill $DAEMON_PID 2>/dev/null || true
           wait $DAEMON_PID 2>/dev/null || true
+
+      - name: Run sysext / Flatcar VM integration tests
+        if: env.KVM_AVAILABLE == 'true'
+        run: |
+          set -e
+          hacks/test-sysext.sh
 
       - name: Fix cargo cache permissions
         if: always()

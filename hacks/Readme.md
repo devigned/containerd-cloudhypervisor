@@ -14,6 +14,9 @@ Scripts are meant to be called from the repository root, and should be invoked w
 * `hacks/build-sysext.sh` - Will build a system extension image with guest (L2) and host bits, including host configuration.
   - will put `containerd-cloudhypervisor.raw` into the repo root.
     See [main readme](../README.md#test-your-builds-locally-in-a-flatcar-vm) for usage instructions.
+* `hacks/test-sysext.sh` - Will boot a Flatcar VM with the sysext in the repo root, run `/usr/share/cloudhv/demo/demo.sh`, and exit with the demo's exit code.
+  - needs `containerd-cloudhypervisor.raw` present in the repo root.
+  - will clone the [sysext bakery](https://github.com/flatcar/sysext-bakery/) repo locally and use `bakery.sh boot` to run the test.
 
 ## Building for different architectures
 
