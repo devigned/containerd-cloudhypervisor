@@ -3,8 +3,6 @@ use std::path::PathBuf;
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
-#[cfg(target_os = "linux")]
-use log::debug;
 use log::{error, info, warn};
 use tokio::process::Command;
 use tokio::sync::watch;
@@ -304,27 +302,24 @@ impl ContainerManager {
                 let layer_mount = mount_point.join(format!("layer{i}"));
                 std::fs::create_dir_all(&layer_mount)?;
 
-                for attempt in 1..=20 {
-                    match mount(
-                        Some(dev.as_str()),
-                        &layer_mount,
-                        Some("erofs"),
-                        MsFlags::MS_RDONLY | MsFlags::MS_NOATIME,
-                        None::<&str>,
-                    ) {
-                        Ok(()) => {
-                            info!("mounted erofs layer {} at {}", dev, layer_mount.display());
-                            break;
-                        }
-                        Err(e) if attempt < 20 => {
-                            debug!("mount attempt {attempt} for erofs {dev} failed: {e}");
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        }
-                        Err(e) => {
-                            anyhow::bail!("mount erofs {} at {}: {e}", dev, layer_mount.display());
-                        }
-                    }
+                // Wait for the device node to appear using inotify, then mount.
+                // For pre-attached devices, /dev/vdX exists at boot — mount works
+                // immediately. For hot-plugged devices, the kernel creates the node
+                // after PCI enumeration (~20-50ms). inotify detects creation in <1ms
+                // vs the old 100ms polling interval.
+                if !std::path::Path::new(&dev).exists() {
+                    wait_for_dev_inotify(&dev).await?;
                 }
+
+                mount(
+                    Some(dev.as_str()),
+                    &layer_mount,
+                    Some("erofs"),
+                    MsFlags::MS_RDONLY | MsFlags::MS_NOATIME,
+                    None::<&str>,
+                )
+                .with_context(|| format!("mount erofs {} at {}", dev, layer_mount.display()))?;
+                info!("mounted erofs layer {} at {}", dev, layer_mount.display());
 
                 lowerdirs.push(layer_mount.to_string_lossy().to_string());
             }
@@ -705,4 +700,126 @@ impl ContainerManager {
 
         Ok(resp)
     }
+}
+
+/// Wait for a device node (e.g. `/dev/vdb`) to appear using inotify.
+/// Returns immediately if the device already exists.
+/// Times out after 10 seconds.
+#[cfg(target_os = "linux")]
+async fn wait_for_dev_inotify(dev_path: &str) -> Result<()> {
+    use std::path::Path;
+
+    if Path::new(dev_path).exists() {
+        return Ok(());
+    }
+
+    let dev_name = Path::new(dev_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("invalid device path")?
+        .to_string();
+
+    let watch_dir = Path::new(dev_path)
+        .parent()
+        .unwrap_or(Path::new("/dev"))
+        .to_path_buf();
+
+    info!(
+        "waiting for device {} via inotify on {}",
+        dev_path,
+        watch_dir.display()
+    );
+
+    // Run inotify in a blocking task (it uses blocking read)
+    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+        struct FdGuard(i32);
+        impl Drop for FdGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::close(self.0);
+                }
+            }
+        }
+
+        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+        if fd < 0 {
+            anyhow::bail!("inotify_init1: {}", std::io::Error::last_os_error());
+        }
+        let _fd_guard = FdGuard(fd);
+
+        let dir_cstr = std::ffi::CString::new(watch_dir.to_string_lossy().as_bytes())?;
+        let wd = unsafe { libc::inotify_add_watch(fd, dir_cstr.as_ptr(), libc::IN_CREATE) };
+        if wd < 0 {
+            anyhow::bail!(
+                "inotify_add_watch({}): {}",
+                watch_dir.display(),
+                std::io::Error::last_os_error()
+            );
+        }
+
+        // Check again after adding watch (device may have appeared between
+        // our initial check and the watch registration)
+        if std::path::Path::new(&format!("{}/{}", watch_dir.display(), dev_name)).exists() {
+            return Ok(());
+        }
+
+        // Poll inotify fd with timeout
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut buf = [0u8; 4096];
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("timeout waiting for device {}", dev_name);
+            }
+
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout_ms = remaining.as_millis().min(1000) as i32;
+            let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                anyhow::bail!("poll: {}", err);
+            }
+            if ret == 0 {
+                // Timeout on this poll — check if device appeared
+                if std::path::Path::new(&format!("{}/{}", watch_dir.display(), dev_name)).exists() {
+                    return Ok(());
+                }
+                continue;
+            }
+
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n < 0 {
+                continue;
+            }
+
+            // Parse inotify events looking for our device name
+            let mut offset = 0usize;
+            while offset + 16 <= n as usize {
+                let name_len =
+                    u32::from_ne_bytes(buf[offset + 12..offset + 16].try_into().unwrap()) as usize;
+                let event_end = offset + 16 + name_len;
+                if event_end <= n as usize && name_len > 0 {
+                    let name_bytes = &buf[offset + 16..event_end];
+                    if let Ok(name) = std::ffi::CStr::from_bytes_until_nul(name_bytes) {
+                        if name.to_string_lossy() == dev_name {
+                            info!("inotify: device {} appeared", dev_name);
+                            return Ok(());
+                        }
+                    }
+                }
+                offset = event_end;
+            }
+        }
+    })
+    .await
+    .context("inotify task panicked")?;
+
+    result
 }
