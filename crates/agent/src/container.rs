@@ -327,7 +327,7 @@ impl ContainerManager {
                             info!("mounted erofs layer {} at {}", dev, layer_mount.display());
                             break;
                         }
-                        Err(e) if std::time::Instant::now() < mount_deadline => {
+                        Err(_e) if std::time::Instant::now() < mount_deadline => {
                             // Device node exists but driver not ready — yield and retry
                             tokio::task::yield_now().await;
                         }

@@ -80,6 +80,7 @@ fn bench_vm_config_serialization(c: &mut Criterion) {
             hotplug_memory_mb: 512,
             hotplug_method: "virtio-mem".into(),
             tpm_enabled: false,
+            warm_restore: true,
         };
         b.iter(|| {
             black_box(serde_json::to_string(&rt_config).unwrap());
@@ -109,6 +110,7 @@ fn bench_cid_allocation(c: &mut Criterion) {
             hotplug_memory_mb: 0,
             hotplug_method: "acpi".into(),
             tpm_enabled: false,
+            warm_restore: true,
         };
         let mut i = 0u64;
         b.iter(|| {
