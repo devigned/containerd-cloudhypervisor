@@ -44,7 +44,6 @@ fn rpc(method: &str, extra: &serde_json::Value) -> serde_json::Value {
 }
 
 #[test]
-#[ignore]
 fn test_status() {
     let resp = rpc("Status", &serde_json::json!({}));
     assert!(resp.get("pool_ready").is_some(), "missing pool_ready");
@@ -53,7 +52,6 @@ fn test_status() {
 }
 
 #[test]
-#[ignore]
 fn test_acquire_release_cycle() {
     // Check initial pool state
     let status = rpc("Status", &serde_json::json!({}));
@@ -112,7 +110,6 @@ fn test_acquire_release_cycle() {
 }
 
 #[test]
-#[ignore]
 fn test_consecutive_lifecycle() {
     let iterations = 5;
     let mut acquire_times = Vec::new();
@@ -171,7 +168,6 @@ fn test_consecutive_lifecycle() {
 }
 
 #[test]
-#[ignore]
 fn test_pool_drain_and_sync_restore() {
     // Drain the pool by acquiring all VMs
     let status = rpc("Status", &serde_json::json!({}));
@@ -243,7 +239,6 @@ fn erofs_path() -> String {
 }
 
 #[test]
-#[ignore]
 fn test_shadow_snapshot_creation() {
     let erofs = erofs_path();
     if erofs.is_empty() {
@@ -358,7 +353,6 @@ fn test_shadow_snapshot_creation() {
 }
 
 #[test]
-#[ignore]
 fn test_status_includes_snapshot_fields() {
     let status = rpc("Status", &serde_json::json!({}));
     assert!(status.get("pool_ready").is_some());
