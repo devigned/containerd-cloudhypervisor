@@ -1,0 +1,23 @@
+[package]
+name = "cloudhv-sandbox-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cloudhv-sandbox-daemon"
+path = "src/main.rs"
+
+[dependencies]
+cloudhv-common = { path = "../common" }
+cloudhv-proto = { path = "../proto" }
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+ttrpc = { version = "0.8", features = ["async"] }
+protobuf = "3"
+chrono = "0.4"
+libc = "0.2"
