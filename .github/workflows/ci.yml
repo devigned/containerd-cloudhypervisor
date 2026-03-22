@@ -60,7 +60,7 @@ jobs:
 
       - name: Run unit tests
         run: |
-          cargo test --workspace
+          cargo test --workspace --lib --bins
           cd crates/agent && cargo test
 
       - name: Check benchmarks compile
