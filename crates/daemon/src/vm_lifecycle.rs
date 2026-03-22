@@ -280,40 +280,52 @@ pub async fn shutdown_and_destroy(api_socket: &Path, ch_pid: u32, state_dir: &Pa
     let _ = std::fs::remove_dir_all(state_dir);
 }
 
-/// Send an HTTP request to the CH API socket.
+/// Send an HTTP request to the CH API socket using hyper.
 async fn api_request(
     socket_path: &Path,
     method: &str,
     path: &str,
     body: Option<&str>,
 ) -> Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use http_body_util::{BodyExt, Empty, Full};
+    use hyper::body::Bytes;
+    use hyper::Request;
+    use hyper_util::rt::TokioIo;
 
-    let mut stream = UnixStream::connect(socket_path)
+    let stream = UnixStream::connect(socket_path)
         .await
         .with_context(|| format!("connect to CH API: {}", socket_path.display()))?;
+    let io = TokioIo::new(stream);
 
-    let body_bytes = body.unwrap_or("");
-    let request = if body_bytes.is_empty() {
-        format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+        .await
+        .context("HTTP handshake with CH API")?;
+    tokio::spawn(conn);
+
+    let req = if let Some(b) = body {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header("Host", "localhost")
+            .header("Content-Type", "application/json")
+            .body(Full::new(Bytes::from(b.to_string())).boxed())
+            .context("build request")?
     } else {
-        format!(
-            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body_bytes}",
-            body_bytes.len()
-        )
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header("Host", "localhost")
+            .body(Empty::<Bytes>::new().boxed())
+            .context("build request")?
     };
 
-    stream.write_all(request.as_bytes()).await?;
+    let resp = sender.send_request(req).await.context("send request")?;
+    let status = resp.status();
 
-    let mut response = vec![0u8; 4096];
-    let n = stream.read(&mut response).await?;
-    let response_str = String::from_utf8_lossy(&response[..n]);
-
-    if !response_str.contains("200 OK") && !response_str.contains("204 No Content") {
-        anyhow::bail!(
-            "CH API {method} {path}: {}",
-            response_str.lines().next().unwrap_or("empty")
-        );
+    if !status.is_success() {
+        let body_bytes = resp.into_body().collect().await?.to_bytes();
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        anyhow::bail!("CH API {method} {path}: {} {}", status, body_str);
     }
 
     Ok(())

@@ -372,12 +372,16 @@ dependencies = [
  "cloudhv-common",
  "cloudhv-proto",
  "env_logger",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "log",
  "protobuf 3.4.0",
  "serde",
  "serde_json",
  "tokio",
+ "tower 0.5.3",
  "ttrpc",
 ]
 
