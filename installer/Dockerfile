@@ -19,6 +19,7 @@ COPY opt/cloudhv/ /opt/cloudhv/
 RUN cp /opt/cloud-hypervisor /opt/cloudhv/cloud-hypervisor
 
 RUN chmod +x /opt/cloudhv/containerd-shim-cloudhv-v1 \
+             /opt/cloudhv/cloudhv-sandbox-daemon \
              /opt/cloudhv/install.sh
 
 ENTRYPOINT ["/opt/cloudhv/install.sh"]

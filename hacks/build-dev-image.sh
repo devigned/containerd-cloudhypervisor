@@ -65,8 +65,8 @@ if [ -n "$REMOTE" ]; then
   make sync REMOTE_HOST="${REMOTE}" 2>&1 | tail -3 || true
   echo ""
 
-  echo "==> Step 2: Building static shim (force rebuild)..."
-  ssh "$REMOTE" "cd ~/containerd-cloudhypervisor && rm -f containerd-shim-cloudhv-v1 && bash hacks/build-static-rust.sh containerd-shim-cloudhv" 2>&1 | tail -5
+  echo "==> Step 2: Building static shim and daemon (force rebuild)..."
+  ssh "$REMOTE" "cd ~/containerd-cloudhypervisor && rm -f containerd-shim-cloudhv-v1 cloudhv-sandbox-daemon && bash hacks/build-static-rust.sh containerd-shim-cloudhv cloudhv-sandbox-daemon" 2>&1 | tail -5
   echo ""
 
   echo "==> Step 3: Verifying shim architecture..."
@@ -88,7 +88,7 @@ set -e
 cd ~/containerd-cloudhypervisor
 
 # Verify all artifacts exist
-for f in containerd-shim-cloudhv-v1 vmlinux rootfs.erofs installer/install.sh; do
+for f in containerd-shim-cloudhv-v1 cloudhv-sandbox-daemon vmlinux rootfs.erofs installer/install.sh; do
   if [ ! -f "\$f" ]; then
     echo "ERROR: Missing artifact: \$f"
     exit 1
@@ -97,10 +97,12 @@ done
 
 rm -rf /tmp/image-root && mkdir -p /tmp/image-root/opt/cloudhv
 cp containerd-shim-cloudhv-v1 /tmp/image-root/opt/cloudhv/
+cp cloudhv-sandbox-daemon     /tmp/image-root/opt/cloudhv/
 cp vmlinux                    /tmp/image-root/opt/cloudhv/
 cp rootfs.erofs               /tmp/image-root/opt/cloudhv/
 cp installer/install.sh       /tmp/image-root/opt/cloudhv/
 chmod +x /tmp/image-root/opt/cloudhv/containerd-shim-cloudhv-v1
+chmod +x /tmp/image-root/opt/cloudhv/cloudhv-sandbox-daemon
 chmod +x /tmp/image-root/opt/cloudhv/install.sh
 
 docker build -t ${IMAGE} -f installer/Dockerfile /tmp/image-root
