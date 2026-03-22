@@ -346,7 +346,7 @@ mod tests {
             hotplug_memory_mb: 0,
             hotplug_method: "acpi".to_string(),
             tpm_enabled: false,
-            warm_restore: false,
+            daemon_socket: String::new(),
         }
     }
 

@@ -277,9 +277,8 @@ fn test_shadow_snapshot_creation() {
     );
     let acquire_ms = t0.elapsed().as_millis();
     assert!(resp.get("error").is_none(), "acquire error: {resp}");
-    assert_eq!(
-        resp["from_snapshot"].as_bool().unwrap_or(true),
-        false,
+    assert!(
+        !resp["from_snapshot"].as_bool().unwrap_or(true),
         "first acquire should NOT be from snapshot"
     );
     println!(
@@ -338,9 +337,8 @@ fn test_shadow_snapshot_creation() {
         );
         let warm_ms = t1.elapsed().as_millis();
         assert!(resp2.get("error").is_none(), "warm acquire error: {resp2}");
-        assert_eq!(
+        assert!(
             resp2["from_snapshot"].as_bool().unwrap_or(false),
-            true,
             "second acquire SHOULD be from snapshot"
         );
         println!("Warm restore acquire: {}ms (from_snapshot=true)", warm_ms);

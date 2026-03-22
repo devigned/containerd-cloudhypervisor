@@ -52,10 +52,6 @@ pub struct DaemonConfig {
     #[serde(default = "default_state_dir")]
     pub state_dir: String,
 
-    /// Enable warm workload snapshots via shadow VMs (experimental).
-    #[serde(default)]
-    pub warm_restore: bool,
-
     /// Warmup duration in seconds for shadow VMs before snapshotting.
     #[serde(default = "default_warmup_secs")]
     pub warmup_duration_secs: u64,

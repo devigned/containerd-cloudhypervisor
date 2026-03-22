@@ -1,5 +1,6 @@
 pub mod annotations;
 pub mod config;
+pub mod daemon_client;
 pub mod hypervisor;
 pub mod instance;
 pub mod memory;

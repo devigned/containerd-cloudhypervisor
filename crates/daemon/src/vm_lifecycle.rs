@@ -112,10 +112,8 @@ pub async fn spawn_ch(config: &DaemonConfig, state_dir: &Path) -> Result<u32> {
 pub async fn wait_ch_ready(api_socket: &Path) -> Result<()> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {
-        if api_socket.exists() {
-            if UnixStream::connect(api_socket).await.is_ok() {
-                return Ok(());
-            }
+        if api_socket.exists() && UnixStream::connect(api_socket).await.is_ok() {
+            return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
@@ -127,9 +125,8 @@ pub async fn wait_for_agent(vsock_socket: &Path) -> Result<()> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline {
         if vsock_socket.exists() {
-            match try_agent_health(vsock_socket).await {
-                Ok(()) => return Ok(()),
-                Err(_) => {}
+            if let Ok(()) = try_agent_health(vsock_socket).await {
+                return Ok(());
             }
         }
         tokio::task::yield_now().await;
