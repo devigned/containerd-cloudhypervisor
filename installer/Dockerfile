@@ -2,24 +2,43 @@
 # This Dockerfile packages pre-built binaries (not compiled here).
 # The release workflow builds each component separately and copies
 # them into the build context before running this Dockerfile.
+#
+# Cloud Hypervisor is built from source (main branch) to get
+# userfaultfd OnDemand restore (PR #7800). Switch to a released
+# version once CH >= v51 is published.
 
-FROM debian:bookworm-slim
+# --- Stage 1: Build Cloud Hypervisor from source ---
+FROM rust:1.86-bookworm AS ch-builder
 
-ARG CH_VERSION=v44.0
-ARG TARGETARCH
+ARG CH_REPO=https://github.com/cloud-hypervisor/cloud-hypervisor.git
+ARG CH_BRANCH=main
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates dmsetup thin-provisioning-tools && \
-    if [ "$TARGETARCH" = "arm64" ]; then CH_SUFFIX="static-aarch64"; else CH_SUFFIX="static"; fi && \
-    curl -sL "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-${CH_SUFFIX}" \
-      -o /opt/cloud-hypervisor && chmod 755 /opt/cloud-hypervisor && \
+    build-essential pkg-config libssl-dev musl-tools git && \
+    rustup target add x86_64-unknown-linux-musl && \
     rm -rf /var/lib/apt/lists/*
 
+RUN git clone --depth 1 --branch ${CH_BRANCH} ${CH_REPO} /build/cloud-hypervisor
+
+WORKDIR /build/cloud-hypervisor
+RUN cargo build --release --target x86_64-unknown-linux-musl --bin cloud-hypervisor && \
+    cp target/x86_64-unknown-linux-musl/release/cloud-hypervisor /opt/cloud-hypervisor && \
+    chmod 755 /opt/cloud-hypervisor
+
+# --- Stage 2: Installer image ---
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=ch-builder /opt/cloud-hypervisor /opt/cloudhv/cloud-hypervisor
+
 COPY opt/cloudhv/ /opt/cloudhv/
-RUN cp /opt/cloud-hypervisor /opt/cloudhv/cloud-hypervisor
 
 RUN chmod +x /opt/cloudhv/containerd-shim-cloudhv-v1 \
              /opt/cloudhv/cloudhv-sandbox-daemon \
+             /opt/cloudhv/cloud-hypervisor \
              /opt/cloudhv/install.sh
 
 ENTRYPOINT ["/opt/cloudhv/install.sh"]
