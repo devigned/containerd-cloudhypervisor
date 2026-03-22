@@ -100,7 +100,7 @@ fn default_warmup_secs() -> u64 {
     30
 }
 fn default_max_snapshots() -> usize {
-    20
+    100
 }
 
 impl DaemonConfig {
