@@ -60,11 +60,15 @@ async fn handle_connection(
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    log::info!("client connected");
 
-    while let Some(line) = lines.next_line().await? {
-        let request: serde_json::Value = serde_json::from_str(&line)?;
+    let (reader, mut writer) = stream.into_split();
+    let mut buf_reader = BufReader::new(reader);
+    let mut line = String::new();
+
+    while buf_reader.read_line(&mut line).await? > 0 {
+        log::info!("received: {}", line.trim());
+        let request: serde_json::Value = serde_json::from_str(line.trim())?;
         let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
 
         let response = match method {
@@ -77,6 +81,9 @@ async fn handle_connection(
         let mut resp_str = serde_json::to_string(&response)?;
         resp_str.push('\n');
         writer.write_all(resp_str.as_bytes()).await?;
+        writer.flush().await?;
+        log::info!("responded: {}", resp_str.trim());
+        line.clear();
     }
 
     Ok(())
