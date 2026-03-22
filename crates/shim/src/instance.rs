@@ -619,6 +619,7 @@ async fn resolve_image_digest(image_ref: &str) -> Option<String> {
 }
 
 /// Prepare erofs image from rootfs (cached by image key).
+/// Uses flock to serialize concurrent mkfs.erofs for the same image.
 fn prepare_erofs(rootfs_path: &std::path::Path, cache_key: &str) -> Result<PathBuf, Error> {
     let cache_path = PathBuf::from(EROFS_CACHE_DIR).join(format!("{cache_key}.erofs"));
 
@@ -628,6 +629,25 @@ fn prepare_erofs(rootfs_path: &std::path::Path, cache_key: &str) -> Result<PathB
 
     std::fs::create_dir_all(EROFS_CACHE_DIR)
         .map_err(|e| Error::Any(anyhow::anyhow!("create erofs cache dir: {e}")))?;
+
+    // Serialize concurrent mkfs.erofs for the same image via flock
+    let lock_path = PathBuf::from(EROFS_CACHE_DIR).join(format!("{cache_key}.lock"));
+    let lock_file = std::fs::File::create(&lock_path)
+        .map_err(|e| Error::Any(anyhow::anyhow!("create lock: {e}")))?;
+    use std::os::unix::io::AsRawFd;
+    let fd = lock_file.as_raw_fd();
+    let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
+    if ret != 0 {
+        return Err(Error::Any(anyhow::anyhow!(
+            "flock: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    // Re-check after acquiring lock (another process may have created it)
+    if cache_path.exists() {
+        return Ok(cache_path);
+    }
 
     let tmp_path =
         PathBuf::from(EROFS_CACHE_DIR).join(format!("{cache_key}.{}.tmp", std::process::id()));

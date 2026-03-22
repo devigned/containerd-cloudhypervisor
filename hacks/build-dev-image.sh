@@ -101,11 +101,22 @@ cp cloudhv-sandbox-daemon     /tmp/image-root/opt/cloudhv/
 cp vmlinux                    /tmp/image-root/opt/cloudhv/
 cp rootfs.erofs               /tmp/image-root/opt/cloudhv/
 cp installer/install.sh       /tmp/image-root/opt/cloudhv/
+# Use the locally-installed CH binary (v51+ with OnDemand restore)
+cp /usr/local/bin/cloud-hypervisor /tmp/image-root/opt/cloudhv/cloud-hypervisor
 chmod +x /tmp/image-root/opt/cloudhv/containerd-shim-cloudhv-v1
 chmod +x /tmp/image-root/opt/cloudhv/cloudhv-sandbox-daemon
+chmod +x /tmp/image-root/opt/cloudhv/cloud-hypervisor
 chmod +x /tmp/image-root/opt/cloudhv/install.sh
 
-docker build -t ${IMAGE} -f installer/Dockerfile /tmp/image-root
+# Use a simple dev Dockerfile (skip CH source build)
+cat > /tmp/image-root/Dockerfile << 'DEVEOF'
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY opt/cloudhv/ /opt/cloudhv/
+ENTRYPOINT ["/opt/cloudhv/install.sh"]
+DEVEOF
+
+docker build -t ${IMAGE} /tmp/image-root
 docker push ${IMAGE}
 ENDSCRIPT
   echo ""
