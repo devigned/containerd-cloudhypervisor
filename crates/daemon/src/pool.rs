@@ -223,6 +223,8 @@ impl Pool {
     async fn restore_one(&self) -> Result<PoolVm> {
         use crate::vm_lifecycle;
 
+        let t0 = std::time::Instant::now();
+
         let vm_id = format!(
             "pool-{}-{}",
             std::process::id(),
@@ -234,22 +236,40 @@ impl Pool {
 
         let base_dir = self.config.base_snapshot_dir();
 
-        // Prepare snapshot: patch CID, vsock socket, serial console
+        // 1. Prepare snapshot: patch CID, vsock socket, serial console
         let vsock_socket = state_dir.join("vsock.sock");
         let snapshot_dir =
             vm_lifecycle::prepare_snapshot(&base_dir, &state_dir, cid, &vsock_socket)?;
+        let t_prepare = t0.elapsed().as_millis();
 
-        // Spawn CH process and restore
+        // 2. Spawn CH process
         let ch_pid = vm_lifecycle::spawn_ch(&self.config, &state_dir).await?;
+        let t_spawn = t0.elapsed().as_millis();
+
+        // 3. Wait for CH API socket
         let api_socket = state_dir.join("api.sock");
         vm_lifecycle::wait_ch_ready(&api_socket).await?;
-        vm_lifecycle::restore_vm(&api_socket, &snapshot_dir).await?;
-        vm_lifecycle::resume_vm(&api_socket).await?;
+        let t_ready = t0.elapsed().as_millis();
 
-        // Verify agent is responsive
+        // 4. vm.restore
+        vm_lifecycle::restore_vm(&api_socket, &snapshot_dir).await?;
+        let t_restore = t0.elapsed().as_millis();
+
+        // 5. vm.resume
+        vm_lifecycle::resume_vm(&api_socket).await?;
+        let t_resume = t0.elapsed().as_millis();
+
+        // 6. Wait for agent
         vm_lifecycle::wait_for_agent(&vsock_socket)
             .await
             .context("agent connect after restore")?;
+        let t_agent = t0.elapsed().as_millis();
+
+        info!(
+            "TIMING restore_one {}: prepare={}ms spawn={}ms ch_ready={}ms restore={}ms resume={}ms agent={}ms total={}ms",
+            vm_id, t_prepare, t_spawn - t_prepare, t_ready - t_spawn,
+            t_restore - t_ready, t_resume - t_restore, t_agent - t_resume, t_agent
+        );
 
         Ok(PoolVm {
             vm_id,

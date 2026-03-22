@@ -187,10 +187,13 @@ pub async fn snapshot_vm(api_socket: &Path, dest_dir: &Path) -> Result<()> {
 }
 
 /// Restore a VM from a snapshot directory.
+/// Uses `OnDemand` memory restore mode (userfaultfd) for lazy page loading.
+/// Requires Cloud Hypervisor >= v51.0 (PR #7800).
 pub async fn restore_vm(api_socket: &Path, source_dir: &Path) -> Result<()> {
     let body = serde_json::json!({
         "source_url": format!("file://{}", source_dir.display()),
         "prefault": false,
+        "memory_restore_mode": "OnDemand",
     });
     api_request(
         api_socket,
