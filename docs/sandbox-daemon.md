@@ -385,33 +385,156 @@ The installer DaemonSet additionally:
 The biggest win is at scale: pre-booted VMs eliminate boot contention
 entirely. Every pod gets an instantly-ready VM regardless of node load.
 
-### Migration Path
+### Implementation Plan
 
-The daemon is opt-in via the `daemon_socket` config field:
+The daemon is built and validated **independently** of the shim. The shim
+is not modified until the daemon's performance and reliability are proven
+via its own test harness.
 
-- **No daemon_socket**: shim behaves exactly as today (v0.12.0)
-- **daemon_socket set**: shim delegates VM lifecycle to the daemon
+#### Stage 1: Daemon Core (no shim changes)
 
-This allows incremental rollout and easy fallback.
+Build the daemon as a standalone binary with its ttrpc API. Test and
+benchmark it using a dedicated test client that simulates what the shim
+would do.
 
-#### Phase 1: Daemon with base VM pool
+**1a. Scaffold**
+- New crate: `crates/daemon/` with `main.rs`, `pool.rs`, `api.rs`, `config.rs`
+- Proto: `proto/daemon.proto` with `AcquireSandbox`, `ReleaseSandbox`, `Status`
+- Daemon binary: `cloudhv-sandbox-daemon`
+- Config loading from JSON file
+- Systemd unit template
 
-- New crate: `crates/daemon/`
-- Base snapshot creation at daemon startup
-- VM pool management (restore from base snapshot, replenish on acquire)
-- AcquireSandbox / ReleaseSandbox RPCs
-- Shim connects to daemon for VM acquisition
-- Installer deploys daemon binary + systemd unit
+**1b. Base snapshot**
+- On startup: cold-boot a VM, wait for agent health check, pause → snapshot → destroy
+- Cache base snapshot at `/run/cloudhv/daemon/base-snapshot/`
+- On subsequent startups: reuse if kernel + rootfs mtime unchanged
 
-#### Phase 2: Warm workload snapshots via shadow VMs
+**1c. VM pool**
+- Restore `pool_size` VMs from base snapshot (CoW)
+- Each VM: CH process + vsock socket + agent connected
+- Pool stored as `Vec<PoolVm>` behind a `Mutex`
+- Replenish async after each acquire
+- Idle timeout destroys excess VMs
 
-- Shadow VM lifecycle (spawn, warmup, snapshot, destroy)
-- Image-key-based snapshot selection in AcquireSandbox
-- Per-image warmup duration configuration
-- Snapshot eviction policy (LRU, max cache size)
-- No production VM pausing — all snapshots from shadow VMs
+**1d. AcquireSandbox / ReleaseSandbox**
+- AcquireSandbox: pop from pool, call ConfigureNetwork on the VM (with
+  caller-provided IP/TAP info), return VM handle
+- If pool empty: synchronous restore from base snapshot
+- ReleaseSandbox: shutdown + destroy CH process
 
-#### Phase 3: Observability and optimization
+**1e. Test client**
+- Standalone binary or integration test in `crates/daemon/tests/`
+- Connects to daemon socket, calls AcquireSandbox with mock TAP/IP
+- Hot-plugs a real rootfs disk, runs a container via agent RPC
+- Verifies workload runs, then calls ReleaseSandbox
+- Measures: acquire latency, container-ready latency, release latency
+- Runs lifecycle N times, reports p50/p95/p99
+
+**1f. Benchmarks**
+- Single-pod latency: acquire → hot-plug → RunContainer → workload ready
+- Pool drain: N concurrent acquires, measure tail latency
+- Pool replenish: time from release to pool_ready restored
+- Memory: per-VM RSS, total pool RSS, CoW sharing ratio
+- Compare with direct CH spawn (v0.12.0 shim behavior)
+- Run on hl-dev (D8s_v5, KVM) for consistent comparison
+
+**Milestone**: daemon passes all Stage 1 tests, acquire latency <5ms from
+warm pool, pool replenish <400ms, 100 consecutive lifecycle passes.
+
+#### Stage 2: Shadow VM Snapshots (no shim changes)
+
+Add warm workload snapshots via shadow VMs to the daemon. Test via the
+same test client.
+
+**2a. Shadow VM lifecycle**
+- On first AcquireSandbox for an unknown `image_key`:
+  - Return pool VM immediately
+  - Spawn shadow VM in background (restore from base → hot-plug rootfs →
+    RunContainer → wait warmup → pause → snapshot → destroy)
+- Cache workload snapshot under `image_key`
+
+**2b. Snapshot restore in AcquireSandbox**
+- If workload snapshot exists for `image_key`: restore from it instead of pool
+- Set `from_snapshot = true` in response
+- Caller skips RunContainer (workload already alive)
+
+**2c. Snapshot management**
+- LRU eviction when cache exceeds `max_snapshots`
+- Invalidation when rootfs mtime changes
+- Per-image warmup duration config
+
+**2d. Test client extensions**
+- Acquire with `image_key` → verify cold path (pool VM)
+- Wait for shadow snapshot → acquire again → verify `from_snapshot = true`
+- Workload responds to HTTP immediately after warm restore
+- Shadow failure → verify no impact, retry works
+- Eviction: fill cache, verify oldest evicted
+
+**2e. Benchmarks**
+- Warm acquire latency: target <10ms
+- Shadow VM total time: boot + warmup + snapshot + destroy
+- Cold vs warm workload readiness (measure HTTP response time)
+- Memory sharing: 50 warm-restored VMs, total RSS vs naive
+
+**Milestone**: warm workload snapshot restore <10ms, shadow VMs produce
+correct snapshots for Python/Node/Go workloads, 100 consecutive warm
+lifecycle passes.
+
+#### Stage 3: Shim Integration
+
+Only after Stage 1 and 2 milestones are met. Minimal shim changes:
+
+**3a. Daemon client in shim**
+- Add `daemon_socket` field to `RuntimeConfig`
+- New module: `crates/shim/src/daemon_client.rs`
+- ttrpc client that connects to daemon socket
+
+**3b. start_sandbox changes**
+- If `daemon_socket` is set: skip VMM spawn, store TAP info only
+- If not set: existing behavior (eager boot)
+
+**3c. start_container changes**
+- If daemon mode: call `AcquireSandbox(tap, mac, ip, gw, image_key)`
+- Move CH PID to pod cgroup
+- If `from_snapshot`: ConfigureNetwork, skip RunContainer
+- If not: hot-plug rootfs, RunContainer
+- If not daemon mode: existing behavior
+
+**3d. delete changes**
+- If daemon mode: call `ReleaseSandbox(vm_id)`, clean TAP
+- If not: existing behavior
+
+**3e. Fallback**
+- If daemon socket unavailable: log warning, fall back to direct spawn
+- Shim works with or without daemon — daemon is purely additive
+
+**3f. Integration tests**
+- Full CRI flow via crictl with daemon running
+- Compare timing with daemon vs without
+- Scale test on AKS with daemon DaemonSet
+
+**Milestone**: shim + daemon end-to-end passing all existing tests (crictl
+lifecycle, AKS agent sandbox, 150-pod scale), with improved latency.
+
+#### Stage 4: AKS Benchmark and Production Hardening
+
+**4a. Installer changes**
+- Install daemon binary + systemd unit + daemon config
+- DaemonSet resource requests cover pool memory
+- Cache cleanup on installer upgrade
+
+**4b. AKS benchmark**
+- 150-pod scale: CloudHV + daemon vs Kata (identical infra)
+- Agent sandbox timing: 10 consecutive runs
+- Contention: 50 concurrent pod starts
+- Node memory at peak
+- Generate report for `reports/`
+
+**4c. Production hardening**
+- Prometheus metrics endpoint on daemon
+- Pool auto-sizing based on recent acquire rate
+- Graceful shutdown (drain pool on SIGTERM)
+- Log correlation between daemon and shim (shared request ID)
 
 - Pool auto-sizing based on node load
 - Prometheus metrics (pool size, acquire latency, restore latency)
