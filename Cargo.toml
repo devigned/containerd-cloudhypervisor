@@ -3,6 +3,7 @@ members = [
     "crates/shim",
     "crates/proto",
     "crates/common",
+    "crates/daemon",
 ]
 exclude = [
     "crates/agent",

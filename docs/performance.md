@@ -1,82 +1,80 @@
 # Performance
 
-## Cold Boot with Async Eager Boot (crictl, single pod)
+## Daemon Pool Acquire (single pod)
 
-The shim boots the VM asynchronously during sandbox creation, overlapping
-with containerd's internal processing. Container rootfs disks are hot-plugged
-after boot; the agent discovers them via inotify (<1ms).
+With the sandbox daemon, VMs are pre-booted in a pool via CH v51 OnDemand
+restore. Acquiring a VM is near-instant.
 
-Measured on hl-dev (Azure D8s_v5, KVM, Cloud Hypervisor v44.0, 1 vCPU):
+| Scenario | Latency |
+|----------|--------:|
+| Pool hit (pre-booted VM available) | **0ms** |
+| Pool empty (synchronous OnDemand restore) | **~25ms** |
 
-### Cached erofs (5 runs)
-
-| Phase | Min | Max | Avg |
-|-------|----:|----:|----:|
-| start_sandbox (async boot spawned) | 7ms | 8ms | 7ms |
-| containerd gap (not our code) | 82ms | 93ms | 88ms |
-| Boot await (residual after overlap) | 0ms | 90ms | 55ms |
-| Hot-plug + inotify + mount + crun | 14ms | 24ms | 18ms |
-| **start_container total** | **26ms** | **110ms** | **80ms** |
-
-Best case: **26ms** (boot finished during containerd gap).
-
-### Uncached erofs (first image)
-
-| Phase | Time |
-|-------|-----:|
-| start_sandbox | 7ms |
-| Boot await (overlapped with erofs) | 0ms |
-| erofs conversion (mkfs.erofs) | 43ms |
-| Hot-plug + mount + crun | 14ms |
-| **start_container total** | **59ms** |
-
-### Optimization breakdown
-
-| Version | start_container (cached) | Key change |
-|---------|------------------------:|------------|
-| v0.10.0 | ~530ms | Baseline (sequential boot) |
-| v0.11.0 | ~340ms | Warm snapshots, tight netlink |
-| v0.12.0-dev | **~26-110ms** | Async boot, tight-poll agent, inotify mount |
-
-## Warm Snapshot Restore (AKS)
-
-Warm snapshot restore eliminates kernel boot and workload startup for all
-pods after the first. The first pod cold-boots and creates a snapshot; all
-
-> **Note:** The cold boot path with async eager boot is faster for single-pod
-> shim latency (~240ms vs ~344ms) because warm restore serializes a larger VM
-> state. Warm restore's value is at **scale**: CoW memory sharing (~5 MiB/pod
-> vs ~60 MiB/pod) and **instant workload readiness** — workloads like Python
-> or Node.js that take 10–15s to start are already running in the restored
-> snapshot. For single-pod benchmarks, cold boot wins on wall-clock time; for
-> production deployments with many pods of the same image, warm restore wins
-> on total resource cost and application-level latency.
-subsequent pods restore from it with CoW (copy-on-write) memory.
+## Cold Path (shim inner, daemon mode)
 
 Measured on AKS (3 × D8ds_v5, Kubernetes v1.33.7, containerd 2.0.0):
 
-| Phase | Cold Boot | Warm Restore |
-|-------|----------:|-----------:|
-| TAP setup (netlink) | <1ms | <1ms |
-| VMM spawn + ready | 6ms | 6ms |
-| VM boot / restore | ~35ms | ~293ms |
-| Agent connect | ~170ms | ~17ms |
-| ConfigureNetwork | — | ~17ms |
-| Container start | ~18ms | 0ms (skipped) |
-| **Total shim time** | **~240ms** | **~344ms** |
+| Phase | Time |
+|-------|-----:|
+| erofs conversion (cached) | 0ms |
+| erofs conversion (uncached, mkfs.erofs) | ~8ms |
+| daemon.AcquireSandbox (pool hit) | ~63ms |
+| Hot-plug + RunContainer RPC | ~11ms |
+| **Cold path shim inner total** | **~74ms** |
 
-### Scale Performance
+## Warm Snapshot Path (daemon mode)
+
+When a warm workload snapshot exists (created by a shadow VM in the background):
+
+| Phase | Time |
+|-------|-----:|
+| daemon.AcquireSandbox (warm snapshot restore) | ~24ms |
+| Agent connect | ~80ms |
+| ConfigureNetwork RPC | ~50ms |
+| Container adoption | ~14ms |
+| **Warm path total** | **~168ms** |
+
+The workload wakes up **already running** — no kernel boot, no agent init,
+no application startup.
+
+## Scale Performance
+
+| Metric | Daemon (current) | v0.11.0 (warm restore) | v0.7.0 |
+|--------|------------------:|----------------------:|-------:|
+| 150 pods → all Ready | **11s** | 77s | 27s |
+| Scale-down 150 → 0 | 12s | 12s | — |
+| Infra | 3 × D8ds_v5 | 3 × D8ds_v5 | 3 × D8ds_v5 |
+
+## Resource Overhead
+
+### Per-VM Memory
+
+| Component | Value |
+|-----------|------:|
+| VM RSS (128 MB allocated, OnDemand userfaultfd) | **~24 MB** |
+| Pool VM idle RSS | ~6 MB |
+| Shim process RSS | ~6 MB |
+| Daemon RSS (total, not per-VM) | ~2.2 MB |
+
+### Node Memory at 150 Pods (3 nodes, 50 VMs per node)
 
 | Metric | Value |
-|--------|-------|
-| 150 pods → all Ready | **77s** (3 × D8ds_v5) |
-| Scale-down 150 → 0 | **12s** (clean termination) |
-| 10 consecutive sandbox runs | **10/10 pass** |
+|--------|------:|
+| Per-node VM memory | ~3.2 GB |
+| Per-node memory utilization | **~10%** of 32 GB |
+| Total cluster memory (3 nodes) | ~9.6 GB |
+
+### Cache Sizes (per node)
+
+| Cache | Size |
+|-------|-----:|
+| erofs cache (per unique image) | ~8.6 MB |
+| Base snapshot (daemon state) | ~513 MB |
 
 ## Rootfs Delivery Performance
 
 The shim caches rootfs as erofs images at `/run/cloudhv/erofs-cache/<hash>.erofs`,
-content-addressed by overlayfs lowerdir paths. flock-serialized for concurrent builds.
+content-addressed by image digest. flock-serialized for concurrent builds.
 
 | Metric | Without Cache | With Cache |
 |--------|--------------|------------|
@@ -85,45 +83,17 @@ content-addressed by overlayfs lowerdir paths. flock-serialized for concurrent b
 | Per-container disk creation | ~460ms | **~3ms** |
 | Speedup | — | **153×** |
 
-## Resource Overhead (per VM)
+## Comparison with Kata Containers
 
-| Component | Cold Boot | Warm Restore (CoW) |
-|-----------|----------:|----:|
-| Cloud Hypervisor (VmRSS) | ~50 MiB | ~529 MiB (524 MiB shared) |
-| Cloud Hypervisor (unique) | ~50 MiB | **~5 MiB** |
-| Shim process (sandbox) | ~5.5 MiB | ~5.5 MiB |
-| Shim process (container) | ~1.4 MiB | ~1.4 MiB |
-| **Total unique per pod** | **~57 MiB** | **~12 MiB** |
-
-No virtiofsd process — block-device-only architecture (2 processes per VM).
-
-### Cache Sizes (per node, per workload image)
-
-| Cache | Size |
-|-------|-----:|
-| Snapshot cache | ~513 MiB |
-| erofs cache | ~8.6 MiB |
-
-## Density
-
-With warm snapshot restore at 150 VMs across 3 nodes (50 per node):
-
-| Component | Per Node | Total (3 nodes) |
-|-----------|---------|------|
-| Unique VM memory | ~250 MiB | ~750 MiB |
-| Snapshot (shared) | ~513 MiB | ~1.5 GiB |
-| System overhead | ~1 GiB | ~3 GiB |
-| **Total used** | **~6 GiB** | **~14 GiB** |
-| **Available (of 32 GiB)** | **~26 GiB** | **~82 GiB** |
-
-## Comparison
+Measured on identical AKS infrastructure (3 × D8ds_v5, 96 GiB total RAM):
 
 | | containerd-cloudhypervisor | Kata Containers |
 |---|---|---|
-| **Cold start (cached)** | ~26-110ms (async boot) | ~500ms–1s |
-| **Warm restore** | ~344ms | N/A |
-| **150-pod scale** | 150/150 (77s) | 130/150 (stuck) |
-| **Memory per pod** | ~5 MiB (CoW) / ~57 MiB (cold) | ~312 MiB |
+| **Cold start (shim inner)** | ~74ms | ~500ms–1s |
+| **Warm restore** | ~168ms | N/A |
+| **150-pod scale** | 150/150 in **11s** | 130/150 (OOM at 130) |
+| **Memory per pod** | **~24 MB** | ~330 MB |
+| **Node memory at 150 pods** | **10%** | 43%+ (OOM) |
 | **Shim binary** | ~4.6 MB | ~65 MB |
 | **Guest rootfs** | 5.4 MB (erofs) | ~257 MB |
 | **Hypervisors** | Cloud Hypervisor only | CH, QEMU, Firecracker |

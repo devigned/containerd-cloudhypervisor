@@ -59,12 +59,11 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub tpm_enabled: bool,
 
-    /// Enable warm workload snapshots for near-instant pod startup.
-    /// **Experimental.** When enabled, the shim snapshots the VM after the
-    /// first pod's workload is fully running and restores subsequent pods
-    /// from the snapshot with CoW memory. Disabled by default.
-    #[serde(default = "default_warm_restore")]
-    pub warm_restore: bool,
+    /// Path to the sandbox daemon Unix socket. When set, the shim
+    /// delegates VM lifecycle to the daemon instead of spawning CH
+    /// directly. Leave empty or omit to use direct spawn (default).
+    #[serde(default)]
+    pub daemon_socket: String,
 }
 
 fn default_ch_binary() -> String {
@@ -98,9 +97,6 @@ fn default_hotplug_memory_mb() -> u64 {
 }
 fn default_hotplug_method() -> String {
     "acpi".to_string()
-}
-fn default_warm_restore() -> bool {
-    false
 }
 
 /// Cloud Hypervisor VM configuration (JSON sent to CH API)

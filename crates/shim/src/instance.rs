@@ -1,3 +1,8 @@
+//! Thin containerd shim instance that delegates VM lifecycle to the
+//! sandbox daemon. The shim handles networking (TAP/tc), erofs rootfs
+//! conversion, and container lifecycle RPCs. The daemon handles VM
+//! boot, pooling, and snapshot management.
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,22 +16,20 @@ use log::info;
 use tokio::sync::OnceCell;
 
 use crate::config::load_config;
-use crate::vm::VmManager;
+use crate::daemon_client::{AcquireRequest, DaemonClient};
 
-/// Milliseconds since Unix epoch for absolute timestamps in TIMING logs.
-fn epoch_ms() -> u128 {
+/// Milliseconds since Unix epoch for TIMING logs.
+pub fn epoch_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
 }
 
-/// Directory for cached erofs images shared across sandboxes.
-/// Same container image → same erofs image (keyed by content hash of
-/// the overlayfs lowerdir paths).
 const EROFS_CACHE_DIR: &str = "/run/cloudhv/erofs-cache";
+const CRI_CONTAINER_TYPE: &str = "/annotations/io.kubernetes.cri.container-type";
+const CRI_SANDBOX_ID: &str = "/annotations/io.kubernetes.cri.sandbox-id";
 
-/// Extension trait to simplify error conversion to shimkit Error.
 trait ResultExt<T> {
     fn ctx(self, msg: &str) -> Result<T, Error>;
 }
@@ -37,19 +40,13 @@ impl<T, E: std::fmt::Display> ResultExt<T> for Result<T, E> {
     }
 }
 
-const CRI_CONTAINER_TYPE: &str = "/annotations/io.kubernetes.cri.container-type";
-const CRI_SANDBOX_ID: &str = "/annotations/io.kubernetes.cri.sandbox-id";
-
 // ---------------------------------------------------------------------------
 // Static shared state
 // ---------------------------------------------------------------------------
 
-/// Active VMs keyed by sandbox ID. Shimkit creates one Instance per
-/// container, but sandbox and app containers in the same pod share a VM.
 static VMS: LazyLock<RwLock<HashMap<String, Arc<SharedVmState>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
-/// Look up a VM by sandbox ID (takes a brief read-lock on VMS).
 fn get_vm(sandbox_id: &str) -> Option<Arc<SharedVmState>> {
     VMS.read()
         .unwrap_or_else(|e| e.into_inner())
@@ -57,50 +54,33 @@ fn get_vm(sandbox_id: &str) -> Option<Arc<SharedVmState>> {
         .cloned()
 }
 
-/// Tracks the VM boot lifecycle so concurrent containers can synchronize.
-#[derive(Debug, Clone, PartialEq)]
-enum BootState {
-    /// VM process is running but vm.create/boot has not been called yet.
-    NotBooted,
-    /// First container is currently booting the VM.
-    Booting,
-    /// VM booted and agent connected successfully.
-    Booted,
-    /// VM boot failed — subsequent containers should not proceed.
-    Failed(String),
-}
+// ---------------------------------------------------------------------------
+// Shared VM state (thin — daemon owns the VM)
+// ---------------------------------------------------------------------------
 
-/// Shared state for a running VM (one per pod).
 struct SharedVmState {
-    vm: VmManager,
+    /// Agent ttrpc client (connected after daemon acquire).
     agent: OnceCell<cloudhv_proto::AgentServiceClient>,
+    /// vsock proxy socket path (from daemon).
     vsock_socket: PathBuf,
-    shared_dir: PathBuf,
+    /// Cloud Hypervisor process PID (for exit watching + cgroup placement).
+    ch_pid: u32,
+    /// Container count (sandbox counts as 1).
     container_count: AtomicUsize,
-    api_socket: PathBuf,
-    boot_state: tokio::sync::Mutex<BootState>,
-    boot_complete: tokio::sync::Notify,
-    // Store sandbox boot config for deferred boot
+    /// TAP device name (created by shim in pod netns).
     tap_name: Option<String>,
     tap_mac: Option<String>,
     ip_cidr: Option<String>,
     gateway: Option<String>,
     netns: Option<String>,
     cgroups_path: Option<String>,
-    /// Containers running in this VM, for snapshot metadata.
-    /// Each entry: (container_id, image_key, pid)
-    container_info: tokio::sync::Mutex<Vec<(String, String, u32)>>,
-    /// Handle for the async eager boot task spawned in start_sandbox.
-    /// The first container takes this handle and awaits it.
-    eager_boot: tokio::sync::Mutex<Option<tokio::task::JoinHandle<Result<(), anyhow::Error>>>>,
+    /// VM ID assigned by the daemon (for release).
+    daemon_vm_id: String,
+    /// Daemon socket path.
+    daemon_socket: String,
 }
 
-/// Lazily connect to the guest agent over vsock, caching the client in the
-/// `OnceCell`. The first caller pays the connection cost; subsequent callers
-/// get the cached client.
-///
-/// Uses exponential backoff with jitter to avoid thundering herd when many
-/// VMs boot simultaneously on the same node.
+/// Connect to the guest agent over vsock.
 async fn get_or_connect_agent(
     vm_state: &SharedVmState,
 ) -> Result<cloudhv_proto::AgentServiceClient, Error> {
@@ -109,274 +89,207 @@ async fn get_or_connect_agent(
         .get_or_try_init(|| async {
             let vsock_client = crate::vsock::VsockClient::new(&vm_state.vsock_socket);
 
-            // Phase 1: Tight poll for the first 500ms — the agent is typically
-            // ready within 100-200ms after kernel boot. Yielding instead of sleeping
-            // eliminates the ~50-75ms backoff delay waste.
+            // Tight-poll for first 500ms (fast for warm-restored VMs
+            // where the agent is already running)
             let tight_poll_deadline =
                 tokio::time::Instant::now() + std::time::Duration::from_millis(500);
-            let mut tight_attempts = 0u32;
             while tokio::time::Instant::now() < tight_poll_deadline {
                 match vsock_client.connect_ttrpc().await {
-                    Ok((agent, _health)) => {
-                        if tight_attempts > 0 {
-                            info!("agent connected after {tight_attempts} tight-poll attempts");
-                        }
-                        return Ok(agent);
-                    }
-                    Err(_) => {
-                        tight_attempts += 1;
-                        if tight_attempts.is_multiple_of(50) {
-                            // Brief sleep every 50 attempts to prevent CPU spike
-                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                        } else {
-                            tokio::task::yield_now().await;
-                        }
+                    Ok((agent, _health)) => return Ok(agent),
+                    Err(_) => tokio::task::yield_now().await,
+                }
+            }
+
+            // Fixed 100ms retry for next 5s (vsock proxy may need time)
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut last_err = String::new();
+            while tokio::time::Instant::now() < deadline {
+                match vsock_client.connect_ttrpc().await {
+                    Ok((agent, _health)) => return Ok(agent),
+                    Err(e) => {
+                        last_err = format!("{e:#}");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                 }
             }
 
-            // Phase 2: Exponential backoff for slow/contended boots (>500ms).
-            // This should be rare in normal operation.
-            let max_attempts = 10u32;
-            let base_delay_ms = 200u64;
-            let max_delay_ms = 3000u64;
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(55);
-            let mut last_err = String::new();
-
-            for attempt in 0..max_attempts {
+            // Last resort: longer backoff for cold boot
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25);
+            for attempt in 0..8u32 {
                 if tokio::time::Instant::now() >= deadline {
                     break;
                 }
-
                 match vsock_client.connect_ttrpc().await {
-                    Ok((agent, _health)) => {
-                        info!(
-                            "agent connected after {} tight + {} backoff attempts",
-                            tight_attempts, attempt
-                        );
-                        return Ok(agent);
-                    }
+                    Ok((agent, _health)) => return Ok(agent),
                     Err(e) => {
                         last_err = format!("{e:#}");
-                        if attempt < max_attempts - 1 && tokio::time::Instant::now() < deadline {
-                            let exp_delay = base_delay_ms * 2u64.pow(attempt);
-                            let capped = exp_delay.min(max_delay_ms);
-                            let jitter_seed = (std::process::id() as u64)
-                                .wrapping_mul(attempt as u64 + 1)
-                                .wrapping_add(0x517cc1b727220a95);
-                            let jitter_frac = (jitter_seed % 100) as f64 / 100.0;
-                            let jitter_ms = (capped as f64 * (0.5 + jitter_frac)) as u64;
-                            info!(
-                                "agent connect backoff attempt {attempt} failed, retrying in {jitter_ms}ms: {last_err}"
-                            );
-                            tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
-                        }
+                        let delay = (500u64 * 2u64.pow(attempt)).min(3000);
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     }
                 }
             }
 
-            Err(Error::Any(anyhow::anyhow!(
-                "agent connect: {last_err} (after {} tight + {max_attempts} backoff attempts)",
-                tight_attempts
-            )))
+            Err(Error::Any(anyhow::anyhow!("agent connect: {last_err}")))
         })
         .await
         .cloned()
 }
 
 // ---------------------------------------------------------------------------
-// CloudHvInstance — implements shimkit's Instance trait
+// CloudHvInstance — the shimkit Instance implementation
 // ---------------------------------------------------------------------------
 
 pub struct CloudHvInstance {
     id: String,
-    bundle: PathBuf,
-    exit: WaitableCell<(u32, DateTime<Utc>)>,
-    is_sandbox: bool,
     sandbox_id: String,
-    stdout: PathBuf,
-    stderr: PathBuf,
+    bundle: PathBuf,
+    exit: Arc<WaitableCell<(u32, DateTime<Utc>)>>,
 }
 
 impl Instance for CloudHvInstance {
     async fn new(id: String, cfg: &InstanceConfig) -> Result<Self, Error> {
-        info!("CloudHvInstance::new id={}", id);
-
         let spec_path = cfg.bundle.join("config.json");
-        let (is_sandbox, sandbox_id) = parse_container_type(&spec_path, &id);
+        let spec_str = std::fs::read_to_string(&spec_path)
+            .map_err(|e| Error::Any(anyhow::anyhow!("read spec: {e}")))?;
+        let spec: serde_json::Value = serde_json::from_str(&spec_str)
+            .map_err(|e| Error::Any(anyhow::anyhow!("parse spec: {e}")))?;
+
+        let sandbox_id = spec
+            .pointer(CRI_SANDBOX_ID)
+            .and_then(|v| v.as_str())
+            .unwrap_or(&id)
+            .to_string();
 
         Ok(Self {
-            id,
-            bundle: cfg.bundle.clone(),
-            exit: WaitableCell::new(),
-            is_sandbox,
+            id: id.clone(),
             sandbox_id,
-            stdout: cfg.stdout.clone(),
-            stderr: cfg.stderr.clone(),
+            bundle: cfg.bundle.clone(),
+            exit: Arc::new(WaitableCell::new()),
         })
     }
 
     async fn start(&self) -> Result<u32, Error> {
-        info!(
-            "CloudHvInstance::start id={} sandbox={}",
-            self.id, self.is_sandbox
-        );
+        let spec = std::fs::read_to_string(self.bundle.join("config.json"))
+            .map_err(|e| Error::Any(anyhow::anyhow!("read spec: {e}")))?;
+        let spec_json: serde_json::Value = serde_json::from_str(&spec)
+            .map_err(|e| Error::Any(anyhow::anyhow!("parse spec: {e}")))?;
 
-        if self.is_sandbox {
-            self.start_sandbox().await
-        } else {
-            self.start_container().await
+        let container_type = spec_json
+            .pointer(CRI_CONTAINER_TYPE)
+            .and_then(|v| v.as_str())
+            .unwrap_or("container");
+
+        match container_type {
+            "sandbox" => self.start_sandbox().await,
+            _ => self.start_container().await,
         }
     }
 
     async fn kill(&self, signal: u32) -> Result<(), Error> {
         info!("CloudHvInstance::kill id={} signal={}", self.id, signal);
 
-        // Best-effort agent RPC — fire and forget (skip if agent never connected)
         if let Some(vm_state) = get_vm(&self.sandbox_id) {
-            if let Some(agent) = vm_state.agent.get() {
-                let cid = self.id.clone();
-                let agent = agent.clone();
-                tokio::spawn(async move {
-                    let mut kreq = cloudhv_proto::KillContainerRequest::new();
-                    kreq.container_id = cid;
-                    kreq.signal = signal;
-                    kreq.all = true;
-                    let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(5));
-                    let _ = agent.kill_container(ctx, &kreq).await;
-                });
+            if let Ok(agent) = get_or_connect_agent(&vm_state).await {
+                let mut req = cloudhv_proto::KillContainerRequest::new();
+                req.container_id = self.id.clone();
+                req.signal = signal;
+                let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(5));
+                let _ = agent.kill_container(ctx, &req).await;
             }
         }
 
-        // Record exit so shimkit's task_delete can retrieve an exit code.
-        // shimkit >=0.1.1+patch allows kill() on Exited tasks (no-op),
-        // so repeated calls here are harmless.
-        let _ = self.exit.set((137, Utc::now()));
+        // For sandbox containers: set exit after a brief wait for the CH process
+        // to die. Sandbox containers have no RunContainer and thus no agent-based
+        // exit watcher. App containers rely on the PID watcher spawned in
+        // start_container.
+        let is_sandbox = self.id == self.sandbox_id;
+        if is_sandbox && (signal == 9 || signal == 15) {
+            let exit = self.exit.clone();
+            if let Some(vm_state) = get_vm(&self.sandbox_id) {
+                let ch_pid = vm_state.ch_pid;
+                if ch_pid > 0 {
+                    // Watch CH PID — when daemon destroys the VM, this fires
+                    tokio::spawn(async move {
+                        wait_for_pid_exit(ch_pid).await;
+                        let _ = exit.set((137, Utc::now()));
+                    });
+                } else {
+                    // No VM acquired yet — set exit immediately
+                    let _ = exit.set((0, Utc::now()));
+                }
+            } else {
+                let _ = exit.set((0, Utc::now()));
+            }
+        }
+
         Ok(())
     }
 
     async fn delete(&self) -> Result<(), Error> {
-        let t_total = std::time::Instant::now();
         info!("CloudHvInstance::delete id={}", self.id);
+        let t_total = std::time::Instant::now();
 
-        // Ensure exit is recorded — if kill() was never called (e.g. force-delete),
-        // this lets shimkit's task_delete retrieve an exit code.
-        let _ = self.exit.set((137, Utc::now()));
-
-        let vm_state = get_vm(&self.sandbox_id);
-
-        if let Some(vm_state) = vm_state {
-            // Best-effort delete RPC — use a short timeout since the VM may
-            // already be dead (crash, liveness probe kill). A long timeout here
-            // blocks containerd's snapshot cleanup, causing "device busy" loops.
-            let t_rpc = std::time::Instant::now();
-            if let Some(agent) = vm_state.agent.get() {
-                let cid = self.id.clone();
-                let mut del_req = cloudhv_proto::DeleteContainerRequest::new();
-                del_req.container_id = cid;
-                let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(2));
-                let _ = agent.delete_container(ctx, &del_req).await;
-            }
-            let rpc_ms = t_rpc.elapsed().as_millis();
-
-            // Clean up disk image (erofs or ext4)
-            if !self.is_sandbox {
-                let state_dir = vm_state.shared_dir.parent().unwrap_or(&vm_state.shared_dir);
-                let disk_id = format!("ctr-{}", &self.id[..12.min(self.id.len())]);
-                for ext in &["erofs", "img"] {
-                    let disk_path = state_dir.join(format!("{disk_id}.{ext}"));
-                    match std::fs::remove_file(&disk_path) {
-                        Ok(()) => info!("removed disk image: {}", disk_path.display()),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => info!("failed to remove disk image: {e}"),
-                    }
-                }
-            }
-
-            // Abort any in-flight eager boot to release the Arc<SharedVmState>
-            if let Some(handle) = vm_state.eager_boot.lock().await.take() {
-                handle.abort();
-                info!(
-                    "aborted in-flight eager boot for sandbox {}",
-                    self.sandbox_id
-                );
-            }
-
-            // Decrement container count; clean up VM if zero
+        if let Some(vm_state) = get_vm(&self.sandbox_id) {
             let prev = vm_state.container_count.fetch_sub(1, Ordering::SeqCst);
-            if prev <= 1 {
-                // Clean up network state BEFORE shutting down VM — the netns
-                // may be reused by the next sandbox if we don't remove the TAP
-                // device and tc redirect rules.
-                let t_tap = std::time::Instant::now();
-                if let (Some(ref tap), Some(ref netns)) = (&vm_state.tap_name, &vm_state.netns) {
-                    crate::netns::cleanup_tap(netns, tap).await;
-                }
-                let tap_ms = t_tap.elapsed().as_millis();
 
-                let t_vm = std::time::Instant::now();
-                let removed = VMS
-                    .write()
+            if prev <= 1 {
+                // Last container — release VM to daemon
+                let client = DaemonClient::new(&vm_state.daemon_socket);
+                if let Err(e) = client.release_sandbox(&vm_state.daemon_vm_id) {
+                    info!("daemon release failed (non-fatal): {e:#}");
+                }
+
+                // Clean up TAP
+                if let (Some(ref netns), Some(ref tap)) = (&vm_state.netns, &vm_state.tap_name) {
+                    crate::netns::cleanup_tap(netns, tap).await;
+                    info!("cleaned up TAP {tap}");
+                }
+
+                VMS.write()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&self.sandbox_id);
-                if let Some(removed_state) = removed {
-                    // Take ownership of VmManager for cleanup
-                    match Arc::try_unwrap(removed_state) {
-                        Ok(state) => {
-                            let mut vm = state.vm;
-                            let _ = vm.cleanup().await;
-                            info!("VM cleaned up for sandbox {}", self.sandbox_id);
-                        }
-                        Err(arc) => {
-                            // Other references exist — just log, VM will be cleaned up on drop
-                            info!("VM {} still referenced, skipping cleanup", self.sandbox_id);
-                            drop(arc);
-                        }
-                    }
-                }
-                let vm_ms = t_vm.elapsed().as_millis();
 
                 info!(
-                    "TIMING delete {} @{}: rpc={}ms tap_cleanup={}ms vm_cleanup={}ms total={}ms",
+                    "TIMING delete {} @{}: total={}ms (sandbox released)",
                     self.id,
                     epoch_ms(),
-                    rpc_ms,
-                    tap_ms,
-                    vm_ms,
                     t_total.elapsed().as_millis()
                 );
             } else {
+                // Container delete — just notify agent
+                if let Ok(agent) = get_or_connect_agent(&vm_state).await {
+                    let mut req = cloudhv_proto::DeleteContainerRequest::new();
+                    req.container_id = self.id.clone();
+                    let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(5));
+                    let _ = agent.delete_container(ctx, &req).await;
+                }
+
                 info!(
-                    "TIMING delete {} @{}: rpc={}ms total={}ms (container only, {} remaining)",
+                    "TIMING delete {} @{}: total={}ms (container only, {} remaining)",
                     self.id,
                     epoch_ms(),
-                    rpc_ms,
                     t_total.elapsed().as_millis(),
                     prev - 1
                 );
             }
         }
 
+        let _ = self.exit.set((0, Utc::now()));
         Ok(())
     }
 
     async fn wait(&self) -> (u32, DateTime<Utc>) {
-        info!("CloudHvInstance::wait id={}", self.id);
-        let result = *self.exit.wait().await;
-        info!(
-            "CloudHvInstance::wait done id={} code={}",
-            self.id, result.0
-        );
-        result
+        *self.exit.wait().await
     }
 }
 
 // ---------------------------------------------------------------------------
-// Helper methods
+// Sandbox and container lifecycle
 // ---------------------------------------------------------------------------
 
 impl CloudHvInstance {
-    /// Boot a VM for the sandbox container.
+    /// Set up networking for the sandbox. No VM interaction — the daemon
+    /// will provide the VM when the first container starts.
     async fn start_sandbox(&self) -> Result<u32, Error> {
         let sandbox_id = self.id.clone();
         let t_total = std::time::Instant::now();
@@ -384,7 +297,9 @@ impl CloudHvInstance {
         let spec_path = self.bundle.join("config.json");
         let sandbox_spec = parse_sandbox_spec(&spec_path);
 
-        // Set up TAP device in the pod's network namespace via netlink (in-process).
+        let config = load_config(None).ctx("config error")?;
+
+        // Set up TAP device in the pod's network namespace
         let t_tap = std::time::Instant::now();
         let (tap_name, tap_mac, ip_config) = if let Some(ref netns) = sandbox_spec.netns {
             let mut result = None;
@@ -401,10 +316,6 @@ impl CloudHvInstance {
                         if attempt < 4 {
                             info!("TAP setup attempt {attempt} failed ({e:#}), retrying...");
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        } else {
-                            info!(
-                                "TAP setup failed after 5 attempts (proceeding without network): {e}"
-                            );
                         }
                     }
                 }
@@ -424,164 +335,47 @@ impl CloudHvInstance {
                 None => (None, None, None),
             }
         } else {
-            info!("no network namespace — VM will boot without networking");
             (None, None, None)
         };
         let tap_ms = t_tap.elapsed().as_millis();
 
-        let t_config = std::time::Instant::now();
-        let config = load_config(None).ctx("config error")?;
-        let config = crate::annotations::apply_annotations(config, &sandbox_spec.annotations);
-        let config = crate::annotations::apply_resource_limits(
-            config,
-            sandbox_spec.mem_request,
-            sandbox_spec.mem_limit,
-            sandbox_spec.cpu_limit,
-        );
-
-        // Cold-boot a new VM
-        let mut vm = VmManager::new(sandbox_id.clone(), config.clone()).ctx("VmManager")?;
-
-        vm.prepare().await.ctx("prepare")?;
-        let config_ms = t_config.elapsed().as_millis();
-
-        if let Some((ref ip_cidr, ref gw)) = ip_config {
-            let parts: Vec<&str> = ip_cidr.split('/').collect();
-            let ip = parts[0];
-            let prefix: u32 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(24);
-            let mask = prefix_to_netmask(prefix);
-            let ip_param = format!(" ip={ip}::{gw}:{mask}::eth0:off");
-            vm.append_kernel_args(&ip_param);
-            info!("kernel network: {}", ip_param.trim());
-        }
-
-        let t_swtpm = std::time::Instant::now();
-        vm.start_swtpm().await.ctx("swtpm")?;
-        let swtpm_ms = t_swtpm.elapsed().as_millis();
-
-        let t_vmm = std::time::Instant::now();
-        vm.spawn_vmm_in_netns(sandbox_spec.netns.as_deref())
-            .ctx("vmm")?;
-        let spawn_ms = t_vmm.elapsed().as_millis();
-
-        vm.wait_vmm_ready().await.ctx("vmm")?;
-        let vmm_ready_ms = t_vmm.elapsed().as_millis();
-
-        let vsock_socket = vm.vsock_socket().to_path_buf();
-        let shared_dir = vm.shared_dir().to_path_buf();
-        let api_socket = vm.api_socket_path().to_path_buf();
-        let ch_pid = vm.ch_pid().unwrap_or(std::process::id());
-
-        // Start memory monitor if hotplug is configured
-        if config.hotplug_memory_mb > 0 {
-            let boot_bytes = config.default_memory_mb * 1024 * 1024;
-            let max_bytes = boot_bytes + config.hotplug_memory_mb * 1024 * 1024;
-            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-            let monitor_config = crate::memory::MemoryMonitorConfig {
-                boot_memory_bytes: boot_bytes,
-                max_memory_bytes: max_bytes,
-                api_socket: api_socket.clone(),
-                vsock_socket: vsock_socket.clone(),
-                shared_dir: shared_dir.clone(),
-            };
-            let _monitor = crate::memory::spawn_memory_monitor(monitor_config, shutdown_rx);
-            info!(
-                "memory monitor started: boot={}MiB max={}MiB",
-                config.default_memory_mb,
-                config.default_memory_mb + config.hotplug_memory_mb
-            );
-            std::mem::forget(shutdown_tx);
-        }
-
-        let (ip_cidr_val, gateway_val) = match &ip_config {
+        let (ip_cidr, gateway) = match &ip_config {
             Some((cidr, gw)) => (Some(cidr.clone()), Some(gw.clone())),
             None => (None, None),
         };
+
+        // Store sandbox state — no VM yet (daemon provides it in start_container)
         let vm_state = Arc::new(SharedVmState {
-            vm,
             agent: OnceCell::new(),
-            vsock_socket,
-            shared_dir,
-            container_count: AtomicUsize::new(1), // sandbox itself counts
-            api_socket,
-            boot_state: tokio::sync::Mutex::new(BootState::NotBooted),
-            boot_complete: tokio::sync::Notify::new(),
+            vsock_socket: PathBuf::new(),
+            ch_pid: 0,
+            container_count: AtomicUsize::new(1),
             tap_name,
             tap_mac,
-            ip_cidr: ip_cidr_val,
-            gateway: gateway_val,
+            ip_cidr,
+            gateway,
             netns: sandbox_spec.netns.clone(),
             cgroups_path: sandbox_spec.cgroups_path.clone(),
-            container_info: tokio::sync::Mutex::new(Vec::new()),
-            eager_boot: tokio::sync::Mutex::new(None),
+            daemon_vm_id: String::new(),
+            daemon_socket: config.daemon_socket.clone(),
         });
-
-        // Spawn eager boot: create and boot the VM with only the guest rootfs
-        // (no container disks). The agent connect also runs here. By the time
-        // start_container is called (~50-100ms later), boot is usually done.
-        // Container rootfs disks will be hot-plugged in start_container.
-        //
-        // SKIP eager boot if warm_restore is enabled AND the snapshot cache is
-        // non-empty — snapshot restore requires a fresh CH process with no
-        // existing VM. If warm_restore is disabled, always eager boot.
-        let skip_eager_boot = config.warm_restore
-            && std::path::Path::new("/run/cloudhv/snapshot-cache")
-                .read_dir()
-                .map(|mut d| d.any(|e| e.is_ok()))
-                .unwrap_or(false);
-
-        if !skip_eager_boot {
-            let vm_state_clone = vm_state.clone();
-            let handle = tokio::spawn(async move {
-                use anyhow::Context;
-                let t0 = std::time::Instant::now();
-
-                // Boot VM with no extra disks — only the guest rootfs (/dev/vda)
-                vm_state_clone
-                    .vm
-                    .create_and_boot_vm(
-                        vm_state_clone.tap_name.as_deref(),
-                        vm_state_clone.tap_mac.as_deref(),
-                        vec![], // no container disks — hot-plugged later
-                    )
-                    .await
-                    .context("eager boot: create_and_boot_vm")?;
-
-                let boot_ms = t0.elapsed().as_millis();
-
-                // Connect to agent — confirms kernel + agent are ready
-                get_or_connect_agent(&vm_state_clone)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-                let total_ms = t0.elapsed().as_millis();
-                log::info!(
-                    "TIMING eager_boot @{}: vm_boot={}ms agent_connect={}ms total={}ms",
-                    crate::instance::epoch_ms(),
-                    boot_ms,
-                    total_ms - boot_ms,
-                    total_ms
-                );
-                Ok(())
-            });
-            *vm_state.eager_boot.lock().await = Some(handle);
-        } else {
-            info!("snapshot cache exists — skipping eager boot (restore likely)");
-        }
 
         VMS.write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(sandbox_id.clone(), vm_state.clone());
+            .insert(sandbox_id.clone(), vm_state);
 
-        info!("sandbox VM {} ready (ch_pid={})", sandbox_id, ch_pid);
         info!(
-            "TIMING start_sandbox {} @{}: tap={}ms config={}ms swtpm={}ms vmm_spawn={}ms vmm_ready={}ms total={}ms",
-            sandbox_id, epoch_ms(), tap_ms, config_ms, swtpm_ms, spawn_ms, vmm_ready_ms, t_total.elapsed().as_millis()
+            "TIMING start_sandbox {} @{}: tap={}ms total={}ms",
+            sandbox_id,
+            epoch_ms(),
+            tap_ms,
+            t_total.elapsed().as_millis()
         );
-        Ok(ch_pid)
+
+        Ok(std::process::id())
     }
 
-    /// Create and start an application container inside an existing sandbox VM.
+    /// Acquire a VM from the daemon and start the container.
     async fn start_container(&self) -> Result<u32, Error> {
         let container_id = &self.id;
         let t_total = std::time::Instant::now();
@@ -595,1833 +389,387 @@ impl CloudHvInstance {
             Error::Any(anyhow::anyhow!("sandbox VM not found: {}", self.sandbox_id))
         })?;
 
-        let shared_dir = &vm_state.shared_dir;
-
         let rootfs_path = self.bundle.join("rootfs");
-        let disk_id = format!("ctr-{}", &container_id[..12.min(container_id.len())]);
-        let parent_dir = shared_dir.parent().unwrap_or(shared_dir);
 
-        // Extract volumes from OCI spec
-        let spec_path = self.bundle.join("config.json");
-        let volumes = extract_volumes(&spec_path).ctx("extract volumes")?;
+        // Resolve image digest for stable cache key + warm snapshot lookup.
+        // This must happen before erofs conversion so the same image always
+        // maps to the same erofs file (regardless of container snapshot path).
+        let image_key = image_key_from_spec(&self.bundle)
+            .await
+            .unwrap_or_else(|| stable_hash_hex(&rootfs_path.to_string_lossy()));
 
-        // Find erofs layer blobs backing the rootfs.
-        // Path 1: erofs snapshotter (containerd 2.1+) — layer.erofs files exist
-        // Path 2: overlayfs snapshotter (containerd 2.0) — convert rootfs dir to erofs
+        // Convert rootfs to erofs (cached by image key). The shim does this
+        // because it has access to the bundle rootfs that containerd prepared.
+        // Retry on transient failures (e.g. fork pressure under heavy load).
         let t_erofs = std::time::Instant::now();
-        let erofs_layers = find_erofs_layers(&rootfs_path);
-        let mut return_erofs: Option<Vec<(std::path::PathBuf, String, bool)>> = None;
-        let rootfs_disks: Vec<(std::path::PathBuf, String, bool)> = if !erofs_layers.is_empty() {
-            // Path 1: erofs snapshotter — pass layer.erofs blobs directly
-            info!(
-                "rootfs backed by {} erofs layer(s), using direct passthrough",
-                erofs_layers.len()
-            );
-            for (i, layer) in erofs_layers.iter().enumerate() {
-                let size = std::fs::metadata(layer).map(|m| m.len()).unwrap_or(0);
-                info!("  erofs layer {}: {} ({} bytes)", i, layer.display(), size);
-            }
-            erofs_layers
-                .iter()
-                .enumerate()
-                .map(|(i, path)| {
-                    let id = format!("{disk_id}-layer{i}");
-                    (path.clone(), id, true)
-                })
-                .collect()
-        } else {
-            // Path 2: overlayfs snapshotter — create erofs image from rootfs directory.
-            // Cache the erofs image keyed by the overlayfs lowerdir paths, which are
-            // deterministic per container image (containerd's snapshotter creates them
-            // from layer digests). This means mkfs.erofs runs once per image, not per pod.
-            //
-            // Race condition handling: multiple shim processes may try to build the
-            // same image concurrently. We use flock on a lock file so only one
-            // process runs mkfs.erofs; the others wait and then hardlink the result.
-            info!("no erofs snapshotter layers, converting rootfs to erofs image");
-            let cache_key = erofs_cache_key(&rootfs_path);
-            let erofs_path = parent_dir.join(format!("{disk_id}.erofs"));
-
-            if let Some(ref key) = cache_key {
-                let cache_dir = std::path::Path::new(EROFS_CACHE_DIR);
-                let _ = std::fs::create_dir_all(cache_dir);
-                let cached = cache_dir.join(format!("{key}.erofs"));
-                let lock_path = cache_dir.join(format!("{key}.lock"));
-
-                // Acquire an exclusive lock — first process builds, others block and wait
-                let lock_result = tokio::task::spawn_blocking({
-                    let cached = cached.clone();
-                    let erofs_path = erofs_path.clone();
-                    let lock_path = lock_path.clone();
-                    let rootfs_for_erofs = rootfs_path.clone();
-                    move || -> anyhow::Result<bool> {
-                        use std::os::unix::io::AsRawFd;
-                        let lock_file = std::fs::OpenOptions::new()
-                            .create(true)
-                            .write(true)
-                            .truncate(false)
-                            .open(&lock_path)?;
-                        // Blocking exclusive lock — retry on EINTR, fail on other errors
-                        loop {
-                            let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
-                            if rc == 0 {
-                                break;
-                            }
-                            let err = std::io::Error::last_os_error();
-                            if err.kind() == std::io::ErrorKind::Interrupted {
-                                continue;
-                            }
-                            return Err(err.into());
-                        }
-
-                        if cached.exists() {
-                            // Another process built it while we waited
-                            std::fs::hard_link(&cached, &erofs_path)
-                                .or_else(|_| std::fs::copy(&cached, &erofs_path).map(|_| ()))?;
-                            log::info!(
-                                "erofs cache hit (after lock): {} ({} bytes)",
-                                cached.display(),
-                                std::fs::metadata(&erofs_path).map(|m| m.len()).unwrap_or(0)
-                            );
-                            return Ok(true); // cache hit
-                        }
-
-                        // We're the builder — run mkfs.erofs
-                        let status = std::process::Command::new("mkfs.erofs")
-                            .arg("--quiet")
-                            .arg(&erofs_path)
-                            .arg(&rootfs_for_erofs)
-                            .status()
-                            .map_err(|e| anyhow::anyhow!("mkfs.erofs spawn: {e}"))?;
-                        if !status.success() {
-                            anyhow::bail!("mkfs.erofs failed: {status}");
-                        }
-
-                        // Populate cache atomically: write to unique tmp then rename.
-                        // Remove any stale tmp from a previous crash.
-                        let tmp =
-                            cached.with_extension(format!("erofs.{}.tmp", std::process::id()));
-                        let _ = std::fs::remove_file(&tmp);
-                        std::fs::hard_link(&erofs_path, &tmp)
-                            .or_else(|_| std::fs::copy(&erofs_path, &tmp).map(|_| ()))?;
-                        std::fs::rename(&tmp, &cached)?;
-
-                        log::info!(
-                            "erofs built and cached: {} ({} bytes)",
-                            cached.display(),
-                            std::fs::metadata(&erofs_path).map(|m| m.len()).unwrap_or(0)
-                        );
-                        // Lock released on drop
-                        Ok(false) // cache miss — we built it
+        let erofs_path = {
+            let mut last_err = None;
+            let mut result = None;
+            for attempt in 0..3 {
+                match prepare_erofs(&rootfs_path, &image_key) {
+                    Ok(path) => {
+                        result = Some(path);
+                        break;
                     }
-                })
-                .await
-                .map_err(|_| Error::Any(anyhow::anyhow!("erofs cache task panicked")))?
-                .ctx("erofs cache")?;
-
-                let _ = lock_result; // true=hit, false=miss — already logged
-                return_erofs = Some(vec![(erofs_path.clone(), disk_id.clone(), true)]);
-            }
-
-            if return_erofs.is_none() {
-                // No cache key (unusual) — build without caching
-                let rootfs_for_erofs = rootfs_path.clone();
-                let erofs_dst = erofs_path.clone();
-                tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                    let status = std::process::Command::new("mkfs.erofs")
-                        .arg("--quiet")
-                        .arg(&erofs_dst)
-                        .arg(&rootfs_for_erofs)
-                        .status()
-                        .map_err(|e| anyhow::anyhow!("mkfs.erofs: {e}"))?;
-                    if !status.success() {
-                        anyhow::bail!("mkfs.erofs failed: {status}");
+                    Err(e) => {
+                        info!("prepare_erofs attempt {attempt} failed: {e}");
+                        last_err = Some(e);
+                        std::thread::sleep(std::time::Duration::from_millis(100 * (attempt + 1)));
                     }
-                    Ok(())
-                })
-                .await
-                .map_err(|_| Error::Any(anyhow::anyhow!("erofs conversion panicked")))?
-                .ctx("convert rootfs to erofs")?;
-
-                let size = std::fs::metadata(&erofs_path).map(|m| m.len()).unwrap_or(0);
-                info!(
-                    "erofs image created (uncached): {} ({} bytes)",
-                    erofs_path.display(),
-                    size
-                );
-                return_erofs = Some(vec![(erofs_path, disk_id.clone(), true)]);
+                }
             }
-
-            return_erofs.unwrap()
+            result.ok_or_else(|| last_err.unwrap())?
         };
         let erofs_ms = t_erofs.elapsed().as_millis();
 
-        // Determine boot role: first container boots the VM, others wait.
-        enum BootRole {
-            First,
-            Subsequent,
-        }
+        // Read OCI config for the container
+        let spec_path = self.bundle.join("config.json");
+        let config_json = std::fs::read(&spec_path).unwrap_or_default();
 
-        let boot_role = {
-            let mut state = vm_state.boot_state.lock().await;
-            match &*state {
-                BootState::NotBooted => {
-                    *state = BootState::Booting;
-                    BootRole::First
-                }
-                BootState::Booting => BootRole::Subsequent,
-                BootState::Booted => BootRole::Subsequent,
-                BootState::Failed(msg) => {
-                    return Err(Error::Any(anyhow::anyhow!(
-                        "VM boot previously failed: {msg}"
-                    )));
-                }
-            }
-        };
-        let is_first_container = matches!(boot_role, BootRole::First);
-        let mut restored_from_snapshot = false;
+        // Check if a VM is already acquired for this sandbox (multi-container pod).
+        // Only the first container triggers daemon acquire + warm snapshot lookup.
+        let already_acquired = !vm_state.daemon_vm_id.is_empty();
 
-        match boot_role {
-            BootRole::First => {
-                let t_boot = std::time::Instant::now();
-
-                // ─── Warm Workload Snapshot/Restore ─────────────────────────
-                //
-                // HOW IT WORKS:
-                //
-                // The snapshot cache stores a fully-warmed VM state: kernel booted,
-                // agent running, AND the container workload fully started (e.g. Python
-                // server listening on 0.0.0.0:8888). This is the "golden" state.
-                //
-                // COLD BOOT (first pod per image on this node):
-                //   1. VM booted eagerly in start_sandbox (no container disks)
-                //   2. Container rootfs hot-plugged here
-                //   3. Agent connects, container starts, workload warms up
-                //   4. After 20s warmup: pause VM → snapshot → resume → cache
-                //   4. The snapshot includes the RUNNING workload process
-                //
-                // RESTORE (all subsequent pods with same image):
-                //   1. Restore VM from cached snapshot with patched config
-                //      (TAP name + MAC updated in config.json, CoW memory, ~150ms)
-                //   2. Resume VM — eth0 already wired to new TAP, workload
-                //      process wakes up ALREADY RUNNING
-                //   3. Configure guest IP via ConfigureNetwork agent RPC
-                //   4. SKIP RunContainer — the container is already alive
-                //   5. Traffic flows immediately (workload binds 0.0.0.0)
-                //
-                // ────────────────────────────────────────────────────────────
-
-                // Snapshot cache key includes VM config AND container image identity
-                // so different workload images get separate snapshots.
-                let warm_restore_enabled = vm_state.vm.config().warm_restore;
-                let snap_key = {
-                    let base = crate::snapshot::snapshot_cache_key(vm_state.vm.config());
-                    let erofs_id = erofs_cache_key(&rootfs_path)
-                        .unwrap_or_else(|| stable_hash_hex(&rootfs_path.to_string_lossy()));
-                    stable_hash_hex(&format!("{base}:{erofs_id}"))
-                };
-
-                // Try snapshot restore first (CoW — near-instant boot)
-                let restored =
-                    if warm_restore_enabled && crate::snapshot::snapshot_cache_hit(&snap_key) {
-                        let snap_dir = crate::snapshot::snapshot_cache_dir(&snap_key);
-                        info!("snapshot cache hit: {}", snap_dir.display());
-
-                        match try_restore(&vm_state, &snap_key, &rootfs_disks).await {
-                            Ok(()) => true,
-                            Err(e) => {
-                                info!("snapshot restore failed, falling back to cold boot: {e:#}");
-                                false
-                            }
-                        }
-                    } else {
-                        false
-                    };
-
-                if !restored {
-                    // Cold boot path — await the eager boot if it was started,
-                    // otherwise boot synchronously with rootfs pre-attached.
-                    let eager_handle = vm_state.eager_boot.lock().await.take();
-                    if let Some(handle) = eager_handle {
-                        // Eager boot was started — await it, then hot-plug rootfs
-                        match handle.await {
-                            Ok(Ok(())) => {
-                                info!("eager boot ready");
-                            }
-                            Ok(Err(e)) => {
-                                let msg = format!("{e:#}");
-                                *vm_state.boot_state.lock().await = BootState::Failed(msg.clone());
-                                vm_state.boot_complete.notify_waiters();
-                                return Err(Error::Any(anyhow::anyhow!(
-                                    "eager boot failed: {msg}"
-                                )));
-                            }
-                            Err(e) => {
-                                let msg = format!("eager boot task panicked: {e}");
-                                *vm_state.boot_state.lock().await = BootState::Failed(msg.clone());
-                                vm_state.boot_complete.notify_waiters();
-                                return Err(Error::Any(anyhow::anyhow!("{msg}")));
-                            }
-                        }
-
-                        // Hot-plug container rootfs disk(s) into the running VM
-                        for (path, id, readonly) in &rootfs_disks {
-                            let disk_json = serde_json::json!({
-                                "path": path.to_string_lossy(),
-                                "readonly": *readonly,
-                                "id": id,
-                            });
-                            VmManager::api_request_to_socket(
-                                &vm_state.api_socket,
-                                "PUT",
-                                "/api/v1/vm.add-disk",
-                                Some(&disk_json.to_string()),
-                            )
-                            .await
-                            .ctx("hot-plug container rootfs")?;
-                            info!("hot-plugged container rootfs: {} ({})", id, path.display());
-                        }
-                    } else {
-                        // No eager boot (snapshot cache existed but no hit for this image).
-                        // Boot synchronously with rootfs pre-attached at boot time.
-                        info!("no eager boot — cold boot with pre-attached rootfs");
-                        let extra_disks: Vec<cloudhv_common::types::VmDisk> = rootfs_disks
-                            .iter()
-                            .map(|(path, id, readonly)| cloudhv_common::types::VmDisk {
-                                path: path.to_string_lossy().to_string(),
-                                readonly: *readonly,
-                                id: Some(id.clone()),
-                            })
-                            .collect();
-                        let boot_result = vm_state
-                            .vm
-                            .create_and_boot_vm(
-                                vm_state.tap_name.as_deref(),
-                                vm_state.tap_mac.as_deref(),
-                                extra_disks,
-                            )
-                            .await;
-
-                        if let Err(e) = boot_result {
-                            let msg = format!("{e:#}");
-                            *vm_state.boot_state.lock().await = BootState::Failed(msg.clone());
-                            vm_state.boot_complete.notify_waiters();
-                            return Err(Error::Any(anyhow::anyhow!("boot with rootfs: {msg}")));
-                        }
-                    }
-                }
-                info!("VM booted (restored={restored}): {disk_id}");
-                restored_from_snapshot = restored;
-                let boot_ms = t_boot.elapsed().as_millis();
-
-                // Connect to agent — confirms VM is fully booted and agent is responsive
-                let t_agent = std::time::Instant::now();
-                match get_or_connect_agent(&vm_state).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        let msg = format!("{e:#}");
-                        *vm_state.boot_state.lock().await = BootState::Failed(msg.clone());
-                        vm_state.boot_complete.notify_waiters();
-                        return Err(Error::Any(anyhow::anyhow!(
-                            "agent connect after boot: {msg}"
-                        )));
-                    }
-                }
-
-                // After snapshot restore, configure guest networking via agent RPC.
-                // The snapshot config's TAP was patched to use the new pod's TAP,
-                // so the guest's eth0 is already backed by the correct TAP device.
-                // We just need to flush the stale IP and configure the new one.
-                if restored {
-                    if let (Some(ref ip_cidr), Some(ref gw)) =
-                        (&vm_state.ip_cidr, &vm_state.gateway)
-                    {
-                        let parts: Vec<&str> = ip_cidr.split('/').collect();
-                        let ip = parts[0];
-                        let prefix: u32 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(24);
-                        let agent = get_or_connect_agent(&vm_state).await?;
-                        let mut req = cloudhv_proto::ConfigureNetworkRequest::new();
-                        req.ip_address = ip.to_string();
-                        req.gateway = gw.clone();
-                        req.prefix_len = prefix;
-                        req.device = "eth0".to_string();
-                        let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
-                        agent
-                            .configure_network(ctx, &req)
-                            .await
-                            .ctx("configure guest network after restore")?;
-                        info!("guest network configured: ip={ip}/{prefix} gw={gw}");
-                    }
-                }
-
-                // Mark boot as complete and wake any waiting containers
-                *vm_state.boot_state.lock().await = BootState::Booted;
-                vm_state.boot_complete.notify_waiters();
-                let agent_ms = t_agent.elapsed().as_millis();
-
-                info!(
-                    "TIMING first_boot {} @{}: vm_boot={}ms agent_connect={}ms restored={}",
-                    container_id,
-                    epoch_ms(),
-                    boot_ms,
-                    agent_ms,
-                    restored
-                );
-
-                // After a successful cold boot, create a snapshot for future pods.
-                // Wait for the workload to warm up before snapshotting.
-                if warm_restore_enabled
-                    && !restored
-                    && !crate::snapshot::snapshot_cache_hit(&snap_key)
-                {
-                    let vm_api = vm_state.api_socket.clone();
-                    let key = snap_key.clone();
-                    let vm_state_ref = vm_state.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
-                        if let Err(e) =
-                            create_snapshot_for_cache(&vm_api, &key, &vm_state_ref.container_info)
-                                .await
-                        {
-                            log::info!("snapshot cache creation failed (non-fatal): {e:#}");
-                        }
-                    });
-                }
-
-                // Place CH in pod cgroup now that the VM is running
-                if let Some(ref cg) = vm_state.cgroups_path {
-                    let ch_pid = vm_state.vm.ch_pid().unwrap_or(std::process::id());
-                    if let Err(e) = place_in_pod_cgroup(ch_pid, cg) {
-                        info!("cgroup placement failed (non-fatal): {e}");
-                    } else {
-                        info!("CH pid {ch_pid} placed in pod cgroup: {cg}");
-                    }
-                }
-            }
-            BootRole::Subsequent => {
-                // Wait for boot to complete (first container drives boot)
-                loop {
-                    let state = vm_state.boot_state.lock().await.clone();
-                    match state {
-                        BootState::Booted => break,
-                        BootState::Failed(msg) => {
-                            return Err(Error::Any(anyhow::anyhow!(
-                                "VM boot previously failed: {msg}"
-                            )));
-                        }
-                        _ => {
-                            // Still booting — wait for notification
-                            vm_state.boot_complete.notified().await;
-                        }
-                    }
-                }
-
-                // Hot-plug disks for this container
-                let api_socket = vm_state.api_socket.clone();
-                for (path, id, readonly) in &rootfs_disks {
-                    let disk_json = serde_json::json!({
-                        "path": path.to_string_lossy(),
-                        "readonly": *readonly,
-                        "id": id,
-                    });
-                    VmManager::api_request_to_socket(
-                        &api_socket,
-                        "PUT",
-                        "/api/v1/vm.add-disk",
-                        Some(&disk_json.to_string()),
-                    )
-                    .await
-                    .ctx("hot-plug rootfs disk")?;
-                    info!("rootfs disk hot-plugged: {id}");
-                }
-            }
-        }
-
-        // ─── Container start ────────────────────────────────────────────
-        //
-        // If restored from a warm workload snapshot, the container process is
-        // ALREADY RUNNING inside the VM. Sending RunContainer again would try
-        // to start a second instance → port conflicts (EADDRINUSE).
-        //
-        // For cold boot or non-first containers, we run the normal RPC flow.
-        // ─────────────────────────────────────────────────────────────────
-
-        if is_first_container && restored_from_snapshot {
-            // Warm restore: container is already alive in the snapshot.
-            // Use AdoptContainer to re-register it under the new container ID.
-            info!("warm restore: adopting container from snapshot metadata");
-
-            let image_key = erofs_cache_key(&rootfs_path)
-                .unwrap_or_else(|| stable_hash_hex(&rootfs_path.to_string_lossy()));
-
-            // Recompute snap_key (same formula as in BootRole::First)
-            let snap_key = {
-                let base = crate::snapshot::snapshot_cache_key(vm_state.vm.config());
-                stable_hash_hex(&format!("{base}:{image_key}"))
-            };
-
-            let metadata =
-                crate::snapshot::load_snapshot_metadata(&snap_key).ctx("load snapshot metadata")?;
-
-            if let Some(ref meta) = metadata {
-                if let Some(info) = meta.containers.iter().find(|c| c.image_key == image_key) {
-                    let agent = get_or_connect_agent(&vm_state).await?;
-                    let mut req = cloudhv_proto::AdoptContainerRequest::new();
-                    req.old_container_id = info.container_id.clone();
-                    req.new_container_id = container_id.to_string();
-                    let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(10));
-                    let resp = agent
-                        .adopt_container(ctx, &req)
-                        .await
-                        .ctx("adopt container after restore")?;
-
-                    let pid = resp.pid;
-                    info!(
-                        "warm restore: adopted container {} -> {} pid={}",
-                        info.container_id, container_id, pid
-                    );
-
-                    // Set up exit watcher for warm-restored container.
-                    // Without this, wait() blocks forever and delete() is never called,
-                    // causing pods to stay Terminating indefinitely.
-                    let exit = self.exit.clone();
-                    let cid = container_id.to_string();
-                    let agent_clone = agent.clone();
-                    tokio::spawn(async move {
-                        let t0 = std::time::Instant::now();
-                        let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
-                        wait_req.container_id = cid.clone();
-                        let ctx =
-                            ttrpc::context::with_duration(std::time::Duration::from_secs(86400));
-                        let exit_code = match agent_clone.wait_container(ctx, &wait_req).await {
-                            Ok(resp) => resp.exit_status,
-                            Err(e) => {
-                                log::info!("wait_container RPC error for {}: {e}", cid);
-                                137
-                            }
-                        };
-                        let _ = exit.set((exit_code, Utc::now()));
-                        log::info!(
-                            "warm-restored container {} exited: code={} rpc={}ms",
-                            cid,
-                            exit_code,
-                            t0.elapsed().as_millis()
-                        );
-                    });
-
-                    vm_state.container_count.fetch_add(1, Ordering::SeqCst);
-                    info!(
-                        "TIMING start_container {} @{}: erofs={}ms rpc=0ms total={}ms first_boot=true (warm restore)",
-                        container_id, epoch_ms(), erofs_ms, t_total.elapsed().as_millis()
-                    );
-                    return Ok(pid);
-                }
-            }
-            // Fallback if metadata missing — fall through to RunContainer
+        let (active_state, from_snapshot, acquire_ms, container_pid) = if already_acquired {
             info!(
-                "warm restore: no metadata for image_key {}, falling back to RunContainer",
-                image_key
+                "VM already acquired for sandbox {}, adding container {}",
+                self.sandbox_id, container_id
             );
-        }
-
-        // ─── Normal container start (cold boot or metadata-fallback) ─────
-        {
-            let agent = get_or_connect_agent(&vm_state).await?;
-            let api_socket = vm_state.api_socket.clone();
-
-            // Hot-plug separate empty disks for emptyDir volumes.
-            for vol in &volumes {
-                if !vol.is_empty_dir {
-                    continue;
-                }
-                let edir_id = format!("edir-{}", &vol.volume_id[..8.min(vol.volume_id.len())]);
-                let edir_path = parent_dir.join(format!("{}.img", edir_id));
-
-                let f = std::fs::File::create(&edir_path).ctx("create emptyDir image")?;
-                f.set_len(16 * 1024 * 1024)?; // 16MB default
-                drop(f);
-                let status = std::process::Command::new("mkfs.ext4")
-                    .args(["-q", "-F", "-O", "^has_journal"])
-                    .arg(&edir_path)
-                    .status();
-                if status.map(|s| !s.success()).unwrap_or(true) {
-                    info!("mkfs.ext4 failed for emptyDir {}", vol.destination);
-                    continue;
-                }
-
-                let edir_json = serde_json::json!({
-                    "path": edir_path.to_string_lossy(),
-                    "readonly": false,
-                    "id": edir_id,
-                });
-                VmManager::api_request_to_socket(
-                    &api_socket,
-                    "PUT",
-                    "/api/v1/vm.add-disk",
-                    Some(&edir_json.to_string()),
+            // Additional container — daemon does hot-plug + RunContainer
+            let client = DaemonClient::new(&vm_state.daemon_socket);
+            let t_acquire = std::time::Instant::now();
+            let resp = client
+                .add_container(
+                    &vm_state.daemon_vm_id,
+                    &erofs_path.to_string_lossy(),
+                    container_id,
+                    &config_json,
                 )
-                .await
-                .ctx("hot-plug emptyDir disk")?;
-                info!("emptyDir hot-plugged: {} for {}", edir_id, vol.destination);
-            }
+                .ctx("daemon add_container")?;
+            let acq_ms = t_acquire.elapsed().as_millis();
+            (vm_state.clone(), false, acq_ms, resp)
+        } else {
+            // First container — acquire VM from daemon
+            let t_acquire = std::time::Instant::now();
+            let client = DaemonClient::new(&vm_state.daemon_socket);
+            let acquired = client
+                .acquire_sandbox(&AcquireRequest {
+                    tap_name: vm_state.tap_name.as_deref().unwrap_or(""),
+                    tap_mac: vm_state.tap_mac.as_deref().unwrap_or(""),
+                    ip_cidr: vm_state.ip_cidr.as_deref().unwrap_or(""),
+                    gateway: vm_state.gateway.as_deref().unwrap_or(""),
+                    image_key: &image_key,
+                    erofs_path: &erofs_path.to_string_lossy(),
+                    container_id,
+                    config_json: &config_json,
+                })
+                .ctx("daemon acquire")?;
+            let acq_ms = t_acquire.elapsed().as_millis();
 
-            let bundle_guest = format!("/run/containers/{}", container_id);
+            info!(
+                "daemon acquired: vm_id={} ch_pid={} from_snapshot={} container_pid={} in {}ms",
+                acquired.vm_id,
+                acquired.ch_pid,
+                acquired.from_snapshot,
+                acquired.container_pid,
+                acq_ms
+            );
 
-            // Read config.json to send inline via the RPC
-            let config_json_bytes =
-                std::fs::read(&spec_path).ctx("read config.json for inline delivery")?;
-
-            // Build the CreateContainerRequest
-            let mut create_req = cloudhv_proto::CreateContainerRequest::new();
-            create_req.container_id = container_id.to_string();
-            create_req.bundle_path = bundle_guest.clone();
-            create_req.config_json = config_json_bytes;
-            create_req.rootfs_preattached = is_first_container;
-            create_req.erofs_layers = rootfs_disks.len() as u32;
-            for vol in &volumes {
-                let mut vm = cloudhv_proto::VolumeMount::new();
-                vm.destination = vol.destination.clone();
-                if vol.is_block || vol.is_empty_dir {
-                    vm.source = vol.source.clone();
-                    vm.volume_type = cloudhv_proto::VolumeType::BLOCK.into();
-                    vm.fs_type = if vol.is_empty_dir {
-                        "ext4".to_string()
-                    } else {
-                        vol.fs_type.clone()
-                    };
-                } else {
-                    // Filesystem volume: send files inline, agent writes to tmpfs
-                    vm.source = format!("{}/volumes/{}", bundle_guest, vol.volume_id);
-                    vm.volume_type = cloudhv_proto::VolumeType::FILESYSTEM.into();
-                    let src = std::path::Path::new(&vol.source);
-                    let entries =
-                        read_volume_files(src).ctx("read volume files for inline delivery")?;
-                    for (rel_path, content, mode) in entries {
-                        let mut inline_file = cloudhv_proto::InlineFile::new();
-                        inline_file.path = rel_path;
-                        inline_file.content = content;
-                        inline_file.mode = mode;
-                        vm.files.push(inline_file);
-                    }
-                }
-                vm.readonly = vol.readonly;
-                create_req.volumes.push(vm);
-            }
-
-            let t_rpc = std::time::Instant::now();
-            let start_resp = if is_first_container {
-                // First container — use RunContainer (create + start atomically)
-                let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
-                agent.run_container(ctx, &create_req).await
-            } else {
-                // Subsequent containers — create then start separately
-                {
-                    let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
-                    agent.create_container(ctx, &create_req).await
-                }
-                .ctx("CreateContainer RPC error")?;
-                let mut start_req = cloudhv_proto::StartContainerRequest::new();
-                start_req.container_id = container_id.to_string();
-                let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
-                agent.start_container(ctx, &start_req).await
-            }
-            .ctx("start container RPC error")?;
-
-            vm_state.container_count.fetch_add(1, Ordering::SeqCst);
-
-            // Record container info for snapshot metadata.
-            let image_key = erofs_cache_key(&rootfs_path)
-                .unwrap_or_else(|| stable_hash_hex(&rootfs_path.to_string_lossy()));
-            vm_state.container_info.lock().await.push((
-                container_id.to_string(),
-                image_key,
-                start_resp.pid,
-            ));
-
-            // Stream container logs from agent via GetContainerLogs RPC.
-            // Open FIFOs synchronously so containerd sees an active writer.
-            let log_agent = agent.clone();
-            let log_cid = container_id.to_string();
-            let stdout_fifo = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&self.stdout)
-                .ok();
-            let stderr_fifo = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&self.stderr)
-                .ok();
-            let log_handle = tokio::spawn(async move {
-                use tokio::io::AsyncWriteExt;
-                let mut stdout_writer = stdout_fifo.map(tokio::fs::File::from_std);
-                let mut stderr_writer = stderr_fifo.map(tokio::fs::File::from_std);
-                let mut offset = 0u64;
-                loop {
-                    let mut req = cloudhv_proto::GetContainerLogsRequest::new();
-                    req.container_id = log_cid.clone();
-                    req.offset = offset;
-                    let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(5));
-                    match log_agent.get_container_logs(ctx, &req).await {
-                        Ok(resp) => {
-                            if let Some(ref mut w) = stdout_writer {
-                                if !resp.stdout.is_empty() {
-                                    let _ = w.write_all(&resp.stdout).await;
-                                }
-                            }
-                            if let Some(ref mut w) = stderr_writer {
-                                if !resp.stderr.is_empty() {
-                                    let _ = w.write_all(&resp.stderr).await;
-                                }
-                            }
-                            offset = resp.offset;
-                            if resp.eof {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
+            // Update shared state with daemon's VM info
+            let new_state = Arc::new(SharedVmState {
+                agent: OnceCell::new(),
+                vsock_socket: acquired.vsock_socket.clone(),
+                ch_pid: acquired.ch_pid,
+                container_count: AtomicUsize::new(vm_state.container_count.load(Ordering::SeqCst)),
+                tap_name: vm_state.tap_name.clone(),
+                tap_mac: vm_state.tap_mac.clone(),
+                ip_cidr: vm_state.ip_cidr.clone(),
+                gateway: vm_state.gateway.clone(),
+                netns: vm_state.netns.clone(),
+                cgroups_path: vm_state.cgroups_path.clone(),
+                daemon_vm_id: acquired.vm_id.clone(),
+                daemon_socket: vm_state.daemon_socket.clone(),
             });
 
-            // Watch for container exit via WaitContainer RPC
+            VMS.write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(self.sandbox_id.clone(), new_state.clone());
+
+            // Place CH in pod cgroup
+            if let Some(ref cg) = new_state.cgroups_path {
+                if let Err(e) = place_in_pod_cgroup(acquired.ch_pid, cg) {
+                    info!("cgroup placement failed (non-fatal): {e}");
+                }
+            }
+
+            // Configure network on warm restore
+            if acquired.from_snapshot {
+                let agent = get_or_connect_agent(&new_state).await?;
+                if let (Some(ref ip_cidr), Some(ref gw)) = (&new_state.ip_cidr, &new_state.gateway)
+                {
+                    let parts: Vec<&str> = ip_cidr.split('/').collect();
+                    let ip = parts[0];
+                    let prefix: u32 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(24);
+                    let mut req = cloudhv_proto::ConfigureNetworkRequest::new();
+                    req.ip_address = ip.to_string();
+                    req.gateway = gw.clone();
+                    req.prefix_len = prefix;
+                    req.device = "eth0".to_string();
+                    let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
+                    agent
+                        .configure_network(ctx, &req)
+                        .await
+                        .ctx("configure network after warm restore")?;
+                    info!("guest network configured: ip={ip}/{prefix} gw={gw}");
+                }
+            }
+
+            (
+                new_state,
+                acquired.from_snapshot,
+                acq_ms,
+                acquired.container_pid,
+            )
+        };
+
+        // Set up exit watcher — races agent WaitContainer against CH process death.
+        // When either fires, the container is gone.
+        {
             let exit = self.exit.clone();
             let cid = container_id.to_string();
-            let agent_clone = agent.clone();
-            tokio::spawn(async move {
-                let t0 = std::time::Instant::now();
-                let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
-                wait_req.container_id = cid.clone();
-                let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(86400));
-                let exit_code = match agent_clone.wait_container(ctx, &wait_req).await {
-                    Ok(resp) => resp.exit_status,
-                    Err(e) => {
-                        log::info!("wait_container RPC error for {}: {e}", cid);
-                        137
-                    }
-                };
-                let rpc_ms = t0.elapsed().as_millis();
-                let t1 = std::time::Instant::now();
-                let log_result =
-                    tokio::time::timeout(std::time::Duration::from_millis(100), log_handle).await;
-                let log_ms = t1.elapsed().as_millis();
-                let t2 = std::time::Instant::now();
-                let _ = exit.set((exit_code, Utc::now()));
-                let set_ms = t2.elapsed().as_millis();
-                log::info!(
-                    "container {} exit path: rpc={}ms log_wait={}ms({}), set={}ms, total={}ms",
-                    cid,
-                    rpc_ms,
-                    log_ms,
-                    if log_result.is_ok() {
-                        "completed"
-                    } else {
-                        "timeout"
-                    },
-                    set_ms,
-                    t0.elapsed().as_millis()
-                );
-            });
+            let ch_pid = active_state.ch_pid;
 
-            let pid = start_resp.pid;
-            let rpc_ms = t_rpc.elapsed().as_millis();
-            info!("started container {} pid={}", container_id, pid);
-            info!(
-                "TIMING start_container {} @{}: erofs={}ms rpc={}ms total={}ms first_boot={}",
-                container_id,
-                epoch_ms(),
-                erofs_ms,
-                rpc_ms,
-                t_total.elapsed().as_millis(),
-                is_first_container
-            );
-            Ok(pid)
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Spec parsing helpers
-// ---------------------------------------------------------------------------
-
-/// Detect whether a container is sandbox or app, and extract sandbox-id.
-fn parse_container_type(spec_path: &std::path::Path, default_id: &str) -> (bool, String) {
-    let spec: serde_json::Value = std::fs::read_to_string(spec_path)
-        .ok()
-        .and_then(|data| serde_json::from_str(&data).ok())
-        .unwrap_or_default();
-
-    let is_sandbox = spec.pointer(CRI_CONTAINER_TYPE).and_then(|v| v.as_str()) == Some("sandbox");
-
-    let sandbox_id = spec
-        .pointer(CRI_SANDBOX_ID)
-        .and_then(|v| v.as_str())
-        .unwrap_or(default_id)
-        .to_string();
-
-    (is_sandbox, sandbox_id)
-}
-
-/// Place a process into the pod's cgroup so that Kubernetes metrics (kubectl top,
-/// HPA, cAdvisor) see the full VM resource usage.
-///
-/// Tries cgroup v2 unified hierarchy first, then systemd-style v2, then v1.
-/// The `cgroups_path` comes from the OCI spec's `linux.cgroupsPath` field.
-fn place_in_pod_cgroup(pid: u32, cgroups_path: &str) -> anyhow::Result<()> {
-    place_in_pod_cgroup_at(pid, cgroups_path, std::path::Path::new("/sys/fs/cgroup"))
-}
-
-/// Testable implementation that accepts the cgroup root path.
-fn place_in_pod_cgroup_at(
-    pid: u32,
-    cgroups_path: &str,
-    cgroup_root: &std::path::Path,
-) -> anyhow::Result<()> {
-    let pid_str = pid.to_string();
-    // Strip leading slash — OCI spec paths often have one
-    let cgroups_path = cgroups_path.trim_start_matches('/');
-
-    // Try cgroup v2 (unified hierarchy) — use existing path only.
-    // Never create_dir_all on systemd-managed cgroup trees; that corrupts
-    // systemd's transient unit tracking and can brick the node.
-    let v2_path = cgroup_root.join(cgroups_path);
-    if v2_path.join("cgroup.procs").exists() {
-        std::fs::write(v2_path.join("cgroup.procs"), &pid_str)
-            .map_err(|e| anyhow::anyhow!("write cgroup v2 procs: {e}"))?;
-        return Ok(());
-    }
-
-    // Try systemd-style cgroup v2 path
-    let systemd_path = to_systemd_cgroup_path(cgroups_path);
-    let v2_systemd = cgroup_root.join(&systemd_path);
-    if v2_systemd.join("cgroup.procs").exists() {
-        std::fs::write(v2_systemd.join("cgroup.procs"), &pid_str)
-            .map_err(|e| anyhow::anyhow!("write cgroup v2 systemd procs: {e}"))?;
-        return Ok(());
-    }
-
-    // Try cgroup v1 (separate controller hierarchies)
-    let mut placed = false;
-    for controller in &["memory", "cpu,cpuacct", "pids"] {
-        let v1_path = cgroup_root.join(controller).join(cgroups_path);
-        if v1_path.join("cgroup.procs").exists() {
-            std::fs::write(v1_path.join("cgroup.procs"), &pid_str)
-                .map_err(|e| anyhow::anyhow!("write cgroup v1 {controller} procs: {e}"))?;
-            placed = true;
-        }
-    }
-
-    if placed {
-        Ok(())
-    } else {
-        anyhow::bail!("no cgroup found for path {cgroups_path} (tried v2, v2-systemd, v1)")
-    }
-}
-
-/// Convert a kubelet-style cgroup path to a systemd slice path.
-///
-/// Input:  `kubepods/burstable/pod-uid/ctr-id`
-/// Output: `kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod_uid.slice/cri-containerd-ctr_id.scope`
-fn to_systemd_cgroup_path(cgroups_path: &str) -> String {
-    let parts: Vec<&str> = cgroups_path.split('/').filter(|s| !s.is_empty()).collect();
-    if parts.is_empty() {
-        return cgroups_path.to_string();
-    }
-
-    let mut result = String::new();
-    let mut prefix = String::new();
-    for (i, part) in parts.iter().enumerate() {
-        let sanitized = part.replace('-', "_");
-        if i == parts.len() - 1 {
-            // Last segment is a scope (container ID)
-            result.push_str(&format!("cri-containerd-{sanitized}.scope"));
-        } else {
-            // Intermediate segments are slices with hierarchical prefix
-            if prefix.is_empty() {
-                result.push_str(&format!("{sanitized}.slice/"));
-                prefix = sanitized;
+            if from_snapshot {
+                // Warm restore — no RunContainer was called, just watch CH PID
+                tokio::spawn(async move {
+                    wait_for_pid_exit(ch_pid).await;
+                    let _ = exit.set((137, Utc::now()));
+                });
             } else {
-                let slice_name = format!("{prefix}-{sanitized}");
-                result.push_str(&format!("{slice_name}.slice/"));
-                prefix = slice_name;
+                // Cold path — race agent WaitContainer vs CH PID death
+                let agent = get_or_connect_agent(&active_state).await?;
+                tokio::spawn(async move {
+                    let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
+                    wait_req.container_id = cid.clone();
+                    let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(86400));
+
+                    tokio::select! {
+                        result = agent.wait_container(ctx, &wait_req) => {
+                            let exit_code = match result {
+                                Ok(resp) => resp.exit_status,
+                                Err(_) => 137,
+                            };
+                            let _ = exit.set((exit_code, Utc::now()));
+                        }
+                        _ = wait_for_pid_exit(ch_pid) => {
+                            let _ = exit.set((137, Utc::now()));
+                        }
+                    }
+                });
             }
         }
+
+        active_state.container_count.fetch_add(1, Ordering::SeqCst);
+
+        info!(
+            "TIMING start_container {} @{}: erofs={}ms acquire={}ms total={}ms from_snapshot={} additional={}",
+            container_id,
+            epoch_ms(),
+            erofs_ms,
+            acquire_ms,
+            t_total.elapsed().as_millis(),
+            from_snapshot,
+            already_acquired
+        );
+
+        Ok(container_pid)
     }
-    result
 }
 
-/// Compute a cache key for the erofs image based on the overlayfs lowerdir paths.
-/// The lowerdirs are containerd snapshot directories keyed by image layer digests,
-/// so the same container image always produces the same set of lowerdirs.
-/// Returns None if the rootfs isn't an overlayfs mount.
-fn erofs_cache_key(rootfs_path: &std::path::Path) -> Option<String> {
-    erofs_cache_key_from_mountinfo(
-        rootfs_path,
-        &std::fs::read_to_string("/proc/self/mountinfo").ok()?,
-    )
-}
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-/// Testable implementation that accepts a mountinfo string.
-fn erofs_cache_key_from_mountinfo(
-    rootfs_path: &std::path::Path,
-    mountinfo: &str,
-) -> Option<String> {
-    let path_str = rootfs_path.to_string_lossy();
-
-    for line in mountinfo.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() > 4 && parts[4] == path_str.as_ref() {
-            if let Some(sep) = parts.iter().position(|&p| p == "-") {
-                if parts.len() > sep + 1 && parts[sep + 1] == "overlay" {
-                    // Extract lowerdir from mount options (after separator)
-                    let all_opts = parts.get(sep + 3).unwrap_or(&"");
-                    for opt in all_opts.split(',') {
-                        if let Some(dirs) = opt.strip_prefix("lowerdir=") {
-                            return Some(stable_hash_hex(dirs));
-                        }
-                    }
-                    // Also check before separator
-                    for part in parts.iter().take(sep).skip(5) {
-                        if let Some(dirs) = part.strip_prefix("lowerdir=") {
-                            return Some(stable_hash_hex(dirs));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Stable 128-bit hash (SipHash-like, deterministic across Rust versions).
-/// Uses FNV-1a 128-bit, which is simple, stable, and collision-resistant
-/// enough for a filesystem cache key.
-pub fn stable_hash_hex(input: &str) -> String {
-    const FNV_OFFSET: u128 = 0x6c62272e07bb0142_62b821756295c58d;
-    const FNV_PRIME: u128 = 0x0000000001000000_000000000000013b;
-    let mut hash = FNV_OFFSET;
-    for byte in input.as_bytes() {
-        hash ^= *byte as u128;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    format!("{hash:032x}")
-}
-
-/// Find erofs layer blobs backing the container's rootfs.
-///
-/// When the erofs snapshotter is active, containerd mounts the rootfs as
-/// overlayfs with erofs lower layers.  We parse `/proc/self/mountinfo` to
-/// find the overlay mount at `rootfs_path`, extract its `lowerdir` entries,
-/// then find the erofs source files backing those mounts.
-///
-/// Returns the layer.erofs file paths in overlayfs lowerdir order
-/// (leftmost = top/highest precedence), or an empty
-/// vec if the rootfs is not backed by erofs (e.g., plain overlayfs).
-fn find_erofs_layers(rootfs_path: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mountinfo = match std::fs::read_to_string("/proc/self/mountinfo") {
-        Ok(m) => m,
-        Err(_) => return Vec::new(),
-    };
-    let path_str = rootfs_path.to_string_lossy();
-
-    // Step 1: find the overlay mount at rootfs_path and extract lowerdirs
-    let mut lowerdirs: Vec<String> = Vec::new();
-    for line in mountinfo.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() > 4 && parts[4] == path_str.as_ref() {
-            if let Some(sep) = parts.iter().position(|&p| p == "-") {
-                if parts.len() > sep + 1 && parts[sep + 1] == "overlay" {
-                    // Found the overlay mount — extract lowerdir from options
-                    let super_opts = parts.get(sep + 3).unwrap_or(&"");
-                    for opt in super_opts.split(',') {
-                        if let Some(dirs) = opt.strip_prefix("lowerdir=") {
-                            lowerdirs = dirs.split(':').map(String::from).collect();
-                            break;
-                        }
-                    }
-                    // Also check mount options before the separator
-                    for part in parts.iter().take(sep).skip(5) {
-                        if let Some(dirs) = part.strip_prefix("lowerdir=") {
-                            lowerdirs = dirs.split(':').map(String::from).collect();
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if lowerdirs.is_empty() {
-        return Vec::new();
-    }
-
-    // Step 2: for each lowerdir, find the erofs source file from mountinfo
-    let mut erofs_layers: Vec<std::path::PathBuf> = Vec::new();
-    for ldir in &lowerdirs {
-        for line in mountinfo.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() > 4 && parts[4] == ldir.as_str() {
-                if let Some(sep) = parts.iter().position(|&p| p == "-") {
-                    if parts.len() > sep + 2 && parts[sep + 1] == "erofs" {
-                        let src = parts[sep + 2];
-                        let path = std::path::PathBuf::from(src);
-                        if path.exists() {
-                            erofs_layers.push(path);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    erofs_layers
-}
-
-/// Parsed sandbox configuration from the OCI spec.
 struct SandboxSpec {
     netns: Option<String>,
-    annotations: HashMap<String, String>,
-    mem_request: Option<u64>,
-    mem_limit: Option<u64>,
-    cpu_limit: Option<u32>,
     cgroups_path: Option<String>,
 }
 
-/// Parse sandbox OCI spec for network namespace, annotations, and resources.
+/// Poll /proc/{pid} until the process exits.
+async fn wait_for_pid_exit(pid: u32) {
+    let proc_path = format!("/proc/{pid}");
+    loop {
+        if !std::path::Path::new(&proc_path).exists() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 fn parse_sandbox_spec(spec_path: &std::path::Path) -> SandboxSpec {
-    let empty = SandboxSpec {
-        netns: None,
-        annotations: HashMap::new(),
-        mem_request: None,
-        mem_limit: None,
-        cpu_limit: None,
-        cgroups_path: None,
-    };
-    let data = match std::fs::read_to_string(spec_path) {
-        Ok(d) => d,
-        Err(_) => return empty,
-    };
-    let spec: serde_json::Value = match serde_json::from_str(&data) {
-        Ok(s) => s,
-        Err(_) => return empty,
-    };
+    let spec_str = std::fs::read_to_string(spec_path).unwrap_or_default();
+    let spec: serde_json::Value = serde_json::from_str(&spec_str).unwrap_or_default();
 
     let netns = spec
         .pointer("/linux/namespaces")
-        .and_then(|v| v.as_array())
+        .and_then(|ns| ns.as_array())
         .and_then(|ns| {
-            ns.iter()
-                .find(|n| n.get("type").and_then(|t| t.as_str()) == Some("network"))
-        })
-        .and_then(|n| n.get("path").and_then(|p| p.as_str()))
-        .map(String::from);
+            ns.iter().find_map(|n| {
+                if n.get("type").and_then(|t| t.as_str()) == Some("network") {
+                    n.get("path").and_then(|p| p.as_str()).map(String::from)
+                } else {
+                    None
+                }
+            })
+        });
 
-    let annotations = crate::annotations::annotations_from_spec(&spec);
-    let (req, lim) = crate::annotations::memory_resources_from_spec(&spec);
-    let cpu_limit = crate::annotations::cpu_resources_from_spec(&spec);
-
-    // Extract cgroups path for VM process placement
     let cgroups_path = spec
         .pointer("/linux/cgroupsPath")
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    if netns.is_some() {
-        info!("sandbox netns: {:?}", netns);
-    }
-    if !annotations.is_empty() {
-        info!("sandbox annotations: {:?}", annotations);
-    }
-    if req.is_some() || lim.is_some() || cpu_limit.is_some() {
-        info!(
-            "sandbox resources: mem_request={:?}MiB mem_limit={:?}MiB cpu_limit={:?}vcpus",
-            req, lim, cpu_limit
-        );
-    }
-    if cgroups_path.is_some() {
-        info!("sandbox cgroups: {:?}", cgroups_path);
-    }
-
     SandboxSpec {
         netns,
-        annotations,
-        mem_request: req,
-        mem_limit: lim,
-        cpu_limit,
         cgroups_path,
     }
 }
 
-/// Volume extracted from the OCI spec's mounts array.
-#[derive(Clone, Debug)]
-struct VolumeSpec {
-    destination: String,
-    source: String,
-    readonly: bool,
-    is_block: bool,
-    is_empty_dir: bool,
-    fs_type: String,
-    volume_id: String,
-}
+/// Extract a stable image key by resolving the CRI image-name annotation
+/// to a content-addressed digest via containerd's image store.
+///
+/// Falls back to hashing the image tag if digest resolution fails, and
+/// to the rootfs path if no image annotation is present.
+async fn image_key_from_spec(bundle: &std::path::Path) -> Option<String> {
+    let spec_str = std::fs::read_to_string(bundle.join("config.json")).ok()?;
+    let spec: serde_json::Value = serde_json::from_str(&spec_str).ok()?;
+    let image_name = spec
+        .pointer("/annotations/io.kubernetes.cri.image-name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
 
-/// System mount destinations that should NOT be treated as volumes.
-const SYSTEM_MOUNTS: &[&str] = &[
-    "/proc",
-    "/dev",
-    "/dev/pts",
-    "/dev/mqueue",
-    "/dev/shm",
-    "/sys",
-    "/sys/fs/cgroup",
-];
-
-/// Extract volume mounts from the OCI spec. Returns an error if the spec
-/// cannot be read or parsed, since missing volumes would cause silent failures.
-fn extract_volumes(spec_path: &std::path::Path) -> anyhow::Result<Vec<VolumeSpec>> {
-    use anyhow::Context;
-
-    let data = std::fs::read_to_string(spec_path)
-        .with_context(|| format!("read OCI spec for volumes: {}", spec_path.display()))?;
-    let spec: serde_json::Value = serde_json::from_str(&data)
-        .with_context(|| format!("parse OCI spec: {}", spec_path.display()))?;
-
-    let mounts = match spec.pointer("/mounts").and_then(|m| m.as_array()) {
-        Some(m) => m,
-        None => return Ok(vec![]),
-    };
-
-    let mut volumes = Vec::new();
-    for mount in mounts {
-        let dest = mount
-            .get("destination")
-            .and_then(|d| d.as_str())
-            .unwrap_or("");
-        let source = mount.get("source").and_then(|s| s.as_str()).unwrap_or("");
-        let mount_type = mount.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        let options = mount
-            .get("options")
-            .and_then(|o| o.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
-            .unwrap_or_default();
-
-        // Skip system mounts
-        if SYSTEM_MOUNTS.contains(&dest) {
-            continue;
-        }
-        // Skip non-bind mounts (proc, tmpfs, sysfs, devpts, etc.)
-        if mount_type != "bind" {
-            continue;
-        }
-        // Skip empty source
-        if source.is_empty() {
-            continue;
-        }
-
-        let readonly = options.contains(&"ro");
-        let is_block = std::path::Path::new(source)
-            .metadata()
-            .map(|m| {
-                use std::os::unix::fs::FileTypeExt;
-                m.file_type().is_block_device()
-            })
-            .unwrap_or(false);
-
-        // Detect emptyDir: writable directory, typically under
-        // /var/lib/kubelet/pods/<uid>/volumes/kubernetes.io~empty-dir/
-        let is_empty_dir = !readonly && !is_block && source.contains("empty-dir");
-
-        // Generate a short stable ID for the volume (hash of destination)
-        let volume_id = format!("{:x}", {
-            let mut h: u64 = 5381;
-            for b in dest.bytes() {
-                h = h.wrapping_mul(33).wrapping_add(b as u64);
-            }
-            h
-        });
-
-        // Fix #9: don't default to ext4 — let agent auto-detect
-        let fs_type = if is_block {
-            detect_block_fs_type(source).unwrap_or_default()
-        } else {
-            String::new()
-        };
-
-        volumes.push(VolumeSpec {
-            destination: dest.to_string(),
-            source: source.to_string(),
-            readonly,
-            is_block,
-            is_empty_dir,
-            fs_type,
-            volume_id,
-        });
+    // Resolve tag → digest via containerd's gRPC image service.
+    // This is content-addressed and immune to tag mutation (e.g. "latest").
+    if let Some(digest) = resolve_image_digest(image_name).await {
+        info!("resolved image {} → {}", image_name, digest);
+        return Some(stable_hash_hex(&digest));
     }
 
-    Ok(volumes)
+    // Fallback: hash the image reference (tag-based, not ideal but functional)
+    info!(
+        "digest resolution failed for {}, using tag hash",
+        image_name
+    );
+    Some(stable_hash_hex(image_name))
 }
 
-/// Detect filesystem type of a block device via blkid.
-/// Returns None when detection fails — the agent will try auto-detect.
-fn detect_block_fs_type(device: &str) -> Option<String> {
-    let output = std::process::Command::new("blkid")
-        .args(["-o", "value", "-s", "TYPE", device])
-        .output()
+/// Query containerd's gRPC image service to resolve an image reference
+/// to its content digest. Returns the digest (e.g. "sha256:b3255e7d...").
+async fn resolve_image_digest(image_ref: &str) -> Option<String> {
+    use containerd_client::services::v1::images_client::ImagesClient;
+    use containerd_client::services::v1::GetImageRequest;
+    use containerd_client::tonic::Request;
+    use containerd_client::with_namespace;
+
+    let channel = containerd_client::connect("/run/containerd/containerd.sock")
+        .await
         .ok()?;
-    let fs = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if fs.is_empty() {
-        None
-    } else {
-        Some(fs)
-    }
+
+    let req = GetImageRequest {
+        name: image_ref.to_string(),
+    };
+    let req = with_namespace!(req, "k8s.io");
+
+    let image = ImagesClient::new(channel)
+        .get(req)
+        .await
+        .ok()?
+        .into_inner()
+        .image?;
+
+    image.target.map(|t| t.digest)
 }
 
-/// Create an erofs disk image containing the container rootfs.
-///
-/// Uses `mkfs.erofs` to create a read-only erofs image from the rootfs
-/// directory. The shim passes this to the VM as a read-only virtio-blk device.
-#[cfg(test)]
-#[allow(dead_code)]
-fn create_rootfs_erofs_image(
-    rootfs_path: &std::path::Path,
-    disk_path: &std::path::Path,
-) -> anyhow::Result<()> {
-    use anyhow::Context;
-    use std::process::Command;
+/// Prepare erofs image from rootfs (cached by image key).
+/// Uses flock to serialize concurrent mkfs.erofs for the same image.
+fn prepare_erofs(rootfs_path: &std::path::Path, cache_key: &str) -> Result<PathBuf, Error> {
+    let cache_path = PathBuf::from(EROFS_CACHE_DIR).join(format!("{cache_key}.erofs"));
 
-    let status = Command::new("mkfs.erofs")
-        .args(["--quiet"])
-        .arg(disk_path)
+    if cache_path.exists() {
+        return Ok(cache_path);
+    }
+
+    std::fs::create_dir_all(EROFS_CACHE_DIR)
+        .map_err(|e| Error::Any(anyhow::anyhow!("create erofs cache dir: {e}")))?;
+
+    // Serialize concurrent mkfs.erofs for the same image via flock
+    let lock_path = PathBuf::from(EROFS_CACHE_DIR).join(format!("{cache_key}.lock"));
+    let lock_file = std::fs::File::create(&lock_path)
+        .map_err(|e| Error::Any(anyhow::anyhow!("create lock: {e}")))?;
+    use std::os::unix::io::AsRawFd;
+    let fd = lock_file.as_raw_fd();
+    let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
+    if ret != 0 {
+        return Err(Error::Any(anyhow::anyhow!(
+            "flock: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    // Re-check after acquiring lock (another process may have created it)
+    if cache_path.exists() {
+        return Ok(cache_path);
+    }
+
+    let tmp_path =
+        PathBuf::from(EROFS_CACHE_DIR).join(format!("{cache_key}.{}.tmp", std::process::id()));
+
+    let status = std::process::Command::new("mkfs.erofs")
+        .arg(&tmp_path)
         .arg(rootfs_path)
-        .status()
-        .context("mkfs.erofs")?;
+        .output()
+        .map_err(|e| Error::Any(anyhow::anyhow!("mkfs.erofs: {e}")))?;
 
-    if !status.success() {
-        anyhow::bail!("mkfs.erofs failed: {status}");
+    if !status.status.success() {
+        let stderr = String::from_utf8_lossy(&status.stderr);
+        return Err(Error::Any(anyhow::anyhow!("mkfs.erofs failed: {stderr}")));
     }
 
-    log::info!("erofs image created: {}", disk_path.display());
-    Ok(())
+    std::fs::rename(&tmp_path, &cache_path)
+        .map_err(|e| Error::Any(anyhow::anyhow!("rename erofs: {e}")))?;
+
+    Ok(cache_path)
 }
 
-/// Read all files from a volume source directory for inline RPC delivery.
-/// Returns a vec of (relative_path, content, mode) tuples.
-fn read_volume_files(src: &std::path::Path) -> anyhow::Result<Vec<(String, Vec<u8>, u32)>> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut files = Vec::new();
-
-    fn walk(
-        base: &std::path::Path,
-        dir: &std::path::Path,
-        out: &mut Vec<(String, Vec<u8>, u32)>,
-    ) -> anyhow::Result<()> {
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let meta = path.symlink_metadata()?;
-            if meta.file_type().is_dir() {
-                walk(base, &path, out)?;
-            } else if meta.file_type().is_file() {
-                let rel = path
-                    .strip_prefix(base)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .to_string();
-                let content = std::fs::read(&path)?;
-                let mode = path.metadata()?.permissions().mode();
-                out.push((rel, content, mode));
-            }
-        }
-        Ok(())
+/// Stable FNV-1a 128-bit hash → hex string.
+pub fn stable_hash_hex(input: &str) -> String {
+    let mut hash: u128 = 0x6c62272e07bb0142_62b821756295c58d;
+    for byte in input.bytes() {
+        hash ^= byte as u128;
+        hash = hash.wrapping_mul(0x0000000001000000_000000000000013b);
     }
-
-    let src_meta = src.symlink_metadata()?;
-    if src_meta.file_type().is_dir() {
-        walk(src, src, &mut files)?;
-    } else if src_meta.file_type().is_file() {
-        let name = src
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let content = std::fs::read(src)?;
-        let mode = src.metadata()?.permissions().mode();
-        files.push((name, content, mode));
-    }
-
-    Ok(files)
+    format!("{hash:032x}")
 }
 
-/// Attempt to restore a VM from a cached snapshot.
-/// Patches the snapshot config with this VM's CID/vsock and TAP device,
-/// restores, resumes, and hot-plugs container rootfs disks.
-///
-/// Networking is handled by patching the TAP name and MAC in the snapshot
-/// config BEFORE restore. This means the restored VM wakes up with its
-/// virtio-net device (eth0) already wired to the new pod's TAP — no PCI
-/// hot-plug needed, no device discovery race.
-async fn try_restore(
-    vm_state: &SharedVmState,
-    snap_key: &str,
-    rootfs_disks: &[(std::path::PathBuf, String, bool)],
-) -> Result<(), Error> {
-    // Patch snapshot config with this VM's CID, vsock socket, and TAP device
-    let patched_dir = crate::snapshot::prepare_snapshot_for_vm(
-        snap_key,
-        vm_state.vm.state_dir(),
-        vm_state.vm.cid(),
-        &vm_state.vsock_socket,
-        vm_state.tap_name.as_deref(),
-        vm_state.tap_mac.as_deref(),
-    )
-    .ctx("prepare snapshot")?;
-
-    // Restore from patched snapshot (CoW memory)
-    vm_state
-        .vm
-        .restore_from_snapshot(&patched_dir)
-        .await
-        .ctx("restore from snapshot")?;
-
-    // Resume the VM
-    vm_state.vm.resume().await.ctx("resume after restore")?;
-
-    // Hot-plug container rootfs disks
-    for (path, id, readonly) in rootfs_disks {
-        let disk_json = serde_json::json!({
-            "path": path.to_string_lossy(),
-            "readonly": *readonly,
-            "id": id,
-        });
-        VmManager::api_request_to_socket(
-            &vm_state.api_socket,
-            "PUT",
-            "/api/v1/vm.add-disk",
-            Some(&disk_json.to_string()),
-        )
-        .await
-        .ctx("hot-plug rootfs after restore")?;
-    }
-
-    Ok(())
-}
-
-/// Create a golden VM snapshot and store it in the cache.
-/// Called asynchronously after a successful cold boot — doesn't block pod startup.
-async fn create_snapshot_for_cache(
-    api_socket: &std::path::Path,
-    cache_key: &str,
-    container_info: &tokio::sync::Mutex<Vec<(String, String, u32)>>,
-) -> anyhow::Result<()> {
-    use anyhow::Context;
-
-    let _lock = crate::snapshot::snapshot_cache_lock(cache_key).await?;
-
-    // Check again under lock — another shim may have created it
-    if crate::snapshot::snapshot_cache_hit(cache_key) {
+/// Place a process in a pod cgroup.
+fn place_in_pod_cgroup(pid: u32, cgroups_path: &str) -> Result<(), String> {
+    let cgroup_base = "/sys/fs/cgroup";
+    let full_path = format!("{cgroup_base}/{cgroups_path}/cgroup.procs");
+    if std::path::Path::new(&full_path).exists() {
+        std::fs::write(&full_path, pid.to_string()).map_err(|e| format!("{e}"))?;
         return Ok(());
     }
 
-    // Snapshot into a temp dir, then move into cache
-    let tmp_dir = std::path::PathBuf::from("/run/cloudhv/snapshot-cache")
-        .join(format!("{cache_key}.{}.tmp", std::process::id()));
-    std::fs::create_dir_all(&tmp_dir)?;
-
-    // Pause → snapshot → resume (VM stays running for the current pod)
-    VmManager::api_request_to_socket(api_socket, "PUT", "/api/v1/vm.pause", None)
-        .await
-        .context("pause for snapshot")?;
-
-    let url = format!("file://{}", tmp_dir.display());
-    let body = serde_json::json!({"destination_url": url});
-    let snap_result = VmManager::api_request_to_socket(
-        api_socket,
-        "PUT",
-        "/api/v1/vm.snapshot",
-        Some(&body.to_string()),
-    )
-    .await;
-
-    // Always resume, even if snapshot failed
-    if let Err(e) =
-        VmManager::api_request_to_socket(api_socket, "PUT", "/api/v1/vm.resume", None).await
-    {
-        log::error!("vm.resume after snapshot failed: {e:#}");
-    }
-
-    if snap_result.is_err() {
-        // Best-effort cleanup of temporary snapshot directory on snapshot failure.
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-    }
-
-    snap_result.context("vm.snapshot")?;
-
-    // Strip `ip=…` from kernel cmdline so the cached snapshot doesn't bake
-    // in a pod-specific IP. The TAP/net device config is KEPT — it will be
-    // patched to the new pod's TAP name and MAC during prepare_snapshot_for_vm.
-    if let Err(e) = strip_kernel_ip_from_dir(&tmp_dir) {
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        return Err(e);
-    }
-
-    if let Err(e) = crate::snapshot::snapshot_cache_store(cache_key, &tmp_dir) {
-        // Best-effort cleanup of temporary snapshot directory on cache store failure.
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        return Err(e);
-    }
-
-    // Save container metadata alongside the snapshot so warm restores can
-    // call AdoptContainer to re-register the running container under a new ID.
-    {
-        let infos = container_info.lock().await;
-        let metadata = crate::snapshot::SnapshotMetadata {
-            containers: infos
-                .iter()
-                .map(|(cid, key, pid)| crate::snapshot::SnapshotContainerInfo {
-                    image_key: key.clone(),
-                    container_id: cid.clone(),
-                    pid: *pid,
-                })
-                .collect(),
-        };
-        if let Err(e) = crate::snapshot::save_snapshot_metadata(cache_key, &metadata) {
-            log::info!("save snapshot metadata failed (non-fatal): {e:#}");
-        } else {
-            info!(
-                "snapshot metadata saved: {} container(s)",
-                metadata.containers.len()
-            );
+    // Try systemd-style path
+    let parts: Vec<&str> = cgroups_path.split(':').collect();
+    if parts.len() == 3 {
+        let path = format!("{cgroup_base}/{}/{}/cgroup.procs", parts[1], parts[2]);
+        if std::path::Path::new(&path).exists() {
+            std::fs::write(&path, pid.to_string()).map_err(|e| format!("{e}"))?;
+            return Ok(());
         }
     }
 
-    info!("golden snapshot created and cached: {cache_key}");
-    Ok(())
-}
-
-/// Remove `ip=…` kernel cmdline params from a snapshot directory's
-/// `config.json`. The TAP/net device config is intentionally KEPT so
-/// the restored VM wakes up with the same virtio-net device — we just
-/// patch the TAP name and MAC during prepare_snapshot_for_vm.
-fn strip_kernel_ip_from_dir(dir: &std::path::Path) -> anyhow::Result<()> {
-    let config_path = dir.join("config.json");
-    let config_str = std::fs::read_to_string(&config_path)?;
-    let mut config: serde_json::Value = serde_json::from_str(&config_str)?;
-
-    // Strip ip=... from kernel cmdline
-    if let Some(cmdline) = config.pointer_mut("/payload/cmdline") {
-        if let Some(s) = cmdline.as_str() {
-            let stripped = s
-                .split_whitespace()
-                .filter(|part| !part.starts_with("ip="))
-                .collect::<Vec<_>>()
-                .join(" ");
-            *cmdline = serde_json::json!(stripped);
-        }
-    }
-
-    std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
-    log::info!("stripped kernel ip= from snapshot dir {}", dir.display());
-    Ok(())
-}
-
-/// Convert a CIDR prefix length to a dotted-decimal netmask.
-fn prefix_to_netmask(prefix: u32) -> String {
-    let mask: u32 = if prefix == 0 {
-        0
-    } else {
-        !0u32 << (32 - prefix)
-    };
-    format!(
-        "{}.{}.{}.{}",
-        (mask >> 24) & 0xff,
-        (mask >> 16) & 0xff,
-        (mask >> 8) & 0xff,
-        mask & 0xff,
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use tempfile::TempDir;
-
-    /// Helper: compute the djb2 volume ID hash for a destination path.
-    fn volume_id_for(dest: &str) -> String {
-        let mut h: u64 = 5381;
-        for b in dest.bytes() {
-            h = h.wrapping_mul(33).wrapping_add(b as u64);
-        }
-        format!("{:x}", h)
-    }
-
-    /// Write an OCI spec JSON to a file with optional mounts.
-    fn write_spec(path: &std::path::Path, mounts: &[serde_json::Value]) {
-        let spec = serde_json::json!({
-            "ociVersion": "1.0.2",
-            "process": {
-                "terminal": false,
-                "user": { "uid": 0, "gid": 0 },
-                "args": ["/bin/sh"],
-                "env": ["PATH=/bin"],
-                "cwd": "/"
-            },
-            "root": { "path": "rootfs", "readonly": false },
-            "linux": { "namespaces": [{"type": "pid"}, {"type": "mount"}] },
-            "mounts": mounts,
-        });
-        fs::write(path, serde_json::to_string_pretty(&spec).unwrap()).unwrap();
-    }
-
-    #[test]
-    fn extract_volumes_empty_spec() {
-        let dir = TempDir::new().unwrap();
-        let spec = dir.path().join("config.json");
-        write_spec(&spec, &[]);
-        let vols = extract_volumes(&spec).unwrap();
-        assert!(vols.is_empty());
-    }
-
-    #[test]
-    fn extract_volumes_skips_system_mounts() {
-        let dir = TempDir::new().unwrap();
-        let spec = dir.path().join("config.json");
-        write_spec(
-            &spec,
-            &[
-                serde_json::json!({"destination": "/proc", "source": "/proc", "type": "bind"}),
-                serde_json::json!({"destination": "/dev", "source": "/dev", "type": "bind"}),
-                serde_json::json!({"destination": "/sys", "source": "/sys", "type": "bind"}),
-                serde_json::json!({"destination": "/dev/pts", "source": "/dev/pts", "type": "bind"}),
-                serde_json::json!({"destination": "/dev/mqueue", "source": "/dev/mqueue", "type": "bind"}),
-                serde_json::json!({"destination": "/dev/shm", "source": "/dev/shm", "type": "bind"}),
-                serde_json::json!({"destination": "/sys/fs/cgroup", "source": "/sys/fs/cgroup", "type": "bind"}),
-            ],
-        );
-        let vols = extract_volumes(&spec).unwrap();
-        assert!(vols.is_empty(), "system mounts should be filtered out");
-    }
-
-    #[test]
-    fn extract_volumes_skips_non_bind_mounts() {
-        let dir = TempDir::new().unwrap();
-        let spec = dir.path().join("config.json");
-        write_spec(
-            &spec,
-            &[
-                serde_json::json!({"destination": "/tmp", "source": "tmpfs", "type": "tmpfs"}),
-                serde_json::json!({"destination": "/mnt/proc", "source": "proc", "type": "proc"}),
-            ],
-        );
-        let vols = extract_volumes(&spec).unwrap();
-        assert!(vols.is_empty(), "non-bind mounts should be filtered out");
-    }
-
-    #[test]
-    fn extract_volumes_detects_configmap_readonly() {
-        let dir = TempDir::new().unwrap();
-        // Create a real source dir so metadata() succeeds (it's not a block device)
-        let src = dir.path().join("configmap-data");
-        fs::create_dir_all(&src).unwrap();
-        fs::write(src.join("key"), "value").unwrap();
-
-        let spec = dir.path().join("config.json");
-        write_spec(
-            &spec,
-            &[serde_json::json!({
-                "destination": "/etc/config",
-                "source": src.to_string_lossy(),
-                "type": "bind",
-                "options": ["rbind", "ro"]
-            })],
-        );
-        let vols = extract_volumes(&spec).unwrap();
-        assert_eq!(vols.len(), 1);
-        assert_eq!(vols[0].destination, "/etc/config");
-        assert!(vols[0].readonly, "should be readonly");
-        assert!(!vols[0].is_block, "directory is not a block device");
-        assert!(!vols[0].is_empty_dir, "no 'empty-dir' in path");
-        assert_eq!(vols[0].volume_id, volume_id_for("/etc/config"));
-    }
-
-    #[test]
-    fn extract_volumes_detects_emptydir() {
-        let dir = TempDir::new().unwrap();
-        // Source path must contain "empty-dir" (kubelet convention)
-        let src = dir
-            .path()
-            .join("pods/uid/volumes/kubernetes.io~empty-dir/scratch");
-        fs::create_dir_all(&src).unwrap();
-
-        let spec = dir.path().join("config.json");
-        write_spec(
-            &spec,
-            &[serde_json::json!({
-                "destination": "/scratch",
-                "source": src.to_string_lossy(),
-                "type": "bind",
-                "options": []
-            })],
-        );
-        let vols = extract_volumes(&spec).unwrap();
-        assert_eq!(vols.len(), 1);
-        assert!(vols[0].is_empty_dir, "path contains 'empty-dir'");
-        assert!(!vols[0].readonly, "emptyDir is writable");
-    }
-
-    #[test]
-    fn extract_volumes_readonly_emptydir_not_detected() {
-        let dir = TempDir::new().unwrap();
-        let src = dir
-            .path()
-            .join("pods/uid/volumes/kubernetes.io~empty-dir/cache");
-        fs::create_dir_all(&src).unwrap();
-
-        let spec = dir.path().join("config.json");
-        write_spec(
-            &spec,
-            &[serde_json::json!({
-                "destination": "/cache",
-                "source": src.to_string_lossy(),
-                "type": "bind",
-                "options": ["ro"]
-            })],
-        );
-        let vols = extract_volumes(&spec).unwrap();
-        assert_eq!(vols.len(), 1);
-        // emptyDir detection requires writable mount
-        assert!(
-            !vols[0].is_empty_dir,
-            "readonly mount should not be emptyDir"
-        );
-    }
-
-    #[test]
-    fn extract_volumes_multiple_volumes() {
-        let dir = TempDir::new().unwrap();
-
-        let cm_src = dir.path().join("cm");
-        fs::create_dir_all(&cm_src).unwrap();
-        fs::write(cm_src.join("app.conf"), "setting=1").unwrap();
-
-        let secret_src = dir.path().join("secret");
-        fs::create_dir_all(&secret_src).unwrap();
-        fs::write(secret_src.join("password"), "hunter2").unwrap();
-
-        let edir_src = dir
-            .path()
-            .join("pods/x/volumes/kubernetes.io~empty-dir/tmp");
-        fs::create_dir_all(&edir_src).unwrap();
-
-        let spec = dir.path().join("config.json");
-        write_spec(
-            &spec,
-            &[
-                serde_json::json!({
-                    "destination": "/etc/config",
-                    "source": cm_src.to_string_lossy(),
-                    "type": "bind",
-                    "options": ["ro"]
-                }),
-                serde_json::json!({
-                    "destination": "/etc/secrets",
-                    "source": secret_src.to_string_lossy(),
-                    "type": "bind",
-                    "options": ["ro"]
-                }),
-                serde_json::json!({
-                    "destination": "/tmp",
-                    "source": edir_src.to_string_lossy(),
-                    "type": "bind",
-                    "options": []
-                }),
-                // System mount — should be filtered
-                serde_json::json!({
-                    "destination": "/proc",
-                    "source": "/proc",
-                    "type": "bind"
-                }),
-            ],
-        );
-        let vols = extract_volumes(&spec).unwrap();
-        assert_eq!(vols.len(), 3, "3 user volumes, /proc filtered");
-        assert!(vols[0].readonly);
-        assert!(vols[1].readonly);
-        assert!(vols[2].is_empty_dir);
-    }
-
-    #[test]
-    fn extract_volumes_no_mounts_key() {
-        let dir = TempDir::new().unwrap();
-        let spec = dir.path().join("config.json");
-        let data = serde_json::json!({
-            "ociVersion": "1.0.2",
-            "process": { "args": ["/bin/sh"] },
-            "root": { "path": "rootfs" }
-        });
-        fs::write(&spec, serde_json::to_string(&data).unwrap()).unwrap();
-        let vols = extract_volumes(&spec).unwrap();
-        assert!(vols.is_empty());
-    }
-
-    #[test]
-    fn extract_volumes_invalid_json_is_error() {
-        let dir = TempDir::new().unwrap();
-        let spec = dir.path().join("config.json");
-        fs::write(&spec, "not json").unwrap();
-        assert!(extract_volumes(&spec).is_err());
-    }
-
-    #[test]
-    fn extract_volumes_missing_file_is_error() {
-        let result = extract_volumes(std::path::Path::new("/nonexistent/config.json"));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn volume_id_is_deterministic() {
-        let id1 = volume_id_for("/etc/config");
-        let id2 = volume_id_for("/etc/config");
-        assert_eq!(id1, id2);
-        // Different paths produce different IDs
-        let id3 = volume_id_for("/etc/secrets");
-        assert_ne!(id1, id3);
-    }
-
-    #[test]
-    fn prefix_to_netmask_common_values() {
-        assert_eq!(super::prefix_to_netmask(24), "255.255.255.0");
-        assert_eq!(super::prefix_to_netmask(16), "255.255.0.0");
-        assert_eq!(super::prefix_to_netmask(32), "255.255.255.255");
-        assert_eq!(super::prefix_to_netmask(0), "0.0.0.0");
-    }
-
-    #[test]
-    fn to_systemd_cgroup_path_converts_correctly() {
-        assert_eq!(
-            super::to_systemd_cgroup_path("kubepods/burstable/pod-abc/ctr-123"),
-            "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod_abc.slice/cri-containerd-ctr_123.scope"
-        );
-        assert_eq!(
-            super::to_systemd_cgroup_path("kubepods/besteffort/pod-xyz/ctr-456"),
-            "kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod_xyz.slice/cri-containerd-ctr_456.scope"
-        );
-    }
-
-    #[test]
-    fn place_in_pod_cgroup_v2_unified() {
-        let dir = TempDir::new().unwrap();
-        let cg = dir.path().join("kubepods/burstable/pod-abc");
-        fs::create_dir_all(&cg).unwrap();
-        fs::write(cg.join("cgroup.procs"), "").unwrap();
-
-        super::place_in_pod_cgroup_at(12345, "kubepods/burstable/pod-abc", dir.path())
-            .expect("should place in v2 cgroup");
-
-        let content = fs::read_to_string(cg.join("cgroup.procs")).unwrap();
-        assert_eq!(content, "12345");
-    }
-
-    #[test]
-    fn place_in_pod_cgroup_v1_fallback() {
-        let dir = TempDir::new().unwrap();
-        // Create v1-style hierarchy (no unified v2 path)
-        let mem_cg = dir.path().join("memory/kubepods/burstable/pod-abc");
-        let cpu_cg = dir.path().join("cpu,cpuacct/kubepods/burstable/pod-abc");
-        fs::create_dir_all(&mem_cg).unwrap();
-        fs::create_dir_all(&cpu_cg).unwrap();
-        fs::write(mem_cg.join("cgroup.procs"), "").unwrap();
-        fs::write(cpu_cg.join("cgroup.procs"), "").unwrap();
-
-        super::place_in_pod_cgroup_at(99999, "kubepods/burstable/pod-abc", dir.path())
-            .expect("should place in v1 cgroups");
-
-        assert_eq!(
-            fs::read_to_string(mem_cg.join("cgroup.procs")).unwrap(),
-            "99999"
-        );
-        assert_eq!(
-            fs::read_to_string(cpu_cg.join("cgroup.procs")).unwrap(),
-            "99999"
-        );
-    }
-
-    #[test]
-    fn place_in_pod_cgroup_no_path_fails() {
-        let dir = TempDir::new().unwrap();
-        let result = super::place_in_pod_cgroup_at(1, "nonexistent/path", dir.path());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn read_volume_files_reads_directory() {
-        let dir = TempDir::new().unwrap();
-        let vol_src = dir.path().join("configmap");
-        fs::create_dir_all(vol_src.join("subdir")).unwrap();
-        fs::write(vol_src.join("key"), "value").unwrap();
-        fs::write(vol_src.join("subdir/nested"), "deep").unwrap();
-
-        let files = read_volume_files(&vol_src).unwrap();
-        assert_eq!(files.len(), 2);
-        let paths: Vec<&str> = files.iter().map(|(p, _, _)| p.as_str()).collect();
-        assert!(paths.contains(&"key"));
-        assert!(paths.contains(&"subdir/nested"));
-        let key_file = files.iter().find(|(p, _, _)| p == "key").unwrap();
-        assert_eq!(key_file.1, b"value");
-    }
-
-    #[test]
-    fn read_volume_files_reads_single_file() {
-        let dir = TempDir::new().unwrap();
-        let file_path = dir.path().join("secret.txt");
-        fs::write(&file_path, "s3cret").unwrap();
-
-        let files = read_volume_files(&file_path).unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].0, "secret.txt");
-        assert_eq!(files[0].1, b"s3cret");
-    }
-
-    #[test]
-    fn erofs_cache_key_extracts_lowerdir() {
-        let mountinfo = "389 34 0:50 / /run/containerd/task/k8s.io/abc/rootfs rw,relatime shared:335 - overlay overlay rw,lowerdir=/snap/917/fs:/snap/916/fs:/snap/915/fs,upperdir=/snap/930/fs,workdir=/snap/930/work";
-        let key = super::erofs_cache_key_from_mountinfo(
-            std::path::Path::new("/run/containerd/task/k8s.io/abc/rootfs"),
-            mountinfo,
-        );
-        assert!(key.is_some());
-        // Same input → same key
-        let key2 = super::erofs_cache_key_from_mountinfo(
-            std::path::Path::new("/run/containerd/task/k8s.io/abc/rootfs"),
-            mountinfo,
-        );
-        assert_eq!(key, key2);
-    }
-
-    #[test]
-    fn erofs_cache_key_different_lowerdirs_differ() {
-        let mi1 = "1 0 0:1 / /rootfs1 rw - overlay overlay rw,lowerdir=/a:/b";
-        let mi2 = "1 0 0:1 / /rootfs1 rw - overlay overlay rw,lowerdir=/a:/c";
-        let k1 = super::erofs_cache_key_from_mountinfo(std::path::Path::new("/rootfs1"), mi1);
-        let k2 = super::erofs_cache_key_from_mountinfo(std::path::Path::new("/rootfs1"), mi2);
-        assert_ne!(k1, k2);
-    }
-
-    #[test]
-    fn erofs_cache_key_none_for_non_overlay() {
-        let mountinfo = "1 0 8:1 / /rootfs rw - ext4 /dev/sda1 rw";
-        let key = super::erofs_cache_key_from_mountinfo(std::path::Path::new("/rootfs"), mountinfo);
-        assert!(key.is_none());
-    }
-
-    #[test]
-    fn stable_hash_is_deterministic() {
-        let h1 = super::stable_hash_hex("hello world");
-        let h2 = super::stable_hash_hex("hello world");
-        assert_eq!(h1, h2);
-        assert_eq!(h1.len(), 32); // 128-bit hex
-        let h3 = super::stable_hash_hex("different input");
-        assert_ne!(h1, h3);
-    }
+    Err(format!(
+        "no cgroup found for path {cgroups_path} (tried v2, v2-systemd)"
+    ))
 }

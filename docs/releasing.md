@@ -28,11 +28,13 @@ contains downloadable binaries and checksums for both amd64 and arm64:
 |-------|-------------|
 | `containerd-shim-cloudhv-v1-linux-amd64` | Host shim binary (x86_64) |
 | `containerd-shim-cloudhv-v1-linux-arm64` | Host shim binary (aarch64) |
+| `cloudhv-sandbox-daemon-linux-amd64` | Sandbox daemon binary (x86_64) |
+| `cloudhv-sandbox-daemon-linux-arm64` | Sandbox daemon binary (aarch64) |
 | `cloudhv-agent-linux-amd64` | Guest agent (x86_64, static musl) |
 | `cloudhv-agent-linux-arm64` | Guest agent (aarch64, static musl) |
 | `vmlinux` | Guest kernel — x86_64 (PVH boot, virtio, vsock, IP_PNP) |
 | `vmlinux-arm64` | Guest kernel — aarch64 (direct boot, PL011, ARM GIC) |
-| `rootfs.ext4` | Guest rootfs — x86_64 (agent + crun, 16 MB) |
+| `rootfs.erofs` | Guest rootfs — x86_64 (agent + crun, 16 MB) |
 | `rootfs-arm64.ext4` | Guest rootfs — aarch64 (agent + crun) |
 | `cloudhv-installer-chart-<version>.tgz` | Helm chart archive |
 | `checksums-sha256.txt` | SHA-256 checksums for all assets |
@@ -125,9 +127,15 @@ ghcr.io/devigned/cloudhv-installer:v0.1.0
 
 The chart is at `charts/cloudhv-installer/` and installs:
 
+- **Shim binary, daemon binary, guest kernel, rootfs, and Cloud Hypervisor**
   onto each selected node, patches containerd config, restarts containerd
+- **Daemon config** (`/opt/cloudhv/daemon.json`) and **systemd unit**
+  (`/etc/systemd/system/cloudhv-sandbox-daemon.service`) for the sandbox daemon
 - **RuntimeClass**: registers the `cloudhv` runtime handler with pod overhead
   annotations for accurate Kubernetes scheduler accounting
+
+The installer Dockerfile builds Cloud Hypervisor from source (main branch)
+until CH v51 is officially released, ensuring OnDemand restore support.
 
 ### Values
 
@@ -160,9 +168,9 @@ build-rootfs ────┘                           │
   (creates GitHub Release, pushes Helm to GHCR)
 ```
 
-1. **build-binaries**: compiles shim (gnu) and agent (musl) in parallel for both x86_64 and aarch64
+1. **build-binaries**: compiles shim (gnu), daemon (gnu), and agent (musl) in parallel for both x86_64 and aarch64
 2. **build-kernel**: builds or restores cached guest kernel (per architecture)
-3. **build-rootfs**: creates rootfs ext4 image with agent + crun (per architecture)
+3. **build-rootfs**: creates rootfs.erofs image with agent + crun (per architecture)
 4. **build-installer-image**: packages arch-specific artifacts into per-platform images,
    then creates a multi-arch manifest combining amd64 and arm64
 5. **release**: creates GitHub Release with all binaries, checksums, Helm chart, and notes

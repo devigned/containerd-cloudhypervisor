@@ -2,8 +2,8 @@
 set -uo pipefail
 
 # CloudHV installer — runs inside the DaemonSet pod with the host
-# filesystem mounted at /host. Copies shim artifacts, configures the
-# erofs snapshotter, and restarts containerd.
+# filesystem mounted at /host. Copies shim + daemon artifacts, configures
+# the runtime handler, starts the sandbox daemon, and restarts containerd.
 
 ARTIFACTS=/opt/cloudhv
 HOST=/host
@@ -75,15 +75,25 @@ EROFSEOF
   rm -f "$HOST/tmp/cloudhv-install-erofs.sh"
 fi
 
-# 3. Copy binaries and guest artifacts
+# 3. Stop existing daemon (if running) before clearing caches
+nsenter --target 1 --mount --uts --ipc --pid -- \
+  systemctl stop cloudhv-sandbox-daemon 2>/dev/null || true
+
+# 4. Clear stale caches from previous installs
+echo "[cloudhv] Clearing caches from previous install..."
+nsenter --target 1 --mount -- rm -rf /run/cloudhv/erofs-cache /run/cloudhv/daemon
+nsenter --target 1 --mount -- mkdir -p /run/cloudhv/daemon
+
+# 5. Copy binaries and guest artifacts
 echo "[cloudhv] Copying binaries and guest artifacts..."
 install -D -m 755 "$ARTIFACTS/containerd-shim-cloudhv-v1" "$HOST/usr/local/bin/containerd-shim-cloudhv-v1"
+install -m 755 "$ARTIFACTS/cloudhv-sandbox-daemon" "$HOST/usr/local/bin/cloudhv-sandbox-daemon"
 install -m 755 "$ARTIFACTS/cloud-hypervisor" "$HOST/usr/local/bin/cloud-hypervisor"
 mkdir -p "$HOST/opt/cloudhv"
 install -m 644 "$ARTIFACTS/vmlinux" "$HOST/opt/cloudhv/vmlinux"
 install -m 644 "$ARTIFACTS/rootfs.erofs" "$HOST/opt/cloudhv/rootfs.erofs"
 
-# 4. Write runtime config
+# 6. Write shim runtime config (with daemon_socket)
 echo "[cloudhv] Writing runtime config..."
 cat > "$HOST/opt/cloudhv/config.json" << CONFIG
 {
@@ -93,15 +103,57 @@ cat > "$HOST/opt/cloudhv/config.json" << CONFIG
   "kernel_args": "${KERNEL_CONSOLE} root=/dev/vda rw init=/init net.ifnames=0",
   "default_vcpus": 1,
   "max_default_vcpus": 0,
-  "default_memory_mb": 512,
+  "default_memory_mb": 128,
   "max_containers_per_vm": 5,
   "hotplug_memory_mb": 0,
   "hotplug_method": "acpi",
-  "tpm_enabled": false
+  "tpm_enabled": false,
+  "daemon_socket": "/run/cloudhv/daemon.sock"
 }
 CONFIG
 
-# 5. Patch containerd config
+# 7. Write daemon config
+echo "[cloudhv] Writing daemon config..."
+cat > "$HOST/opt/cloudhv/daemon.json" << DAEMON
+{
+  "pool_size": 3,
+  "kernel_path": "/opt/cloudhv/vmlinux",
+  "rootfs_path": "/opt/cloudhv/rootfs.erofs",
+  "kernel_args": "${KERNEL_CONSOLE} root=/dev/vda rw init=/init net.ifnames=0",
+  "default_vcpus": 1,
+  "default_memory_mb": 128,
+  "socket_path": "/run/cloudhv/daemon.sock",
+  "state_dir": "/run/cloudhv/daemon"
+}
+DAEMON
+
+# 8. Install systemd unit for the sandbox daemon
+echo "[cloudhv] Installing sandbox daemon service..."
+cat > "$HOST/etc/systemd/system/cloudhv-sandbox-daemon.service" << 'UNIT'
+[Unit]
+Description=CloudHV Sandbox Daemon
+After=containerd.service
+Requires=containerd.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p /run/cloudhv/daemon
+ExecStart=/usr/local/bin/cloudhv-sandbox-daemon /opt/cloudhv/daemon.json
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=info
+MemoryMax=4G
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+nsenter --target 1 --mount --uts --ipc --pid -- \
+  systemctl daemon-reload
+nsenter --target 1 --mount --uts --ipc --pid -- \
+  systemctl enable cloudhv-sandbox-daemon
+
+# 9. Patch containerd config
 echo "[cloudhv] Patching containerd config..."
 CONTAINERD_CONFIG="$HOST/etc/containerd/config.toml"
 
@@ -130,21 +182,28 @@ else
   echo "[cloudhv] Runtime handler added"
 fi
 
-# 6. Restart containerd
-echo "[cloudhv] Scheduling containerd restart..."
+# 10. Restart containerd and start daemon
+echo "[cloudhv] Scheduling containerd restart and daemon start..."
 nsenter --target 1 --mount --uts --ipc --pid -- \
-  bash -c 'nohup bash -c "sleep 5 && systemctl restart containerd" &>/dev/null &'
+  bash -c 'nohup bash -c "sleep 5 && systemctl restart containerd && sleep 3 && systemctl start cloudhv-sandbox-daemon" &>/dev/null &'
 
-sleep 10
+sleep 15
 if chroot "$HOST" systemctl is-active --quiet containerd; then
   echo "[cloudhv] containerd restarted successfully"
 else
   echo "[cloudhv] WARNING: containerd may still be restarting"
 fi
 
+if chroot "$HOST" systemctl is-active --quiet cloudhv-sandbox-daemon; then
+  echo "[cloudhv] sandbox daemon running"
+else
+  echo "[cloudhv] WARNING: sandbox daemon may still be starting (pool init takes a few seconds)"
+fi
+
 echo "[cloudhv] Installation complete on $(cat $HOST/etc/hostname)"
 echo "[cloudhv] Rootfs delivery: erofs layer passthrough"
+echo "[cloudhv] Daemon: /run/cloudhv/daemon.sock"
 
 # Keep running so the DaemonSet stays healthy
-echo "[cloudhv] Installer idle. Shim is active."
+echo "[cloudhv] Installer idle. Shim + daemon active."
 exec sleep infinity

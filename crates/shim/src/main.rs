@@ -2,13 +2,10 @@
 
 use containerd_shimkit::sandbox;
 
-mod annotations;
 mod config;
+mod daemon_client;
 mod instance;
-mod memory;
 mod netns;
-mod snapshot;
-mod vm;
 mod vsock;
 
 use instance::CloudHvInstance;

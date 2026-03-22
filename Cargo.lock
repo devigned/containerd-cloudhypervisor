@@ -364,6 +364,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "cloudhv-sandbox-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "chrono",
+ "cloudhv-common",
+ "cloudhv-proto",
+ "env_logger",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "log",
+ "protobuf 3.4.0",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower 0.5.3",
+ "ttrpc",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -393,6 +416,22 @@ dependencies = [
  "tonic",
  "tonic-build",
  "tower 0.4.13",
+]
+
+[[package]]
+name = "containerd-client"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "936cc6911381d95039f381080ec148024d2bb0044a03363542b0a6b0b2c46592"
+dependencies = [
+ "hyper-util",
+ "prost 0.13.5",
+ "prost-build 0.13.5",
+ "prost-types 0.13.5",
+ "tokio",
+ "tonic",
+ "tonic-build",
+ "tower 0.5.3",
 ]
 
 [[package]]
@@ -429,17 +468,16 @@ name = "containerd-shim-cloudhv"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "cloudhv-common",
  "cloudhv-proto",
+ "containerd-client 0.8.0",
  "containerd-shimkit",
  "criterion",
- "env_logger",
  "libc",
  "log",
  "nix 0.29.0",
- "protobuf 3.4.0",
- "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -465,7 +503,7 @@ dependencies = [
  "anyhow",
  "caps",
  "chrono",
- "containerd-client",
+ "containerd-client 0.6.0",
  "containerd-shim",
  "futures",
  "git-version",
@@ -1307,6 +1345,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "lock_api"
+version = "0.4.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
+dependencies = [
+ "scopeguard",
+]
+
+[[package]]
 name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1525,6 +1572,29 @@ checksum = "30d5b2194ed13191c1999ae0704b7839fb18384fa22e49b57eeaa97d79ce40da"
 dependencies = [
  "libc",
  "winapi",
+]
+
+[[package]]
+name = "parking_lot"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
+dependencies = [
+ "lock_api",
+ "parking_lot_core",
+]
+
+[[package]]
+name = "parking_lot_core"
+version = "0.9.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
+dependencies = [
+ "cfg-if 1.0.4",
+ "libc",
+ "redox_syscall",
+ "smallvec",
+ "windows-link",
 ]
 
 [[package]]
@@ -1929,6 +1999,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "redox_syscall"
+version = "0.5.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
+dependencies = [
+ "bitflags 2.11.0",
+]
+
+[[package]]
 name = "regex"
 version = "1.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2016,6 +2095,12 @@ checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
 ]
+
+[[package]]
+name = "scopeguard"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "semver"
@@ -2310,6 +2395,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
+ "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2 0.6.3",

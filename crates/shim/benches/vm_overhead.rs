@@ -2,8 +2,7 @@
 //!
 //! Measures:
 //! - VM config serialization overhead
-//! - CID allocation throughput
-//! - Hypervisor detection
+//! - Erofs cache key hashing throughput
 //!
 //! Run with: cargo bench -p containerd-shim-cloudhv
 //!
@@ -80,7 +79,7 @@ fn bench_vm_config_serialization(c: &mut Criterion) {
             hotplug_memory_mb: 512,
             hotplug_method: "virtio-mem".into(),
             tpm_enabled: false,
-            warm_restore: false,
+            daemon_socket: String::new(),
         };
         b.iter(|| {
             black_box(serde_json::to_string(&rt_config).unwrap());
@@ -90,64 +89,19 @@ fn bench_vm_config_serialization(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark CID allocation (atomic counter throughput).
-fn bench_cid_allocation(c: &mut Criterion) {
-    let mut group = c.benchmark_group("cid_allocation");
+/// Benchmark stable hash (used for erofs cache key).
+fn bench_stable_hash(c: &mut Criterion) {
+    let mut group = c.benchmark_group("hashing");
 
-    group.bench_function("allocate_vm_manager", |b| {
-        let config = RuntimeConfig {
-            cloud_hypervisor_binary: "/usr/local/bin/cloud-hypervisor".into(),
-            kernel_path: "/opt/vmlinux".into(),
-            rootfs_path: "/opt/rootfs.ext4".into(),
-            default_vcpus: 1,
-            max_default_vcpus: 0,
-            default_memory_mb: 128,
-            vsock_port: 10789,
-            agent_startup_timeout_secs: 10,
-            kernel_args: "console=hvc0".into(),
-            debug: false,
-            max_containers_per_vm: 1,
-            hotplug_memory_mb: 0,
-            hotplug_method: "acpi".into(),
-            tpm_enabled: false,
-            warm_restore: false,
-        };
-        let mut i = 0u64;
+    group.bench_function("stable_hash_hex", |b| {
+        let input = "/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/42/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/41/fs";
         b.iter(|| {
-            let vm =
-                containerd_shim_cloudhv::vm::VmManager::new(format!("bench-{i}"), config.clone())
-                    .unwrap();
-            i += 1;
-            black_box(vm.cid());
+            black_box(containerd_shim_cloudhv::instance::stable_hash_hex(input));
         });
     });
 
     group.finish();
 }
 
-/// Benchmark hypervisor detection overhead.
-fn bench_hypervisor_detection(c: &mut Criterion) {
-    let mut group = c.benchmark_group("hypervisor");
-
-    group.bench_function("detect_backend", |b| {
-        b.iter(|| {
-            black_box(containerd_shim_cloudhv::hypervisor::detect_hypervisor());
-        });
-    });
-
-    group.bench_function("check_virt_support", |b| {
-        b.iter(|| {
-            black_box(containerd_shim_cloudhv::hypervisor::check_virtualization_support());
-        });
-    });
-
-    group.finish();
-}
-
-criterion_group!(
-    benches,
-    bench_vm_config_serialization,
-    bench_cid_allocation,
-    bench_hypervisor_detection,
-);
+criterion_group!(benches, bench_vm_config_serialization, bench_stable_hash,);
 criterion_main!(benches);

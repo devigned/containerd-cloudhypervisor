@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+package cloudhv.daemon;
+
+option go_package = "github.com/devigned/containerd-cloudhypervisor/proto";
+
+// SandboxDaemon manages a pool of pre-booted VMs on a node.
+// Shims acquire ready-to-use VMs instead of booting from scratch.
+//
+// NOTE: The current implementation uses a JSON-line protocol over a Unix
+// socket (see crates/daemon/src/api.rs). These proto definitions describe
+// the intended ttrpc API and will be wired up when we migrate from JSON
+// to ttrpc codegen.
+service SandboxDaemon {
+    // Acquire a pre-booted VM from the pool. The daemon selects the optimal
+    // source: warm workload snapshot (if available) or clean pool VM.
+    // Blocks if the pool is empty (synchronous fallback restore).
+    rpc AcquireSandbox(AcquireRequest) returns (AcquireResponse);
+
+    // Release a VM back to the daemon for destruction.
+    // The daemon destroys the VM and replenishes the pool.
+    rpc ReleaseSandbox(ReleaseRequest) returns (ReleaseResponse);
+
+    // Pool and snapshot status for monitoring.
+    rpc Status(StatusRequest) returns (StatusResponse);
+}
+
+message AcquireRequest {
+    string tap_name = 1;       // Host TAP device name (created by shim)
+    string tap_mac = 2;        // MAC address for the TAP
+    string ip_cidr = 3;        // Pod IP in CIDR notation (e.g. "10.224.0.51/16")
+    string gateway = 4;        // Default gateway (e.g. "169.254.1.1")
+    string netns = 5;          // Network namespace path
+    string image_key = 6;      // erofs cache key for workload snapshot lookup
+    uint32 vcpus = 7;          // Requested vCPUs (0 = use default)
+    uint64 memory_mb = 8;      // Requested memory in MiB (0 = use default)
+}
+
+message AcquireResponse {
+    string vm_id = 1;          // Unique VM identifier
+    string api_socket = 2;     // Cloud Hypervisor API socket path
+    string vsock_socket = 3;   // vsock proxy socket path
+    uint64 cid = 4;            // vsock CID
+    uint32 ch_pid = 5;         // Cloud Hypervisor process PID
+    bool from_snapshot = 6;    // True if restored from a warm workload snapshot
+}
+
+message ReleaseRequest {
+    string vm_id = 1;
+}
+
+message ReleaseResponse {}
+
+message StatusRequest {}
+
+message StatusResponse {
+    uint32 pool_ready = 1;          // VMs ready in pool
+    uint32 pool_target = 2;         // Target pool size
+    uint32 active_vms = 3;          // VMs currently acquired by shims
+    uint32 shadow_vms_running = 4;  // Shadow VMs warming up for snapshots
+    repeated string snapshot_keys = 5; // Cached workload snapshot image keys
+}

@@ -60,7 +60,7 @@ jobs:
 
       - name: Run unit tests
         run: |
-          cargo test --workspace
+          cargo test --workspace --lib --bins
           cd crates/agent && cargo test
 
       - name: Check benchmarks compile
@@ -100,10 +100,10 @@ jobs:
         run: |
           bash hacks/build-guest.sh
 
-      - name: Build Containerd shim
+      - name: Build Containerd shim and daemon
         run: |
-          bash hacks/build-static-rust.sh containerd-shim-cloudhv
-          ls -slh containerd-shim-cloudhv-v1
+          bash hacks/build-static-rust.sh containerd-shim-cloudhv cloudhv-sandbox-daemon
+          ls -slh containerd-shim-cloudhv-v1 cloudhv-sandbox-daemon
 
       - name: Build host dependencies for sysext
         run: |
@@ -155,7 +155,7 @@ jobs:
           sudo apt-get install -y \
             protobuf-compiler musl-tools \
             flex bison libelf-dev bc \
-            iproute2 util-linux curl
+            iproute2 util-linux curl erofs-utils
 
       - name: Enable KVM
         run: |
@@ -171,25 +171,13 @@ jobs:
       - name: Install Cloud Hypervisor
         if: env.KVM_AVAILABLE == 'true'
         run: |
-          sufx=""
-          if [ "${{ matrix.target }}" = "aarch64" ] ; then
-            sufx="-aarch64"
-          fi
-          wget -q "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${{ env.CH_VERSION }}/cloud-hypervisor-static${sufx}" \
-            -O /tmp/cloud-hypervisor
-          sudo install -m 755 /tmp/cloud-hypervisor /usr/local/bin/cloud-hypervisor
+          # Build CH from source (need main branch for OnDemand restore)
+          sudo apt-get install -y libssl-dev
+          git clone --depth 1 https://github.com/cloud-hypervisor/cloud-hypervisor.git /tmp/ch-build
+          cd /tmp/ch-build
+          cargo build --release --bin cloud-hypervisor
+          sudo install -m 755 target/release/cloud-hypervisor /usr/local/bin/cloud-hypervisor
           cloud-hypervisor --version
-
-      - name: Install http-echo (for container integration tests)
-        if: env.KVM_AVAILABLE == 'true'
-        run: |
-          # http-echo is a static Go binary; extract from the Docker image
-          docker pull hashicorp/http-echo:latest
-          CID=$(docker create hashicorp/http-echo:latest)
-          docker cp "$CID:/http-echo" /tmp/http-echo
-          docker rm "$CID"
-          sudo install -m 755 /tmp/http-echo /usr/local/bin/http-echo
-          echo "http-echo installed: $(file /usr/local/bin/http-echo)"
 
       - name: Download build artifacts
         if: env.KVM_AVAILABLE == 'true'
@@ -201,12 +189,49 @@ jobs:
         if: env.KVM_AVAILABLE == 'true'
         timeout-minutes: 10
         run: |
+          # Build daemon
+          cargo build --release -p cloudhv-sandbox-daemon
+
+          # Write daemon config
+          sudo mkdir -p /opt/cloudhv /run/cloudhv/daemon
+          sudo tee /opt/cloudhv/daemon-test.json > /dev/null <<EOF
+          {
+            "pool_size": 3,
+            "kernel_path": "$PWD/vmlinux",
+            "rootfs_path": "$PWD/rootfs.erofs",
+            "kernel_args": "console=ttyS0 root=/dev/vda rw init=/init net.ifnames=0",
+            "default_vcpus": 1,
+            "default_memory_mb": 128,
+            "socket_path": "/run/cloudhv/daemon.sock",
+            "state_dir": "/run/cloudhv/daemon",
+            "warmup_duration_secs": 5
+          }
+          EOF
+
+          # Start daemon in background
+          sudo RUST_LOG=info ./target/release/cloudhv-sandbox-daemon \
+            /opt/cloudhv/daemon-test.json &
+          DAEMON_PID=$!
+          echo "Daemon started (PID=$DAEMON_PID)"
+
+          # Wait for daemon to be ready
+          for i in $(seq 1 30); do
+            if [ -S /run/cloudhv/daemon.sock ]; then
+              echo "Daemon socket ready"
+              break
+            fi
+            sleep 1
+          done
+
+          # Run daemon integration tests
           sudo -E env "PATH=$PATH" \
-            CLOUDHV_TEST_KERNEL="$PWD/vmlinux" \
-            CLOUDHV_TEST_ROOTFS="$PWD/rootfs.erofs" \
-            CLOUDHV_TEST_CH_BIN="/usr/local/bin/cloud-hypervisor" \
-            CLOUDHV_TEST_HTTP_ECHO="/usr/local/bin/http-echo" \
-            cargo test -p containerd-shim-cloudhv --test integration -- --nocapture --test-threads=1
+            DAEMON_SOCKET="/run/cloudhv/daemon.sock" \
+            WARMUP_SECS=5 \
+            cargo test -p cloudhv-sandbox-daemon --test integration -- --nocapture --test-threads=1
+
+          # Stop daemon
+          sudo kill $DAEMON_PID 2>/dev/null || true
+          wait $DAEMON_PID 2>/dev/null || true
 
       - name: Fix cargo cache permissions
         if: always()

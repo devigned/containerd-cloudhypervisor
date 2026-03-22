@@ -126,7 +126,6 @@ fn is_mounted(target: &str) -> bool {
 
 /// Create a device node if it doesn't exist.
 #[cfg(target_os = "linux")]
-#[allow(dead_code)]
 pub fn create_dev_node(path: &str, major: u64, minor: u64, mode: u32) {
     use std::path::Path;
     let dev = nix::sys::stat::makedev(major, minor);
@@ -151,5 +150,4 @@ pub fn create_dev_node(path: &str, major: u64, minor: u64, mode: u32) {
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn create_dev_node(_path: &str, _major: u64, _minor: u64, _mode: u32) {}
