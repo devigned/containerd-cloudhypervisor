@@ -91,13 +91,15 @@ impl Pool {
     /// otherwise restores synchronously from the base snapshot.
     pub async fn acquire(&self) -> Result<PoolVm> {
         // Try to pop from the ready pool
-        if let Some(vm) = self.ready.lock().await.pop() {
+        let vm = self.ready.lock().await.pop();
+        if let Some(vm) = vm {
             self.active_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let remaining = self.ready.lock().await.len();
             info!(
                 "acquired pool VM {} (pool={} active={})",
                 vm.vm_id,
-                self.ready_count().await,
+                remaining,
                 self.active_count()
             );
             return Ok(vm);
@@ -130,18 +132,17 @@ impl Pool {
     /// Replenish the pool by restoring one VM from the base snapshot.
     /// Called asynchronously after each acquire.
     pub async fn replenish_one(&self) {
-        if self.ready_count().await >= self.config.pool_size {
+        let current = self.ready.lock().await.len();
+        if current >= self.config.pool_size {
             return;
         }
 
         match self.restore_one().await {
             Ok(vm) => {
-                info!(
-                    "pool replenished: {} (pool={})",
-                    vm.vm_id,
-                    self.ready_count().await + 1
-                );
+                let name = vm.vm_id.clone();
                 self.ready.lock().await.push(vm);
+                let new_count = self.ready.lock().await.len();
+                info!("pool replenished: {} (pool={})", name, new_count);
             }
             Err(e) => {
                 warn!("pool replenish failed: {:#}", e);
