@@ -400,8 +400,26 @@ impl CloudHvInstance {
 
         // Convert rootfs to erofs (cached by image key). The shim does this
         // because it has access to the bundle rootfs that containerd prepared.
+        // Retry on transient failures (e.g. fork pressure under heavy load).
         let t_erofs = std::time::Instant::now();
-        let erofs_path = prepare_erofs(&rootfs_path, &image_key)?;
+        let erofs_path = {
+            let mut last_err = None;
+            let mut result = None;
+            for attempt in 0..3 {
+                match prepare_erofs(&rootfs_path, &image_key) {
+                    Ok(path) => {
+                        result = Some(path);
+                        break;
+                    }
+                    Err(e) => {
+                        info!("prepare_erofs attempt {attempt} failed: {e}");
+                        last_err = Some(e);
+                        std::thread::sleep(std::time::Duration::from_millis(100 * (attempt + 1)));
+                    }
+                }
+            }
+            result.ok_or_else(|| last_err.unwrap())?
+        };
         let erofs_ms = t_erofs.elapsed().as_millis();
 
         // Read OCI config for the container
