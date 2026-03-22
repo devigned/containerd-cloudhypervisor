@@ -210,7 +210,11 @@ impl SnapshotManager {
         run_req.container_id = format!("shadow-ctr-{}", image_key);
         run_req.rootfs_preattached = false;
         run_req.erofs_layers = 1;
-        // Minimal OCI config — just run the entrypoint
+        // Intentionally empty OCI config: the shadow container only exists to
+        // warm up the rootfs and runtime (file caches, shared libraries, etc.).
+        // The agent falls back to defaults for an empty config, which is
+        // sufficient for warmup. The real pod's OCI config will be applied
+        // when restoring from this snapshot.
         run_req.config_json = b"{}".to_vec();
 
         let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));

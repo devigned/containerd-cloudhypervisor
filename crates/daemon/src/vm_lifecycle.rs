@@ -91,7 +91,7 @@ pub async fn boot_vm(
 /// Spawn a Cloud Hypervisor process. Returns PID.
 pub async fn spawn_ch(config: &DaemonConfig, state_dir: &Path) -> Result<u32> {
     let api_socket = state_dir.join("api.sock");
-    let child = Command::new(&config.cloud_hypervisor_binary)
+    let mut child = Command::new(&config.cloud_hypervisor_binary)
         .arg("--api-socket")
         .arg(&api_socket)
         .stdin(std::process::Stdio::null())
@@ -101,8 +101,11 @@ pub async fn spawn_ch(config: &DaemonConfig, state_dir: &Path) -> Result<u32> {
         .context("spawn cloud-hypervisor")?;
 
     let pid = child.id().context("get CH pid")?;
-    // Detach — we don't want to wait on it
-    std::mem::forget(child);
+    // Spawn a background task to reap the child when it exits, avoiding
+    // zombie processes without blocking the caller.
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
 
     std::fs::write(state_dir.join("ch.pid"), pid.to_string())?;
     Ok(pid)

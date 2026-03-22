@@ -6,6 +6,11 @@ option go_package = "github.com/devigned/containerd-cloudhypervisor/proto";
 
 // SandboxDaemon manages a pool of pre-booted VMs on a node.
 // Shims acquire ready-to-use VMs instead of booting from scratch.
+//
+// NOTE: The current implementation uses a JSON-line protocol over a Unix
+// socket (see crates/daemon/src/api.rs). These proto definitions describe
+// the intended ttrpc API and will be wired up when we migrate from JSON
+// to ttrpc codegen.
 service SandboxDaemon {
     // Acquire a pre-booted VM from the pool. The daemon selects the optimal
     // source: warm workload snapshot (if available) or clean pool VM.

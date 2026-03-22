@@ -16,7 +16,7 @@ use log::info;
 use tokio::sync::OnceCell;
 
 use crate::config::load_config;
-use crate::daemon_client::DaemonClient;
+use crate::daemon_client::{AcquireRequest, DaemonClient};
 
 /// Milliseconds since Unix epoch for TIMING logs.
 pub fn epoch_ms() -> u128 {
@@ -453,16 +453,16 @@ impl CloudHvInstance {
             let t_acquire = std::time::Instant::now();
             let client = DaemonClient::new(&vm_state.daemon_socket);
             let acquired = client
-                .acquire_sandbox(
-                    vm_state.tap_name.as_deref().unwrap_or(""),
-                    vm_state.tap_mac.as_deref().unwrap_or(""),
-                    vm_state.ip_cidr.as_deref().unwrap_or(""),
-                    vm_state.gateway.as_deref().unwrap_or(""),
-                    &image_key,
-                    &erofs_path.to_string_lossy(),
+                .acquire_sandbox(&AcquireRequest {
+                    tap_name: vm_state.tap_name.as_deref().unwrap_or(""),
+                    tap_mac: vm_state.tap_mac.as_deref().unwrap_or(""),
+                    ip_cidr: vm_state.ip_cidr.as_deref().unwrap_or(""),
+                    gateway: vm_state.gateway.as_deref().unwrap_or(""),
+                    image_key: &image_key,
+                    erofs_path: &erofs_path.to_string_lossy(),
                     container_id,
-                    &config_json,
-                )
+                    config_json: &config_json,
+                })
                 .ctx("daemon acquire")?;
             let acq_ms = t_acquire.elapsed().as_millis();
 

@@ -128,9 +128,11 @@ impl Pool {
 
     /// Release a VM. The VM is destroyed (not recycled).
     pub async fn release(&self, vm_id: &str) -> Result<()> {
-        self.active_count
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        self.active.lock().await.remove(vm_id);
+        let removed = self.active.lock().await.remove(vm_id).is_some();
+        if removed {
+            self.active_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
         info!(
             "released VM {} (active={}), destroying...",
             vm_id,

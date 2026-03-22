@@ -75,9 +75,22 @@ async fn handle_connection(
     let mut line = String::new();
 
     while buf_reader.read_line(&mut line).await? > 0 {
-        log::info!("received: {}", line.trim());
         let request: serde_json::Value = serde_json::from_str(line.trim())?;
         let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
+
+        log::info!(
+            "request: method={} image_key={} container_id={}",
+            method,
+            request
+                .get("image_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-"),
+            request
+                .get("container_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-")
+        );
+        log::debug!("request payload: {}", line.trim());
 
         let response = match method {
             "AcquireSandbox" => handle_acquire(pool, snapshots, config, &request).await,
@@ -101,7 +114,7 @@ async fn handle_connection(
 async fn handle_acquire(
     pool: &Arc<Pool>,
     snapshots: &Arc<SnapshotManager>,
-    _config: &DaemonConfig,
+    config: &DaemonConfig,
     request: &serde_json::Value,
 ) -> serde_json::Value {
     let tap_name = request
@@ -151,7 +164,7 @@ async fn handle_acquire(
             .await
     {
         let vm_id = format!("warm-{}-{}", image_key, std::process::id());
-        let state_dir = std::path::PathBuf::from("/run/cloudhv/daemon").join(&vm_id);
+        let state_dir = std::path::PathBuf::from(&config.state_dir).join(&vm_id);
         if let Err(e) = std::fs::create_dir_all(&state_dir) {
             return serde_json::json!({"error": format!("create state dir: {e}")});
         }
@@ -232,6 +245,8 @@ async fn handle_acquire(
                 match run_container_in_vm(
                     &vm.api_socket,
                     &vm.vsock_socket,
+                    tap_name,
+                    tap_mac,
                     erofs_path,
                     container_id,
                     config_json_b64,
@@ -264,14 +279,35 @@ async fn handle_acquire(
 }
 
 /// Hot-plug an erofs rootfs and run a container via the guest agent.
+/// If `tap_name` and `tap_mac` are provided, hot-plugs a TAP NIC first.
 async fn run_container_in_vm(
     api_socket: &std::path::Path,
     vsock_socket: &std::path::Path,
+    tap_name: &str,
+    tap_mac: &str,
     erofs_path: &str,
     container_id: &str,
     config_json_b64: &str,
 ) -> anyhow::Result<u32> {
     use crate::vm_lifecycle;
+
+    // Hot-plug TAP NIC (CH runs on the host and can see the TAP device
+    // created by the shim via `ip link set <tap> netns 1`)
+    if !tap_name.is_empty() && !tap_mac.is_empty() {
+        let net_json = serde_json::json!({
+            "tap": tap_name,
+            "mac": tap_mac,
+        });
+        vm_lifecycle::api_request_with_body(
+            api_socket,
+            "PUT",
+            "/api/v1/vm.add-net",
+            &net_json.to_string(),
+        )
+        .await
+        .context("hot-plug TAP NIC")?;
+        info!("TAP {} hot-plugged into VM", tap_name);
+    }
 
     // Hot-plug rootfs disk
     let disk_id = format!("ctr-{}", &container_id[..12.min(container_id.len())]);
@@ -353,6 +389,8 @@ async fn handle_add_container(pool: &Arc<Pool>, request: &serde_json::Value) -> 
     match run_container_in_vm(
         &vm.api_socket,
         &vm.vsock_socket,
+        "", // no TAP hot-plug for additional containers
+        "",
         erofs_path,
         container_id,
         config_json_b64,

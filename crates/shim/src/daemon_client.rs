@@ -13,6 +13,18 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use log::info;
 
+/// Parameters for acquiring a sandbox VM from the daemon.
+pub struct AcquireRequest<'a> {
+    pub tap_name: &'a str,
+    pub tap_mac: &'a str,
+    pub ip_cidr: &'a str,
+    pub gateway: &'a str,
+    pub image_key: &'a str,
+    pub erofs_path: &'a str,
+    pub container_id: &'a str,
+    pub config_json: &'a [u8],
+}
+
 /// Response from AcquireSandbox.
 #[derive(Debug)]
 pub struct AcquiredVm {
@@ -43,29 +55,19 @@ impl DaemonClient {
 
     /// Acquire a pre-booted VM from the daemon.
     /// The daemon handles hot-plugging the rootfs and starting the container.
-    pub fn acquire_sandbox(
-        &self,
-        tap_name: &str,
-        tap_mac: &str,
-        ip_cidr: &str,
-        gateway: &str,
-        image_key: &str,
-        erofs_path: &str,
-        container_id: &str,
-        config_json: &[u8],
-    ) -> Result<AcquiredVm> {
+    pub fn acquire_sandbox(&self, params: &AcquireRequest<'_>) -> Result<AcquiredVm> {
         use base64::Engine;
-        let config_b64 = base64::engine::general_purpose::STANDARD.encode(config_json);
+        let config_b64 = base64::engine::general_purpose::STANDARD.encode(params.config_json);
 
         let req = serde_json::json!({
             "method": "AcquireSandbox",
-            "tap_name": tap_name,
-            "tap_mac": tap_mac,
-            "ip_cidr": ip_cidr,
-            "gateway": gateway,
-            "image_key": image_key,
-            "erofs_path": erofs_path,
-            "container_id": container_id,
+            "tap_name": params.tap_name,
+            "tap_mac": params.tap_mac,
+            "ip_cidr": params.ip_cidr,
+            "gateway": params.gateway,
+            "image_key": params.image_key,
+            "erofs_path": params.erofs_path,
+            "container_id": params.container_id,
             "config_json": config_b64,
         });
 
@@ -136,6 +138,11 @@ impl DaemonClient {
     }
 
     /// Send a JSON-line RPC to the daemon.
+    ///
+    /// Uses blocking `std::os::unix::net::UnixStream` intentionally: the 30s
+    /// read timeout bounds the blocking window, and in practice operations
+    /// complete in < 100 ms. This avoids pulling in tokio::net for a
+    /// single synchronous call in the shim's start path.
     fn rpc(&self, request: &serde_json::Value) -> Result<serde_json::Value> {
         let mut stream = UnixStream::connect(&self.socket_path)
             .with_context(|| format!("connect to daemon: {}", self.socket_path))?;

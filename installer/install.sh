@@ -75,14 +75,14 @@ EROFSEOF
   rm -f "$HOST/tmp/cloudhv-install-erofs.sh"
 fi
 
-# 3. Clear stale caches from previous installs
+# 3. Stop existing daemon (if running) before clearing caches
+nsenter --target 1 --mount --uts --ipc --pid -- \
+  systemctl stop cloudhv-sandbox-daemon 2>/dev/null || true
+
+# 4. Clear stale caches from previous installs
 echo "[cloudhv] Clearing caches from previous install..."
 nsenter --target 1 --mount -- rm -rf /run/cloudhv/erofs-cache /run/cloudhv/daemon
 nsenter --target 1 --mount -- mkdir -p /run/cloudhv/daemon
-
-# 4. Stop existing daemon (if running)
-nsenter --target 1 --mount --uts --ipc --pid -- \
-  systemctl stop cloudhv-sandbox-daemon 2>/dev/null || true
 
 # 5. Copy binaries and guest artifacts
 echo "[cloudhv] Copying binaries and guest artifacts..."
