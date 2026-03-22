@@ -120,10 +120,9 @@ impl SnapshotManager {
         vm_lifecycle::restore_vm(&api_socket, &snapshot_work_dir).await?;
         vm_lifecycle::resume_vm(&api_socket).await?;
 
-        // Wait for agent
-        vm_lifecycle::wait_for_agent(&vsock_socket)
-            .await
-            .context("agent connect after workload restore")?;
+        // Skip agent health check for warm restores — the agent was verified
+        // when the snapshot was created. The shim will connect directly.
+        // Connecting here would hold the vsock proxy and delay the shim.
 
         info!("restored workload snapshot for image_key={}", image_key);
         Ok((ch_pid, api_socket, vsock_socket))

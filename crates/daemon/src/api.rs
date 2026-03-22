@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use log::{info, warn};
 
 use crate::config::DaemonConfig;
@@ -82,6 +82,7 @@ async fn handle_connection(
         let response = match method {
             "AcquireSandbox" => handle_acquire(pool, snapshots, config, &request).await,
             "ReleaseSandbox" => handle_release(pool, &request).await,
+            "AddContainer" => handle_add_container(pool, &request).await,
             "Status" => handle_status(pool, snapshots).await,
             _ => serde_json::json!({"error": format!("unknown method: {}", method)}),
         };
@@ -103,11 +104,11 @@ async fn handle_acquire(
     _config: &DaemonConfig,
     request: &serde_json::Value,
 ) -> serde_json::Value {
-    let _tap_name = request
+    let tap_name = request
         .get("tap_name")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let _tap_mac = request
+    let tap_mac = request
         .get("tap_mac")
         .and_then(|v| v.as_str())
         .unwrap_or("");
@@ -125,6 +126,14 @@ async fn handle_acquire(
         .unwrap_or("");
     let erofs_path = request
         .get("erofs_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let container_id = request
+        .get("container_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let config_json_b64 = request
+        .get("config_json")
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
@@ -154,6 +163,39 @@ async fn handle_acquire(
         {
             Ok((ch_pid, api_socket, vsock_socket)) => {
                 info!("warm restore for image_key={}", image_key);
+
+                // Hot-plug TAP NIC into the restored VM so networking works
+
+                if !tap_name.is_empty() && !tap_mac.is_empty() {
+                    let net_json = serde_json::json!({
+                        "tap": tap_name,
+                        "mac": tap_mac,
+                    });
+                    if let Err(e) = crate::vm_lifecycle::api_request_with_body(
+                        &api_socket,
+                        "PUT",
+                        "/api/v1/vm.add-net",
+                        &net_json.to_string(),
+                    )
+                    .await
+                    {
+                        warn!("TAP hot-plug failed on warm restore: {e:#}");
+                        return serde_json::json!({"error": format!("TAP hot-plug: {e:#}")});
+                    }
+                    info!("TAP {} hot-plugged into warm VM {}", tap_name, vm_id);
+                }
+
+                // Register as active so release() works correctly
+                pool.register_active(crate::pool::PoolVm {
+                    vm_id: vm_id.clone(),
+                    api_socket: api_socket.clone(),
+                    vsock_socket: vsock_socket.clone(),
+                    cid,
+                    ch_pid,
+                    created_at: std::time::Instant::now(),
+                })
+                .await;
+
                 return serde_json::json!({
                     "vm_id": vm_id,
                     "api_socket": api_socket.to_string_lossy(),
@@ -161,6 +203,7 @@ async fn handle_acquire(
                     "cid": cid,
                     "ch_pid": ch_pid,
                     "from_snapshot": true,
+                    "container_pid": 0,
                 });
             }
             Err(e) => {
@@ -184,6 +227,26 @@ async fn handle_acquire(
                 snapshots.trigger_shadow(image_key, erofs_path).await;
             }
 
+            // Hot-plug rootfs and run container inside the VM
+            let container_pid = if !erofs_path.is_empty() && !container_id.is_empty() {
+                match run_container_in_vm(
+                    &vm.api_socket,
+                    &vm.vsock_socket,
+                    erofs_path,
+                    container_id,
+                    config_json_b64,
+                )
+                .await
+                {
+                    Ok(pid) => pid,
+                    Err(e) => {
+                        return serde_json::json!({"error": format!("run container: {e:#}")});
+                    }
+                }
+            } else {
+                0
+            };
+
             serde_json::json!({
                 "vm_id": vm.vm_id,
                 "api_socket": vm.api_socket.to_string_lossy(),
@@ -191,11 +254,113 @@ async fn handle_acquire(
                 "cid": vm.cid,
                 "ch_pid": vm.ch_pid,
                 "from_snapshot": false,
+                "container_pid": container_pid,
             })
         }
         Err(e) => {
             serde_json::json!({"error": format!("acquire failed: {:#}", e)})
         }
+    }
+}
+
+/// Hot-plug an erofs rootfs and run a container via the guest agent.
+async fn run_container_in_vm(
+    api_socket: &std::path::Path,
+    vsock_socket: &std::path::Path,
+    erofs_path: &str,
+    container_id: &str,
+    config_json_b64: &str,
+) -> anyhow::Result<u32> {
+    use crate::vm_lifecycle;
+
+    // Hot-plug rootfs disk
+    let disk_id = format!("ctr-{}", &container_id[..12.min(container_id.len())]);
+    let disk_json = serde_json::json!({
+        "path": erofs_path,
+        "readonly": true,
+        "id": disk_id,
+    });
+    vm_lifecycle::api_request_with_body(
+        api_socket,
+        "PUT",
+        "/api/v1/vm.add-disk",
+        &disk_json.to_string(),
+    )
+    .await
+    .context("hot-plug rootfs")?;
+
+    // Connect to agent
+    let (agent, _health) = vm_lifecycle::connect_agent(vsock_socket)
+        .await
+        .context("agent connect for container")?;
+
+    // Decode OCI config
+    use base64::Engine;
+    let config_json = if config_json_b64.is_empty() {
+        b"{}".to_vec()
+    } else {
+        base64::engine::general_purpose::STANDARD
+            .decode(config_json_b64)
+            .unwrap_or_else(|_| b"{}".to_vec())
+    };
+
+    // Run container
+    let mut req = cloudhv_proto::CreateContainerRequest::new();
+    req.container_id = container_id.to_string();
+    req.config_json = config_json;
+    req.rootfs_preattached = false;
+    req.erofs_layers = 1;
+
+    let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
+    let resp = agent
+        .run_container(ctx, &req)
+        .await
+        .context("RunContainer")?;
+
+    info!(
+        "container {} started in VM (pid={})",
+        container_id, resp.pid
+    );
+    Ok(resp.pid)
+}
+
+async fn handle_add_container(pool: &Arc<Pool>, request: &serde_json::Value) -> serde_json::Value {
+    let vm_id = request.get("vm_id").and_then(|v| v.as_str()).unwrap_or("");
+    let erofs_path = request
+        .get("erofs_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let container_id = request
+        .get("container_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let config_json_b64 = request
+        .get("config_json")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if vm_id.is_empty() || container_id.is_empty() {
+        return serde_json::json!({"error": "vm_id and container_id required"});
+    }
+
+    let vm = match pool.get_active(vm_id).await {
+        Some(vm) => vm,
+        None => {
+            return serde_json::json!({"error": format!("VM {} not found in active set", vm_id)});
+        }
+    };
+
+    match run_container_in_vm(
+        &vm.api_socket,
+        &vm.vsock_socket,
+        erofs_path,
+        container_id,
+        config_json_b64,
+    )
+    .await
+    {
+        Ok(pid) => serde_json::json!({"container_pid": pid}),
+        Err(e) => serde_json::json!({"error": format!("add container: {e:#}")}),
     }
 }
 

@@ -17,11 +17,11 @@ use log::info;
 #[derive(Debug)]
 pub struct AcquiredVm {
     pub vm_id: String,
-    pub api_socket: PathBuf,
     pub vsock_socket: PathBuf,
     pub cid: u64,
     pub ch_pid: u32,
     pub from_snapshot: bool,
+    pub container_pid: u32,
 }
 
 /// Client for the sandbox daemon's Unix socket API.
@@ -42,6 +42,7 @@ impl DaemonClient {
     }
 
     /// Acquire a pre-booted VM from the daemon.
+    /// The daemon handles hot-plugging the rootfs and starting the container.
     pub fn acquire_sandbox(
         &self,
         tap_name: &str,
@@ -50,7 +51,12 @@ impl DaemonClient {
         gateway: &str,
         image_key: &str,
         erofs_path: &str,
+        container_id: &str,
+        config_json: &[u8],
     ) -> Result<AcquiredVm> {
+        use base64::Engine;
+        let config_b64 = base64::engine::general_purpose::STANDARD.encode(config_json);
+
         let req = serde_json::json!({
             "method": "AcquireSandbox",
             "tap_name": tap_name,
@@ -59,6 +65,8 @@ impl DaemonClient {
             "gateway": gateway,
             "image_key": image_key,
             "erofs_path": erofs_path,
+            "container_id": container_id,
+            "config_json": config_b64,
         });
 
         let resp = self.rpc(&req)?;
@@ -69,7 +77,6 @@ impl DaemonClient {
 
         Ok(AcquiredVm {
             vm_id: resp["vm_id"].as_str().context("missing vm_id")?.to_string(),
-            api_socket: PathBuf::from(resp["api_socket"].as_str().context("missing api_socket")?),
             vsock_socket: PathBuf::from(
                 resp["vsock_socket"]
                     .as_str()
@@ -78,6 +85,7 @@ impl DaemonClient {
             cid: resp["cid"].as_u64().context("missing cid")?,
             ch_pid: resp["ch_pid"].as_u64().context("missing ch_pid")? as u32,
             from_snapshot: resp["from_snapshot"].as_bool().unwrap_or(false),
+            container_pid: resp["container_pid"].as_u64().unwrap_or(0) as u32,
         })
     }
 
@@ -96,6 +104,35 @@ impl DaemonClient {
 
         info!("released VM {} to daemon", vm_id);
         Ok(())
+    }
+
+    /// Add a container to an existing VM (multi-container pod).
+    /// Returns the container PID.
+    pub fn add_container(
+        &self,
+        vm_id: &str,
+        erofs_path: &str,
+        container_id: &str,
+        config_json: &[u8],
+    ) -> Result<u32> {
+        use base64::Engine;
+        let config_b64 = base64::engine::general_purpose::STANDARD.encode(config_json);
+
+        let req = serde_json::json!({
+            "method": "AddContainer",
+            "vm_id": vm_id,
+            "erofs_path": erofs_path,
+            "container_id": container_id,
+            "config_json": config_b64,
+        });
+
+        let resp = self.rpc(&req)?;
+
+        if let Some(err) = resp.get("error").and_then(|e| e.as_str()) {
+            anyhow::bail!("daemon AddContainer: {}", err);
+        }
+
+        Ok(resp["container_pid"].as_u64().unwrap_or(0) as u32)
     }
 
     /// Send a JSON-line RPC to the daemon.

@@ -16,23 +16,23 @@ cloudhv-common = { workspace = true }
 # containerd shim protocol (via shimkit, without libcontainer/libseccomp/dbus)
 containerd-shimkit = { git = "https://github.com/devigned/runwasi.git", branch = "shimkit-ttrpc-0.10", default-features = false }
 
+# containerd gRPC client (for image digest resolution)
+containerd-client = "0.8.0"
+
 # Async runtime
 tokio = { workspace = true }
 
 # RPC
 ttrpc = { workspace = true }
-protobuf = { workspace = true }
 
 # Error handling
 anyhow = { workspace = true }
 
 # Serialization
-serde = { workspace = true }
 serde_json = { workspace = true }
 
 # Logging
 log = { workspace = true }
-env_logger = { workspace = true }
 
 # System
 nix = { workspace = true }
@@ -40,6 +40,9 @@ libc = { workspace = true }
 
 # Time
 chrono = { workspace = true }
+
+# Encoding
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"

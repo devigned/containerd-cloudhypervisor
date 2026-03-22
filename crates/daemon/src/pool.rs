@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -8,7 +9,7 @@ use tokio::sync::Mutex;
 use crate::config::DaemonConfig;
 
 /// A pre-booted VM in the pool, ready for acquisition.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PoolVm {
     /// Unique VM identifier.
     pub vm_id: String,
@@ -29,6 +30,8 @@ pub struct Pool {
     config: DaemonConfig,
     /// Ready-to-use VMs waiting for acquisition.
     ready: Mutex<Vec<PoolVm>>,
+    /// Active VMs acquired by shims, keyed by vm_id.
+    active: Mutex<HashMap<String, PoolVm>>,
     /// Count of VMs currently acquired by shims.
     active_count: std::sync::atomic::AtomicUsize,
     /// Next CID to assign (incremented per VM).
@@ -42,6 +45,7 @@ impl Pool {
         Arc::new(Self {
             config,
             ready: Mutex::new(Vec::new()),
+            active: Mutex::new(HashMap::new()),
             active_count: std::sync::atomic::AtomicUsize::new(0),
             next_cid: std::sync::atomic::AtomicU64::new(3), // CID 0-2 reserved
         })
@@ -95,6 +99,10 @@ impl Pool {
         if let Some(vm) = vm {
             self.active_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.active
+                .lock()
+                .await
+                .insert(vm.vm_id.clone(), vm.clone());
             let remaining = self.ready.lock().await.len();
             info!(
                 "acquired pool VM {} (pool={} active={})",
@@ -110,6 +118,10 @@ impl Pool {
         let vm = self.restore_one().await?;
         self.active_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.active
+            .lock()
+            .await
+            .insert(vm.vm_id.clone(), vm.clone());
         info!("acquired VM {} (synchronous restore)", vm.vm_id);
         Ok(vm)
     }
@@ -118,6 +130,7 @@ impl Pool {
     pub async fn release(&self, vm_id: &str) -> Result<()> {
         self.active_count
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.active.lock().await.remove(vm_id);
         info!(
             "released VM {} (active={}), destroying...",
             vm_id,
@@ -127,6 +140,19 @@ impl Pool {
         // Destroy the VM
         self.destroy_vm(vm_id).await;
         Ok(())
+    }
+
+    /// Look up an active VM by its ID.
+    pub async fn get_active(&self, vm_id: &str) -> Option<PoolVm> {
+        self.active.lock().await.get(vm_id).cloned()
+    }
+
+    /// Register an externally-created VM (e.g. warm restore) as active.
+    /// This ensures release() can find and clean it up properly.
+    pub async fn register_active(&self, vm: PoolVm) {
+        self.active_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.active.lock().await.insert(vm.vm_id.clone(), vm);
     }
 
     /// Replenish the pool by restoring one VM from the base snapshot.

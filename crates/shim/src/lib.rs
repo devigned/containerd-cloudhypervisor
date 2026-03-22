@@ -1,10 +1,5 @@
-pub mod annotations;
 pub mod config;
 pub mod daemon_client;
-pub mod hypervisor;
 pub mod instance;
-pub mod memory;
 pub mod netns;
-pub mod snapshot;
-pub mod vm;
 pub mod vsock;

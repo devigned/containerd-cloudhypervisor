@@ -650,7 +650,6 @@ impl ContainerManager {
     /// restore). Moves all bookkeeping — container state, exit receiver,
     /// and log buffer — from `old_id` to `new_id`.
     /// Returns the PID of the adopted container.
-    #[allow(dead_code)]
     pub fn adopt(&mut self, old_id: &str, new_id: &str) -> Result<u32> {
         let container = self
             .containers
