@@ -3,39 +3,81 @@
 ## System Overview
 
 ```text
-                     ┌─────────────────────────────────────────────────────────┐
-                     │  Pod Network Namespace                                  │
-containerd           │                                                         │
-   │                 │  ┌──────┐  TC redirect  ┌──────┐                        │
-   │ ttrpc           │  │ veth ├──────────────►│ TAP  │                        │
-   │                 │  │(eth0)│◄──────────────┤      │                        │
-   ▼                 │  └───┬──┘               └──┬───┘                        │
-┌──────────────┐     │      │                     │                            │
-│  shim-v1     ├─────┤      │ IP flushed          │ virtio-net                 │
-│              │     │      │ (VM owns pod IP)    │                            │
-│  • disk img  │     │  ┌───┴─────────────────────┴────────────────────────┐   │
-│  • hot-plug  │     │  │  cloud-hypervisor (VMM)                          │   │
-│  • logs      │     │  │  ┌─────────────────────────────────────────────┐ │   │
-│              │     │  │  │  Guest VM (custom kernel)                   │ │   │
-└──────┬───────┘     │  │  │                                             │ │   │
-       │ vsock       │  │  │  eth0 ← kernel ip= (IP_PNP at boot)         │ │   │
-       │             │  │  │                                             │ │   │
-       │             │  │  │  ┌───────────┐     ┌──────┐                 │ │   │
-       └─────────────┤  │  │  │   Agent   │────►│ crun │ (containers)    │ │   │
-                     │  │  │  │  (PID 1)  │     └──────┘                 │ │   │
-                     │  │  │  └───────────┘                              │ │   │
-                     │  │  └─────────────────────────────────────────────┘ │   │
-                     │  └──────────────────────────────────────────────────┘   │
-                     └─────────────────────────────────────────────────────────┘
+                    ┌─────────────────────────────────────────────────────────────┐
+                    │  cloudhv-sandbox-daemon  (systemd, long-running)            │
+                    │                                                             │
+                    │  Base snapshot: kernel + agent (clean state)                │
+                    │                                                             │
+                    │  Pool (OnDemand restore from base, ~25ms each):            │
+                    │    VM-1: agent ready, 6 MB idle RSS ✓                      │
+                    │    VM-2: agent ready, 6 MB idle RSS ✓                      │
+                    │    VM-3: agent ready, 6 MB idle RSS ✓                      │
+                    │                                                             │
+                    │  Warm workload snapshots (via shadow VMs):                  │
+                    │    python-runtime: warm ✓                                   │
+                    │    http-echo: warm ✓                                        │
+                    │                                                             │
+                    │  /run/cloudhv/daemon.sock                                   │
+                    └───────────┬─────────────────────────────────────────────────┘
+                                │ Unix socket API
+                    ┌───────────┴─────────────────────────────────────────────────┐
+                    │  containerd-shim-cloudhv-v1  (per-pod, ephemeral)           │
+                    │                                                             │
+  containerd        │  Pod Network Namespace                                      │
+     │              │                                                             │
+     │ ttrpc        │  ┌──────┐  TC redirect  ┌──────┐                           │
+     │              │  │ veth ├──────────────►│ TAP  │                            │
+     │              │  │(eth0)│◄──────────────┤      │                            │
+     ▼              │  └───┬──┘               └──┬───┘                           │
+  ┌──────────┐      │      │ IP flushed          │ virtio-net                     │
+  │  shim    ├──────┤      │ (VM owns pod IP)    │                               │
+  │  ~1180   │      │  ┌───┴─────────────────────┴────────────────────────────┐  │
+  │  lines   │      │  │  cloud-hypervisor (VMM)                              │  │
+  │          │      │  │  ┌─────────────────────────────────────────────┐     │  │
+  │ • TAP    │      │  │  │  Guest VM (custom kernel)                   │     │  │
+  │ • erofs  │      │  │  │                                             │     │  │
+  │ • daemon │      │  │  │  eth0 ← ConfigureNetwork RPC                │     │  │
+  │   RPCs   │      │  │  │                                             │     │  │
+  └────┬─────┘      │  │  │  ┌───────────┐     ┌──────┐                │     │  │
+       │ vsock      │  │  │  │   Agent   │────►│ crun │ (containers)   │     │  │
+       │            │  │  │  │  (PID 1)  │     └──────┘                │     │  │
+       └────────────┤  │  │  └───────────┘                             │     │  │
+                    │  │  └─────────────────────────────────────────────┘     │  │
+                    │  └──────────────────────────────────────────────────────┘  │
+                    └───────────────────────────────────────────────────────────────┘
 ```
 
 ## Components
 
-- **Host shim** (`containerd-shim-cloudhv-v1`): containerd shim v2, manages VM lifecycle,
-  creates disk images, hot-plugs block devices, sets up networking, forwards logs.
-- **Guest agent** (`cloudhv-agent`): PID 1 in the VM, discovers hot-plugged disks, adapts
-  OCI specs, delegates to crun. Built as a separate workspace with its own ttrpc 0.9 dependency.
-- **Communication: vsock + ttrpc — no network stack, no shared filesystem.
+### Sandbox Daemon (`cloudhv-sandbox-daemon`)
+
+Long-running systemd daemon on each node. Manages:
+
+- **Base snapshot** — created once at startup from a cold-booted VM (kernel + agent, no containers). Reused across daemon restarts if kernel/rootfs mtime unchanged.
+- **VM pool** — maintains `pool_size` (default: 3) pre-booted VMs restored from the base snapshot using CH v51 OnDemand restore (~25ms each, ~6 MB idle RSS via userfaultfd). When the pool is empty, synchronous restore serves as fallback.
+- **Shadow VM snapshots** — on first `AcquireSandbox` for an unknown image, the daemon spawns a shadow VM in the background: restore from base → hot-plug rootfs → `RunContainer` → wait `warmup_duration_secs` → pause → snapshot → destroy. Subsequent acquires for the same image restore from the warm snapshot. Shadow VMs have no networking and no impact on live pods.
+- **Image key** — content digest from containerd's gRPC image service, immune to tag mutation (e.g., `:latest` re-push).
+- **Active VM tracking** — the daemon tracks all acquired VMs for proper lifecycle management. `ReleaseSandbox` destroys the VM; pool is replenished asynchronously.
+- **CH process exit watching** — `/proc/{pid}` polling detects unexpected VMM exits.
+
+The daemon serves VMs to shims via a Unix socket API at `/run/cloudhv/daemon.sock`.
+
+### Shim (`containerd-shim-cloudhv-v1`)
+
+Thin containerd shim v2 (~1,180 lines). When `daemon_socket` is configured, the shim delegates VM lifecycle to the daemon and handles only:
+
+- **TAP networking** — creates TAP device in the pod's network namespace, sets up TC redirect rules, flushes the pod IP from the veth.
+- **erofs conversion** — converts container rootfs to erofs images, cached at `/run/cloudhv/erofs-cache/<hash>.erofs`. Uses flock serialization with retry for concurrent builds.
+- **Daemon RPCs** — `AcquireSandbox` (get a pre-booted VM), `AddContainer` (hot-plug disk + RunContainer), `ReleaseSandbox` (destroy VM).
+- **Container lifecycle** — logs, kill, wait, state.
+
+### Guest Agent (`cloudhv-agent`)
+
+PID 1 in the VM. Discovers hot-plugged disks via inotify, adapts OCI specs, delegates to crun. Built as a separate workspace with its own ttrpc 0.9 dependency.
+
+### Communication
+
+- **vsock + ttrpc** — no network stack, no shared filesystem.
 - **Container runtime**: crun (1.8 MB static) — lighter than runc (10 MB).
 - **Kernel**: Custom kernel (~27 MB) with virtio, vsock, BPF, ACPI hot-plug,
   IP_PNP, and virtio-net. Supports both x86_64 (PVH boot, `console=hvc0`) and
@@ -53,75 +95,41 @@ containerd           │                                                        
 The shim uses the `io.kubernetes.cri.container-type` annotation to distinguish between
 sandbox creation and application containers:
 
-- **Sandbox** (`container-type=sandbox`): spawns the Cloud Hypervisor process and
-  **eagerly boots the VM** with only the guest rootfs (`/dev/vda`). The VM boots
-  asynchronously — `start_sandbox` returns immediately (~7ms) while boot + agent
-  connect proceed in the background (~175ms). Networking (TAP + TC redirect) is
-  set up before boot.
-- **App container** (`container-type=container`): awaits the async boot (usually
-  complete by now — 0ms wait), converts the rootfs to erofs (cached), hot-plugs
-  it into the running VM, and sends config.json + volume data inline via the
-  RunContainer RPC. The guest agent discovers hot-plugged disks via inotify (<1ms)
-  and runs the container with crun.
+- **Sandbox** (`container-type=sandbox`): sets up TAP networking in the pod's
+  network namespace. With the daemon, no VM is spawned yet — TAP info is stored
+  for the subsequent `AcquireSandbox` call. Returns in ~7ms.
+- **App container** (`container-type=container`): calls `daemon.AcquireSandbox()`
+  with the stored TAP info and image key. The daemon returns a pre-booted VM
+  (from pool or warm snapshot). The shim converts the rootfs to erofs (cached),
+  hot-plugs it via `AddContainer`, and the guest agent discovers the disk via
+  inotify and runs the container with crun.
 
-### Async Eager Boot
-
-The VM boots in the background during sandbox creation, overlapping with
-containerd's internal work (~90ms gap between RunPodSandbox and StartContainer).
-By the time `start_container` runs, the VM is usually booted and the agent is
-connected, making the container start nearly instant:
+### Boot Flow (Daemon Mode)
 
 ```
 start_sandbox (7ms):
-  TAP setup → config → spawn VMM → SPAWN boot+agent (async) → return
+  TAP setup → store TAP info → return
 
-  ─── containerd gap (~90ms) ─── boot running in background ───
+  ─── containerd gap (~90ms) ───
 
-start_container (~26-110ms):
-  erofs lookup (0ms cached) → await boot (0-90ms) → hot-plug disk → RPC
+start_container:
+  erofs lookup (0ms cached / 8ms uncached)
+  → daemon.AcquireSandbox (0ms pool hit / 25ms sync restore)
+  → hot-plug disk + RunContainer RPC
+  → total ~74ms cold path
 ```
 
-The agent connect uses a two-phase strategy: tight-poll with `yield_now()`
-for the first 500ms (catches the agent the instant it's ready), then
-exponential backoff for slow/contended boots.
-
-## Warm Snapshot Restore
-
-The shim supports **warm workload snapshots** for near-instant pod startup.
-
-### How it works
-
-1. **Cold boot** (first pod per workload image per node): VM boots normally,
-   agent starts, workload initializes (e.g., Python server starts listening).
-   After 20s warmup, the VM is paused, snapshotted, and resumed. The snapshot
-   is cached at `/run/cloudhv/snapshot-cache/<key>/`.
-
-2. **Warm restore** (all subsequent pods): The snapshot config is patched with
-   the new pod's TAP name, MAC, vsock CID, and serial console path. The VM is
-   restored with CoW memory (userfaultfd), resumed, and the guest IP is
-   reconfigured via the agent's `ConfigureNetwork` RPC. The workload wakes up
-   **already running** — no kernel boot, no agent init, no workload startup.
-
-### Why 0.0.0.0 makes this work
-
-The workload binds `0.0.0.0:<port>`, which accepts on ALL interfaces. The
-snapshot's TAP is patched to the new pod's TAP in the config before restore.
-The guest sees the same eth0 backed by a different TAP. Since the workload
-listens on `0.0.0.0`, traffic flows immediately — no rebind, no restart.
-
-### Container adoption
-
-The `AdoptContainer` RPC re-registers the snapshot's running container under
-the new container ID so that kill/wait/state RPCs work correctly. An exit
-watcher is spawned for clean termination on scale-down.
+For warm snapshot paths (~168ms): the daemon restores from a workload snapshot,
+the shim calls `ConfigureNetwork` to assign the pod IP, and the workload wakes
+up already running.
 
 ## Container Rootfs Delivery
 
 The shim converts container rootfs to erofs images, cached at
 `/run/cloudhv/erofs-cache/<hash>.erofs`. The cache is content-addressed
-by the overlayfs lowerdir paths (FNV-1a 128-bit hash) and flock-serialized
-for concurrent builds. One build per unique image; all subsequent pods
-hardlink the cached image.
+by the content digest from containerd's gRPC image service (immune to tag
+mutation) and flock-serialized with retry for concurrent builds. One build
+per unique image; all subsequent pods hardlink the cached image.
 
 ### Block Device Passthrough (devmapper snapshotter)
 
@@ -132,12 +140,13 @@ and passes the device path directly to Cloud Hypervisor's `vm.add-disk` API.
 ### erofs Cache (overlayfs snapshotter)
 
 When the snapshotter produces a directory mount, the shim runs `mkfs.erofs`
-to convert it into a compact read-only image. The erofs image is cached and
-hardlinked for all subsequent pods using the same container image.
+to convert it into a compact read-only image (~8ms). The erofs image is cached
+and hardlinked for all subsequent pods using the same container image.
 
 In both tiers, config.json and volume data (ConfigMaps, Secrets) are delivered
-inline via the CreateContainer RPC — the agent writes them to the bundle
-directory. No second disk, no virtiofsd.
+inline via the RunContainer RPC — the agent writes them to the bundle
+directory. No second disk, no virtiofsd. Hot-plug and RunContainer happen
+in the daemon when using daemon mode.
 
 ## Volumes (CSI, ConfigMap, Secret, emptyDir)
 

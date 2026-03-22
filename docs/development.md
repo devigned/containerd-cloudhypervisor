@@ -10,15 +10,22 @@ make fmt            # Format code
 make clippy         # Run clippy
 make test           # Run unit tests
 
+# Build the daemon
+cargo build --release -p cloudhv-sandbox-daemon
+
 # Requires libseccomp-dev and libcap-ng-dev on Linux
 ```
 
 ### Project Structure
 
-The project uses two Cargo workspaces:
+The project has 3 main crates in the root workspace, plus the agent as a separate workspace:
 
-- **Root workspace** (`Cargo.toml`): shim, proto, and common crates.
+- **Root workspace** (`Cargo.toml`): shim, daemon, proto, and common crates.
   Uses ttrpc 0.8 via [shimkit](https://github.com/containerd/runwasi).
+  - `crates/shim` — containerd shim v2 (`containerd-shim-cloudhv-v1`)
+  - `crates/daemon` — sandbox daemon (`cloudhv-sandbox-daemon`)
+  - `crates/proto` — protobuf/ttrpc service definitions
+  - `crates/common` — shared types, constants, error handling, netlink utilities
 - **Agent workspace** (`crates/agent/Cargo.toml`): standalone guest agent binary.
   Uses ttrpc 0.9 for vsock server support.
 
@@ -27,12 +34,20 @@ protobuf 3.2, while the agent needs protobuf 3.7+ for ttrpc 0.9's vsock API.
 Both binaries are protocol-compatible — the shim's ttrpc 0.8 client communicates
 with the agent's ttrpc 0.9 server over vsock.
 
+The agent is excluded from the root workspace (`exclude = ["crates/agent"]`)
+and must be built and checked separately:
+
+```bash
+cd crates/agent && cargo check
+cd crates/agent && cargo test
+```
+
 ## Prerequisites
 
 - **Rust** (stable toolchain)
 - **protobuf-compiler** (`protoc`) — for ttrpc code generation
 - **Linux with KVM** — for integration tests (`/dev/kvm`)
-- **Cloud Hypervisor** — VMM binary
+- **Cloud Hypervisor >= v51.0** — required for daemon OnDemand restore (build from source until released: [PR #7800](https://github.com/cloud-hypervisor/cloud-hypervisor/pull/7800))
 
 ## Guest Artifacts
 
@@ -66,38 +81,23 @@ No shell, no busybox, no package manager — absolute minimum for running contai
 ### Unit Tests
 
 ```bash
-cargo test --workspace           # shim, proto, common
-cd crates/agent && cargo test    # agent
+cargo test --workspace           # shim, daemon, proto, common
+cd crates/agent && cargo test    # agent (separate workspace)
 ```
 
-### Integration Tests
+### Daemon Integration Tests
 
-Integration tests boot real VMs and require root + KVM:
+The daemon has integration tests that exercise the full VM lifecycle (requires root + KVM):
 
 ```bash
-sudo cargo test -p containerd-shim-cloudhv --test integration -- --nocapture --test-threads=1
+cd crates/daemon && cargo test
 ```
-
-Set environment variables to override default paths:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CLOUDHV_TEST_KERNEL` | `guest/kernel/vmlinux` | Path to guest kernel |
-| `CLOUDHV_TEST_ROOTFS` | `guest/rootfs/rootfs.ext4` | Path to guest rootfs |
-| `CLOUDHV_TEST_CH_BIN` | `/usr/local/bin/cloud-hypervisor` | Path to CH binary |
-| `CLOUDHV_TEST_HTTP_ECHO` | `/usr/local/bin/http-echo` | Path to http-echo binary |
-
-Tests that require `http-echo` (container networking, multi-container, e2e benchmark)
-skip gracefully if the binary is not available.
 
 ### Benchmarks
 
 ```bash
 # Criterion micro-benchmarks (image cache, config serialization, CID allocation)
 cargo bench -p containerd-shim-cloudhv --bench vm_overhead
-
-# Integration timing benchmark (requires KVM + sudo)
-sudo cargo test -p containerd-shim-cloudhv --test integration -- --nocapture test_vm_lifecycle_timing
 ```
 
 ## Remote Development (macOS → Linux VM)
@@ -145,10 +145,10 @@ Key differences on ARM64:
    cargo test --workspace
    ```
 
-4. **Integration tests require root** (for `/run/cloudhv/` and Cloud Hypervisor):
+4. **Daemon integration tests require root + KVM** (for Cloud Hypervisor and `/run/cloudhv/`):
 
    ```bash
-   sudo cargo test -p containerd-shim-cloudhv --test integration -- --nocapture --test-threads=1
+   cd crates/daemon && cargo test
    ```
 
 5. **Submit a PR** — CI runs lint, build (gnu + musl), unit tests, and integration tests with KVM
