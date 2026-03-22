@@ -31,7 +31,7 @@
      ▼              │  └───┬──┘               └──┬───┘                           │
   ┌──────────┐      │      │ IP flushed          │ virtio-net                     │
   │  shim    ├──────┤      │ (VM owns pod IP)    │                               │
-  │  ~1180   │      │  ┌───┴─────────────────────┴────────────────────────────┐  │
+  │  ~1300   │      │  ┌───┴─────────────────────┴────────────────────────────┐  │
   │  lines   │      │  │  cloud-hypervisor (VMM)                              │  │
   │          │      │  │  ┌─────────────────────────────────────────────┐     │  │
   │ • TAP    │      │  │  │  Guest VM (custom kernel)                   │     │  │
@@ -64,7 +64,7 @@ The daemon serves VMs to shims via a Unix socket API at `/run/cloudhv/daemon.soc
 
 ### Shim (`containerd-shim-cloudhv-v1`)
 
-Thin containerd shim v2 (~1,180 lines). When `daemon_socket` is configured, the shim delegates VM lifecycle to the daemon and handles only:
+Thin containerd shim v2 (~1,300 lines). When `daemon_socket` is configured, the shim delegates VM lifecycle to the daemon and handles only:
 
 - **TAP networking** — creates TAP device in the pod's network namespace, sets up TC redirect rules, flushes the pod IP from the veth.
 - **erofs conversion** — converts container rootfs to erofs images, cached at `/run/cloudhv/erofs-cache/<hash>.erofs`. Uses flock serialization with retry for concurrent builds.
@@ -126,22 +126,17 @@ up already running.
 ## Container Rootfs Delivery
 
 The shim converts container rootfs to erofs images, cached at
-`/run/cloudhv/erofs-cache/<hash>.erofs`. The cache is content-addressed
-by the content digest from containerd's gRPC image service (immune to tag
-mutation) and flock-serialized with retry for concurrent builds. One build
-per unique image; all subsequent pods hardlink the cached image.
+`/run/cloudhv/erofs-cache/<hash>.erofs`. The cache key is an FNV-1a hash
+of the image's content digest, resolved via `containerd-client` gRPC.
+This makes the key content-addressed and immune to tag mutation.
 
-### Block Device Passthrough (devmapper snapshotter)
-
-When containerd uses the devmapper snapshotter, the container rootfs is already
-a thin-provisioned block device. The shim detects this via `/proc/self/mountinfo`
-and passes the device path directly to Cloud Hypervisor's `vm.add-disk` API.
-
-### erofs Cache (overlayfs snapshotter)
-
-When the snapshotter produces a directory mount, the shim runs `mkfs.erofs`
-to convert it into a compact read-only image (~8ms). The erofs image is cached
-and hardlinked for all subsequent pods using the same container image.
+Concurrent builds are serialized with `flock(LOCK_EX)` on a per-image
+lock file. After acquiring the lock, the shim re-checks whether the
+cache file exists (double-checked locking). If `mkfs.erofs` fails
+(e.g. fork pressure under heavy pod creation load), it retries up to
+3 times with progressive backoff (100ms, 200ms, 300ms). In practice,
+only the very first pod per image per node runs `mkfs.erofs` (~8ms);
+all subsequent pods hit the cache (0ms).
 
 In both tiers, config.json and volume data (ConfigMaps, Secrets) are delivered
 inline via the RunContainer RPC — the agent writes them to the bundle

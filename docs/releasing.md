@@ -34,7 +34,7 @@ contains downloadable binaries and checksums for both amd64 and arm64:
 | `cloudhv-agent-linux-arm64` | Guest agent (aarch64, static musl) |
 | `vmlinux` | Guest kernel — x86_64 (PVH boot, virtio, vsock, IP_PNP) |
 | `vmlinux-arm64` | Guest kernel — aarch64 (direct boot, PL011, ARM GIC) |
-| `rootfs.ext4` | Guest rootfs — x86_64 (agent + crun, 16 MB) |
+| `rootfs.erofs` | Guest rootfs — x86_64 (agent + crun, 16 MB) |
 | `rootfs-arm64.ext4` | Guest rootfs — aarch64 (agent + crun) |
 | `cloudhv-installer-chart-<version>.tgz` | Helm chart archive |
 | `checksums-sha256.txt` | SHA-256 checksums for all assets |
@@ -170,7 +170,7 @@ build-rootfs ────┘                           │
 
 1. **build-binaries**: compiles shim (gnu), daemon (gnu), and agent (musl) in parallel for both x86_64 and aarch64
 2. **build-kernel**: builds or restores cached guest kernel (per architecture)
-3. **build-rootfs**: creates rootfs ext4 image with agent + crun (per architecture)
+3. **build-rootfs**: creates rootfs.erofs image with agent + crun (per architecture)
 4. **build-installer-image**: packages arch-specific artifacts into per-platform images,
    then creates a multi-arch manifest combining amd64 and arm64
 5. **release**: creates GitHub Release with all binaries, checksums, Helm chart, and notes

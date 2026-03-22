@@ -7,7 +7,7 @@ that runs container workloads inside lightweight microVMs with maximum density a
 
 - **Sandbox daemon** — long-running systemd daemon pre-boots a pool of VMs from a base snapshot via CH v51 OnDemand restore (~25ms each, ~6 MB idle RSS). Shadow VMs create warm workload snapshots in the background — no production pod pausing
 - **150/150 pods in 11s** on 3 × D8ds_v5 nodes (96 GiB total RAM), ~24 MB per VM, 10% node memory utilization
-- **Thin shim** — the containerd shim (~1,180 lines) handles TAP networking, erofs conversion, and daemon RPCs (`AcquireSandbox`, `AddContainer`, `ReleaseSandbox`)
+- **Thin shim** — the containerd shim (~1,300 lines) handles TAP networking, erofs conversion, and daemon RPCs (`AcquireSandbox`, `AddContainer`, `ReleaseSandbox`)
 - **VM isolation** — each pod runs in its own Cloud Hypervisor microVM with dedicated kernel
 - **erofs rootfs cache** — content-addressable, flock-serialized, shared across pods
 - **inotify device discovery** — hot-plugged container disks detected in <1ms via inotify (no polling)
@@ -112,7 +112,7 @@ cd guest/rootfs && sudo bash build-rootfs.sh ../../target/x86_64-unknown-linux-m
 sudo install -m 755 target/release/containerd-shim-cloudhv-v1 /usr/local/bin/
 sudo install -m 755 target/release/cloudhv-sandbox-daemon /usr/local/bin/
 sudo mkdir -p /opt/cloudhv /run/cloudhv/erofs-cache /run/cloudhv/daemon
-sudo cp guest/kernel/vmlinux guest/rootfs/rootfs.ext4 /opt/cloudhv/
+sudo cp guest/kernel/vmlinux guest/rootfs/rootfs.erofs /opt/cloudhv/
 
 # Shim config (see docs/configuration.md for full reference)
 sudo tee /opt/cloudhv/config.json > /dev/null <<EOF
@@ -123,7 +123,7 @@ sudo tee /opt/cloudhv/config.json > /dev/null <<EOF
   "kernel_args": "console=ttyS0 root=/dev/vda rw init=/init net.ifnames=0",
   "default_vcpus": 1,
   "max_default_vcpus": 0,
-  "default_memory_mb": 512,
+  "default_memory_mb": 128,
   "max_containers_per_vm": 5,
   "daemon_socket": "/run/cloudhv/daemon.sock"
 }
@@ -135,7 +135,7 @@ sudo tee /opt/cloudhv/daemon.json > /dev/null <<EOF
   "pool_size": 3,
   "max_pool_size": 10,
   "default_vcpus": 1,
-  "default_memory_mb": 512,
+  "default_memory_mb": 128,
   "kernel_path": "/opt/cloudhv/vmlinux",
   "rootfs_path": "/opt/cloudhv/rootfs.erofs",
   "kernel_args": "console=ttyS0 root=/dev/vda rw init=/init net.ifnames=0",

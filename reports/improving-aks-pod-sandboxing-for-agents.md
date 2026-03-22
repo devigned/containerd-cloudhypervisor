@@ -175,7 +175,7 @@ restore:
 - **Pool VMs** — pre-booted from base snapshots, assigned to pods on demand
   (25 ms restore time per VM)
 - **Shadow VMs** — create warm workload snapshots in the background
-- **Thin shim** — ~1,180 lines handling TAP networking, erofs conversion, and
+- **Thin shim** — ~1,300 lines handling TAP networking, erofs conversion, and
   daemon RPCs (replaced the full VMM-spawning shim)
 - **Image key** — uses content digest from containerd's gRPC image service
 
@@ -428,7 +428,7 @@ of commit `57b7b4d`. Key results on the same 3 × D8ds_v5 infrastructure:
 
 The daemon architecture eliminated the CPU overhead gap by replacing per-pod
 VMM process spawn with pre-pooled VMs acquired via daemon RPC. The shim is
-now ~1,180 lines handling only TAP networking, erofs conversion, and daemon
+now ~1,300 lines handling only TAP networking, erofs conversion, and daemon
 communication.
 
 ## Conclusion

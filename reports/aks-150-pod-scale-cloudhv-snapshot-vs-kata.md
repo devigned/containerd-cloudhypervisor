@@ -12,7 +12,7 @@ daemon that pre-boots VM pools from base snapshots:
 - **Standalone sandbox daemon** pre-boots VM pools from base snapshots using
   Cloud Hypervisor v51's userfaultfd `OnDemand` restore
 - **Shadow VMs** create warm workload snapshots in the background
-- **Thin shim** (~1,180 lines) handles only TAP networking, erofs conversion,
+- **Thin shim** (~1,300 lines) handles only TAP networking, erofs conversion,
   and daemon RPCs
 - **Image key** uses content digest from containerd's gRPC image service
 

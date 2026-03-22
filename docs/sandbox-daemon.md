@@ -27,10 +27,11 @@ eager boot, 15s+ under 50-VM contention). The shim is ephemeral — spawned
 per pod by containerd, destroyed when the pod dies. It cannot pre-warm VMs
 because it doesn't exist before `RunPodSandbox`.
 
-Async eager boot (v0.12.0) overlaps ~90ms of boot with containerd's
-internal processing, but can never eliminate the cost entirely. Under
-burst scale (150 pods), all VMs compete for host CPU during boot, inflating
-per-pod latency to seconds.
+Previous optimizations (async eager boot in v0.12.0) overlapped ~90ms of
+boot with containerd's internal processing, but could never eliminate the
+cost entirely. Under burst scale (150 pods), all VMs competed for host CPU
+during boot, inflating per-pod latency to seconds. The daemon architecture
+eliminates this entirely by pre-booting VMs in a pool.
 
 ## Proposal: Sandbox Daemon
 
@@ -125,6 +126,26 @@ The daemon does NOT own:
 ### Shim Changes
 
 The shim becomes a thin client for VM lifecycle:
+
+#### Image Key Strategy
+
+The image key identifies "same workload" for warm snapshot reuse. The shim
+resolves the container image tag to a content-addressed digest using
+`containerd-client` v0.8.0 (gRPC call to containerd's ImageService). The
+digest is then hashed with FNV-1a 128-bit to produce a stable hex key.
+
+```
+busybox:latest → containerd gRPC → sha256:b3255e7d... → FNV-1a → e15434cbacd68a2d60dbb91d7f060194
+```
+
+This makes the key immune to tag mutation — if `latest` is repushed with
+different content, the digest changes and a new snapshot is created. The
+daemon's mtime check on the erofs file provides a secondary safety net.
+
+Fallback chain:
+1. **Content digest** (via containerd gRPC) — preferred, content-addressed
+2. **Image tag hash** — if gRPC fails
+3. **Rootfs path hash** — for non-CRI callers
 
 ```
 start_sandbox:
@@ -376,11 +397,10 @@ message StatusResponse {
   "replenish_delay_ms": 100,
   "vm_idle_timeout_secs": 300,
   "default_vcpus": 1,
-  "default_memory_mb": 512,
+  "default_memory_mb": 128,
   "cloud_hypervisor_binary": "/usr/local/bin/cloud-hypervisor",
   "kernel_path": "/opt/cloudhv/vmlinux",
   "rootfs_path": "/opt/cloudhv/rootfs.erofs",
-  "warm_restore": false,
   "socket_path": "/run/cloudhv/daemon.sock"
 }
 ```
@@ -447,6 +467,9 @@ With CH v51+ OnDemand restore on AKS (3 × D8ds_v5):
 | Node memory at 150 pods | ~43% | **~10%** |
 | Daemon RSS | N/A | **~2.2 MB** |
 | Shim RSS | ~5.5 MiB | **~6 MB** |
+| Base snapshot creation | N/A | **~1s** (cold boot + agent wait + snapshot) |
+| Shadow VM lifecycle | N/A | **~33s** (30s warmup + 3s snapshot) |
+| Pool restore (per VM) | N/A | **25ms** |
 
 ### Implementation Plan
 

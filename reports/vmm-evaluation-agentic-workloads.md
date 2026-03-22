@@ -19,7 +19,7 @@ krun (crun-krun), and OpenVMM.
 Rust-based VMM from Intel/Microsoft. Our current architecture uses a
 **standalone sandbox daemon** that pre-boots VM pools from base snapshots
 using CH v51's userfaultfd `OnDemand` restore. The shim is a thin daemon
-client (~1,180 lines) handling only TAP networking, erofs conversion, and
+client (~1,300 lines) handling only TAP networking, erofs conversion, and
 daemon RPCs.
 
 | Attribute | Value |

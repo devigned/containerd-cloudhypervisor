@@ -28,7 +28,7 @@ The shim loads its configuration from `/opt/cloudhv/config.json` at startup.
   "rootfs_path": "/opt/cloudhv/rootfs.erofs",
   "kernel_args": "console=ttyS0 root=/dev/vda rw init=/init net.ifnames=0",
   "default_vcpus": 1,
-  "default_memory_mb": 512,
+  "default_memory_mb": 128,
   "max_containers_per_vm": 5,
   "tpm_enabled": false,
   "daemon_socket": "/run/cloudhv/daemon.sock"
@@ -54,7 +54,7 @@ The sandbox daemon loads its configuration from `/opt/cloudhv/daemon.json`.
 | `pool_size` | `3` | Target number of pre-booted idle VMs |
 | `max_pool_size` | `10` | Hard cap on idle pool VMs |
 | `default_vcpus` | `1` | vCPUs per pool VM |
-| `default_memory_mb` | `512` | Memory per pool VM in MiB |
+| `default_memory_mb` | `128` | Memory per pool VM in MiB |
 | `cloud_hypervisor_binary` | `/usr/local/bin/cloud-hypervisor` | Path to CH binary (requires v51+) |
 | `kernel_path` | — | Path to guest vmlinux |
 | `rootfs_path` | — | Path to guest rootfs.erofs |
@@ -71,7 +71,7 @@ The sandbox daemon loads its configuration from `/opt/cloudhv/daemon.json`.
   "pool_size": 3,
   "max_pool_size": 10,
   "default_vcpus": 1,
-  "default_memory_mb": 512,
+  "default_memory_mb": 128,
   "kernel_path": "/opt/cloudhv/vmlinux",
   "rootfs_path": "/opt/cloudhv/rootfs.erofs",
   "kernel_args": "console=ttyS0 root=/dev/vda rw init=/init net.ifnames=0",
@@ -262,23 +262,3 @@ Then restart containerd:
 ```bash
 sudo systemctl restart containerd
 ```
-
-## Devmapper Snapshotter (Optional)
-
-For zero-copy rootfs delivery, configure containerd to use the devmapper
-snapshotter for the cloudhv runtime:
-
-```toml
-[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.cloudhv]
-  runtime_type = "io.containerd.cloudhv.v1"
-  snapshotter = "devmapper"
-```
-
-This requires a thin-provisioning pool. See
-[containerd devmapper docs](https://github.com/containerd/containerd/blob/main/docs/snapshotters/devmapper.md)
-for setup instructions.
-
-When devmapper is configured, the shim passes the container's thin snapshot
-block device directly to the VM — no image creation, no caching overhead.
-When not configured (overlayfs default), the shim falls back to creating
-cached ext4 images.

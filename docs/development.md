@@ -158,6 +158,6 @@ Key differences on ARM64:
 
 - `cargo clippy -- -D warnings` — no suppressed warnings in production code
 - Tests must **never false-pass** — use `.expect()`, not silent skip-on-error
-- VMs must **always clean up** — `VmManager` implements `Drop` to prevent zombie processes
+- VMs must **always clean up** — the daemon destroys CH processes on release to prevent zombie VMs
 - Verify on **both macOS and Linux** before pushing
 - Every feature must have an **integration test** proving it works end-to-end
