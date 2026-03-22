@@ -166,6 +166,11 @@ impl Pool {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Public CID allocator for use by snapshot restore.
+    pub fn next_cid_pub(&self) -> u64 {
+        self.next_cid()
+    }
+
     /// Check if the base snapshot is valid (exists and matches current kernel/rootfs).
     fn base_snapshot_valid(&self, base_dir: &std::path::Path) -> bool {
         let config_path = base_dir.join("config.json");

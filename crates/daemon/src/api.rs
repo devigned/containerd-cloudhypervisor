@@ -3,21 +3,27 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use log::info;
+use log::{info, warn};
 
 use crate::config::DaemonConfig;
 use crate::pool::Pool;
+use crate::shadow::SnapshotManager;
 
 /// The daemon API server. Listens on a Unix socket and serves
 /// AcquireSandbox, ReleaseSandbox, and Status RPCs.
 pub struct ApiServer {
     config: DaemonConfig,
     pool: Arc<Pool>,
+    snapshots: Arc<SnapshotManager>,
 }
 
 impl ApiServer {
-    pub fn new(config: DaemonConfig, pool: Arc<Pool>) -> Self {
-        Self { config, pool }
+    pub fn new(config: DaemonConfig, pool: Arc<Pool>, snapshots: Arc<SnapshotManager>) -> Self {
+        Self {
+            config,
+            pool,
+            snapshots,
+        }
     }
 
     /// Start the ttrpc server. Blocks until shutdown.
@@ -41,9 +47,10 @@ impl ApiServer {
         loop {
             let (stream, _) = listener.accept().await?;
             let pool = Arc::clone(&self.pool);
+            let snapshots = Arc::clone(&self.snapshots);
             let config = self.config.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, &pool, &config).await {
+                if let Err(e) = handle_connection(stream, &pool, &snapshots, &config).await {
                     log::warn!("client error: {:#}", e);
                 }
             });
@@ -56,6 +63,7 @@ impl ApiServer {
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     pool: &Arc<Pool>,
+    snapshots: &Arc<SnapshotManager>,
     config: &DaemonConfig,
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -72,9 +80,9 @@ async fn handle_connection(
         let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
 
         let response = match method {
-            "AcquireSandbox" => handle_acquire(pool, config, &request).await,
+            "AcquireSandbox" => handle_acquire(pool, snapshots, config, &request).await,
             "ReleaseSandbox" => handle_release(pool, &request).await,
-            "Status" => handle_status(pool).await,
+            "Status" => handle_status(pool, snapshots).await,
             _ => serde_json::json!({"error": format!("unknown method: {}", method)}),
         };
 
@@ -91,6 +99,7 @@ async fn handle_connection(
 
 async fn handle_acquire(
     pool: &Arc<Pool>,
+    snapshots: &Arc<SnapshotManager>,
     _config: &DaemonConfig,
     request: &serde_json::Value,
 ) -> serde_json::Value {
@@ -110,10 +119,45 @@ async fn handle_acquire(
         .get("gateway")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let _image_key = request
+    let image_key = request
         .get("image_key")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    let erofs_path = request
+        .get("erofs_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Check for warm workload snapshot
+    if !image_key.is_empty() && snapshots.has_snapshot(image_key).await {
+        let vm_id = format!("warm-{}-{}", image_key, std::process::id());
+        let state_dir = std::path::PathBuf::from("/run/cloudhv/daemon").join(&vm_id);
+        if let Err(e) = std::fs::create_dir_all(&state_dir) {
+            return serde_json::json!({"error": format!("create state dir: {e}")});
+        }
+
+        let cid = pool.next_cid_pub();
+        match snapshots
+            .restore_from_snapshot(image_key, &vm_id, cid, &state_dir)
+            .await
+        {
+            Ok((ch_pid, api_socket, vsock_socket)) => {
+                info!("warm restore for image_key={}", image_key);
+                return serde_json::json!({
+                    "vm_id": vm_id,
+                    "api_socket": api_socket.to_string_lossy(),
+                    "vsock_socket": vsock_socket.to_string_lossy(),
+                    "cid": cid,
+                    "ch_pid": ch_pid,
+                    "from_snapshot": true,
+                });
+            }
+            Err(e) => {
+                warn!("warm restore failed, falling back to pool: {:#}", e);
+                // Fall through to pool acquire
+            }
+        }
+    }
 
     match pool.acquire().await {
         Ok(vm) => {
@@ -123,6 +167,11 @@ async fn handle_acquire(
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 pool_clone.replenish_one().await;
             });
+
+            // Trigger shadow VM for this image (if not already snapshotted)
+            if !image_key.is_empty() && !erofs_path.is_empty() {
+                snapshots.trigger_shadow(image_key, erofs_path).await;
+            }
 
             serde_json::json!({
                 "vm_id": vm.vm_id,
@@ -152,9 +201,11 @@ async fn handle_release(pool: &Arc<Pool>, request: &serde_json::Value) -> serde_
     }
 }
 
-async fn handle_status(pool: &Arc<Pool>) -> serde_json::Value {
+async fn handle_status(pool: &Arc<Pool>, snapshots: &Arc<SnapshotManager>) -> serde_json::Value {
     serde_json::json!({
         "pool_ready": pool.ready_count().await,
         "active_vms": pool.active_count(),
+        "shadow_vms_running": snapshots.active_shadow_count().await,
+        "snapshot_keys": snapshots.snapshot_keys().await,
     })
 }

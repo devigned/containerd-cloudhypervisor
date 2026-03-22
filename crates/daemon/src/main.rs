@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use log::info;
@@ -6,6 +7,7 @@ use log::info;
 mod api;
 mod config;
 mod pool;
+pub mod shadow;
 mod vm_lifecycle;
 
 #[tokio::main]
@@ -38,7 +40,10 @@ async fn main() -> Result<()> {
     let pool = pool::Pool::new(config.clone());
     pool.initialize().await?;
 
+    // Initialize snapshot manager (for warm workload snapshots)
+    let snapshots = shadow::SnapshotManager::new(config.clone(), Arc::clone(&pool));
+
     // Start API server
-    let server = api::ApiServer::new(config, pool);
+    let server = api::ApiServer::new(config, pool, snapshots);
     server.serve().await
 }

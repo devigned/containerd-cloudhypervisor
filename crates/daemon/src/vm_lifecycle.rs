@@ -284,7 +284,7 @@ pub async fn shutdown_and_destroy(api_socket: &Path, ch_pid: u32, state_dir: &Pa
 }
 
 /// Send an HTTP request to the CH API socket using hyper.
-async fn api_request(
+pub async fn api_request(
     socket_path: &Path,
     method: &str,
     path: &str,
@@ -332,4 +332,57 @@ async fn api_request(
     }
 
     Ok(())
+}
+
+/// Convenience: send a CH API request with a body.
+pub async fn api_request_with_body(
+    socket_path: &Path,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> Result<()> {
+    api_request(socket_path, method, path, Some(body)).await
+}
+
+/// Connect to the guest agent via vsock and return ttrpc clients.
+pub async fn connect_agent(
+    vsock_socket: &Path,
+) -> Result<(
+    cloudhv_proto::AgentServiceClient,
+    cloudhv_proto::HealthServiceClient,
+)> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let stream = UnixStream::connect(vsock_socket)
+        .await
+        .with_context(|| format!("connect vsock: {}", vsock_socket.display()))?;
+
+    let (reader, mut writer) = stream.into_split();
+    let connect_cmd = format!("CONNECT {}\n", cloudhv_common::AGENT_VSOCK_PORT);
+    writer.write_all(connect_cmd.as_bytes()).await?;
+
+    let mut buf_reader = BufReader::new(reader);
+    let mut response = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        buf_reader.read_line(&mut response),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("vsock CONNECT handshake timed out"))?
+    .context("vsock read")?;
+
+    if !response.starts_with("OK") {
+        anyhow::bail!("vsock CONNECT failed: {}", response.trim());
+    }
+
+    let stream = buf_reader.into_inner().reunite(writer)?;
+    let std_stream = stream.into_std()?;
+    use std::os::unix::io::IntoRawFd;
+    let fd = std_stream.into_raw_fd();
+
+    let client = ttrpc::asynchronous::Client::new(fd);
+    let agent = cloudhv_proto::AgentServiceClient::new(client.clone());
+    let health = cloudhv_proto::HealthServiceClient::new(client);
+
+    Ok((agent, health))
 }
