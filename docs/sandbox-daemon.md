@@ -440,3 +440,161 @@ This allows incremental rollout and easy fallback.
    pre-assign IPs to pool VMs for even faster acquire?
 5. **Integration with Kubernetes scheduler**: Can we expose pool capacity
    as an extended resource so the scheduler avoids overcommitting nodes?
+
+---
+
+## Addendum: Test Plan
+
+The daemon's ttrpc API provides a clean boundary for testing. A test client
+can drive the full lifecycle without containerd, Kubernetes, or CRI — just
+connect to the Unix socket and call RPCs.
+
+### Unit Tests
+
+Testable in isolation with mocked CH processes:
+
+| Test | Validates |
+|------|-----------|
+| Pool initializes to `pool_size` VMs | Base snapshot creation + restore loop |
+| AcquireSandbox returns a VM with valid api_socket, vsock_socket | Response fields populated correctly |
+| AcquireSandbox decrements pool count | Pool bookkeeping |
+| Pool replenishes after acquire (async) | Replenishment triggers and completes |
+| AcquireSandbox blocks when pool is empty | Synchronous fallback restore |
+| ReleaseSandbox destroys VM (CH process exits) | Cleanup path |
+| ReleaseSandbox with invalid vm_id returns error | Error handling |
+| Status RPC reports correct pool_ready / active_vms | Monitoring accuracy |
+| Daemon startup with no existing base snapshot | Creates base snapshot from cold boot |
+| Daemon startup with existing base snapshot | Reuses cached base snapshot |
+| VM idle timeout destroys unused pool VMs | Resource reclaim |
+| Pool respects max_pool_size cap | No unbounded growth |
+| Config reload updates pool_size | Dynamic reconfiguration |
+
+### Integration Tests (Daemon + CH + Agent)
+
+These run against real Cloud Hypervisor with KVM. Require a host with
+`/dev/kvm` access (hl-dev or CI runner with nested virt).
+
+#### Lifecycle Tests
+
+| Test | Steps | Validates |
+|------|-------|-----------|
+| **Acquire and use** | AcquireSandbox → hot-plug disk → RunContainer → verify workload runs → ReleaseSandbox | Full lifecycle |
+| **Consecutive acquire/release** | Repeat acquire→release 10 times | No state leaks, pool replenishment |
+| **Concurrent acquire** | 10 parallel AcquireSandbox calls | Pool drain + synchronous fallback |
+| **Acquire with custom resources** | AcquireSandbox(vcpus=2, memory=1024) | Custom VM sizing |
+| **Release during acquire** | AcquireSandbox (blocks, pool empty) → cancel | Graceful cancellation |
+| **Daemon restart** | AcquireSandbox → daemon restarts → ReleaseSandbox | Orphan VM cleanup |
+| **Daemon crash recovery** | Kill daemon process → restart → Status | Pool rebuilds from base snapshot |
+
+#### Shadow VM Snapshot Tests
+
+| Test | Steps | Validates |
+|------|-------|-----------|
+| **Shadow snapshot creation** | AcquireSandbox(image_key=X, no snapshot) → wait → verify snapshot exists | Shadow VM lifecycle |
+| **Snapshot restore** | Create snapshot → AcquireSandbox(same image_key) → verify from_snapshot=true | Workload snapshot hit |
+| **Shadow VM failure** | Shadow VM crashes during warmup → verify no snapshot cached, no impact on live VMs | Fault isolation |
+| **Shadow VM networking** | Verify shadow VM has no TAP, workload still binds 0.0.0.0 | Networkless warmup |
+| **Snapshot eviction** | Fill cache to max_snapshots → verify LRU eviction | Cache management |
+| **Concurrent shadow VMs** | Multiple images trigger shadows simultaneously | No resource conflicts |
+| **Per-image warmup duration** | Configure 60s for image A, 10s for image B → verify timing | Warmup configuration |
+
+#### Resource Accounting Tests
+
+| Test | Steps | Validates |
+|------|-------|-----------|
+| **Cgroup migration** | AcquireSandbox → verify CH PID in daemon cgroup → shim moves to pod cgroup → verify | Accounting handoff |
+| **Pool memory accounting** | Start daemon → verify pool VMs count against daemon cgroup | System overhead tracking |
+| **CoW memory sharing** | Acquire 10 VMs → measure total RSS vs 10 × per-VM RSS | CoW deduplication |
+| **Daemon resource limits** | Set MemoryMax=2G → fill pool → verify OOM kills daemon not host | Resource containment |
+
+#### Network Configuration Tests
+
+| Test | Steps | Validates |
+|------|-------|-----------|
+| **ConfigureNetwork on acquired VM** | AcquireSandbox → daemon calls ConfigureNetwork → verify guest has IP | Post-acquire networking |
+| **IP conflict detection** | Acquire two VMs with same IP → verify error or correct isolation | Safety |
+| **Network cleanup on release** | AcquireSandbox → configure → ReleaseSandbox → verify TAP cleaned | No network leaks |
+
+### Performance Tests
+
+Run on identical infrastructure to enable comparison with previous
+benchmarks and Kata Containers.
+
+#### Single-Pod Latency (hl-dev, D8s_v5, KVM)
+
+Measure wall-clock time from AcquireSandbox call to workload serving HTTP:
+
+| Scenario | Metric | Target | Comparison |
+|----------|--------|--------|------------|
+| Pool hit (base VM) | AcquireSandbox latency | <5ms | v0.12.0: 7ms sandbox + 26-110ms container |
+| Pool hit + hot-plug + RPC | Container ready | <25ms | v0.12.0: 26-110ms |
+| Pool empty (sync restore) | AcquireSandbox latency | <350ms | v0.12.0: 120-200ms total |
+| Workload snapshot hit | Container ready (warm) | <10ms | v0.12.0 warm: 300ms |
+| Pool replenish time | Time to refill one slot | <400ms | Background, non-blocking |
+
+Run each scenario 20 times to reduce noise. Report p50, p95, p99.
+
+#### Scale Benchmark (AKS, 3 × D8ds_v5)
+
+Compare with v0.12.0 and Kata on identical infrastructure:
+
+| Test | CloudHV v0.12.0 | CloudHV + Daemon | Kata |
+|------|-----------------|------------------|------|
+| 150 pods → all Ready | 77s | Target: <30s | 130/150 (stuck) |
+| Scale-down 150 → 0 | 12s | Target: <10s | ~30s |
+| Per-pod memory (cold) | 57 MiB | ~5 MiB (CoW from base) | 312 MiB |
+| Per-pod memory (warm) | 5 MiB | ~5 MiB (CoW from workload) | N/A |
+| Node memory at 150 pods | 4.2 GiB | Target: <3 GiB | 40.5 GiB |
+
+Protocol:
+1. Deploy daemon with `pool_size: 10` on each node
+2. Wait for pools to fill (Status RPC shows pool_ready = pool_size)
+3. Scale deployment from 0 → 150
+4. Record time to all pods Ready (readiness probe with startup probe, 1s period)
+5. Capture node memory via `free -m` (VMSS run-command)
+6. Scale 150 → 0, record time to all pods terminated
+7. Repeat 3 times, report median
+
+#### Agent Sandbox Benchmark (AKS, Python workload)
+
+Compare Python sandbox startup with and without daemon:
+
+| Test | Without Daemon | With Daemon (cold) | With Daemon (warm) |
+|------|---------------|-------------------|-------------------|
+| SDK create → sandbox ready | ~13s | Target: <5s | Target: <3s |
+| Consecutive runs (10x) | 10/10 pass | 10/10 pass | 10/10 pass |
+| VM uptime at first exec | 20s (cold boot) | ~0.5s (pool) | ~50s (snapshot clock) |
+
+#### Contention Benchmark
+
+The primary value of the daemon — pre-booted pools eliminate boot contention:
+
+| Concurrent pods | v0.12.0 agent_connect | With Daemon |
+|----------------|----------------------|-------------|
+| 1 | 170ms | <5ms |
+| 10 | ~500ms | <5ms |
+| 50 | ~5s | <5ms (pool) / ~350ms (drain) |
+| 150 | ~15s | <5ms (pool) / ~350ms (drain) |
+
+Protocol:
+1. Pre-fill pool to 50 VMs
+2. Launch N pods simultaneously (kubectl scale)
+3. Measure per-pod agent_connect time from TIMING logs
+4. Compare with Kata's per-pod boot time at same concurrency
+
+### Edge Cases
+
+| Edge Case | Expected Behavior |
+|-----------|-------------------|
+| Daemon not running when shim starts | Shim falls back to direct CH spawn (v0.12.0 behavior) |
+| Daemon socket exists but daemon is dead | Shim detects connection failure, falls back |
+| Pool drains completely during burst | Synchronous restore (same latency as v0.12.0 warm restore) |
+| Base snapshot corrupted | Daemon recreates from cold boot on startup |
+| Workload snapshot restore fails | Daemon falls back to pool VM (cold boot path) |
+| CH binary upgraded while daemon running | Daemon restart required (systemd handles) |
+| Guest rootfs upgraded while pool VMs exist | Daemon invalidates pool and base snapshot on rootfs mtime change |
+| Shadow VM OOM during warmup | Shadow destroyed, snapshot not cached, retry on next acquire |
+| Node memory pressure | Daemon reduces pool_size via idle timeout; kubelet can evict daemon pod |
+| Daemon and shim version mismatch | ttrpc API versioned; daemon rejects incompatible clients |
+| Multiple images trigger shadow VMs simultaneously | Daemon caps concurrent shadows (e.g. max 2) to avoid resource exhaustion |
+| AcquireSandbox with vcpus/memory that don't match pool VMs | Daemon bypasses pool, creates custom VM synchronously |
