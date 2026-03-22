@@ -153,21 +153,93 @@ Pool sizing:
   - vm_idle_timeout_secs: destroy idle VMs after timeout (default: 300)
 ```
 
-### Warm Workload Snapshots (Experimental)
+### Warm Workload Snapshots via Shadow VMs
 
-When `warm_restore` is enabled:
+Today (v0.11.0), warm snapshots are taken by pausing a **live production
+VM** — the pod that's serving actual traffic. This causes:
 
-1. After a cold-boot container's workload is fully running (~20s warmup),
-   the shim tells the daemon: `CreateWorkloadSnapshot(vm_id, image_key)`
-2. Daemon pauses the VM, snapshots it (with workload running), resumes
-3. On future `AcquireSandbox` with matching `image_key`:
-   - Daemon restores from the workload snapshot instead of the base
-   - VM wakes up with workload already serving
-   - Shim skips RunContainer
+- ~200-500ms of request downtime while paused
+- Risk of TCP connection resets (peers time out)
+- Kubelet may restart the container if liveness probe fires during pause
 
-Workload snapshots are stored separately from the base snapshot and are
-per-image. They include the full workload state (Python runtime loaded,
-server listening, etc.).
+The daemon eliminates this by using **shadow VMs** — dedicated throwaway
+instances that exist solely to produce warm snapshots, outside of
+Kubernetes entirely.
+
+#### Shadow VM Flow
+
+```
+First AcquireSandbox(image_key="python-runtime"):
+  1. No workload snapshot exists for this image
+  2. Daemon returns a clean pool VM → shim starts container normally
+  3. Pod serves traffic immediately — never paused, never disrupted
+
+Meanwhile (async, background):
+  4. Daemon spawns a shadow VM:
+     a. Restore from base snapshot (clean VM, agent ready)
+     b. Hot-plug the container rootfs (same erofs image)
+     c. RunContainer RPC (workload starts inside shadow)
+     d. Wait warmup_duration (configurable, default 30s)
+     e. Pause shadow VM → snapshot → destroy shadow
+     f. Cache workload snapshot under image_key
+  5. Shadow VM lifecycle: ~35s total, fully async
+
+Next AcquireSandbox(image_key="python-runtime"):
+  6. Workload snapshot exists → restore from it
+  7. VM wakes up with Python already running, server listening
+  8. ConfigureNetwork RPC (new IP) → traffic flows immediately
+```
+
+#### Shadow VM Properties
+
+| Property | Value |
+|----------|-------|
+| Managed by containerd? | No — daemon-internal only |
+| In a pod cgroup? | No — lives in daemon's cgroup |
+| Has networking? | No — no TAP, no IP, no CNI |
+| Serves traffic? | No — purely for snapshot creation |
+| Lifetime | ~35s (boot + warmup + snapshot + destroy) |
+| Impact on live pods | Zero — completely isolated |
+
+#### Benefits Over Live-Pause Snapshots
+
+- **Zero production disruption** — live pods are never paused
+- **Longer warmup** — can wait 60s+ for full JIT/model loading since no
+  user traffic is affected
+- **Safer** — snapshot failure doesn't impact any running workload
+- **Simpler error handling** — if shadow VM crashes, just retry later
+- **Configurable warmup** — per-image warmup duration in daemon config
+
+#### Shadow VM Networking
+
+Shadow VMs boot without networking because:
+
+1. The workload binds `0.0.0.0:<port>` — it listens on all interfaces
+2. No interface exists during warmup, but the bind still succeeds on `0.0.0.0`
+3. On restore, the shim configures the real network via ConfigureNetwork RPC
+4. The kernel sees the new interface, workload accepts on it automatically
+
+If a workload requires a network interface during startup (e.g. connects
+to an external service on init), the daemon can create a dummy interface
+with a non-routable IP for the shadow VM's warmup period.
+
+#### Snapshot Cache Management
+
+```json
+{
+  "snapshot_cache": {
+    "max_total_size_gb": 10,
+    "max_snapshots": 20,
+    "eviction_policy": "lru",
+    "warmup_duration_secs": 30,
+    "per_image_overrides": {
+      "python-runtime-sandbox": {
+        "warmup_duration_secs": 60
+      }
+    }
+  }
+}
+```
 
 ### Resource Accounting
 
@@ -218,9 +290,6 @@ service SandboxDaemon {
   // Release a VM back to the daemon for destruction.
   rpc ReleaseSandbox(ReleaseRequest) returns (ReleaseResponse);
 
-  // Request a warm workload snapshot of a running VM.
-  rpc CreateWorkloadSnapshot(SnapshotRequest) returns (SnapshotResponse);
-
   // Pool and snapshot status for monitoring.
   rpc Status(Empty) returns (StatusResponse);
 }
@@ -251,20 +320,12 @@ message ReleaseRequest {
 
 message ReleaseResponse {}
 
-message SnapshotRequest {
-  string vm_id = 1;
-  string image_key = 2;
-}
-
-message SnapshotResponse {
-  bool created = 1;
-}
-
 message StatusResponse {
   uint32 pool_ready = 1;
   uint32 pool_target = 2;
   uint32 active_vms = 3;
-  repeated string snapshot_keys = 4;
+  uint32 shadow_vms_running = 4;   // Shadow VMs currently warming up
+  repeated string snapshot_keys = 5;
 }
 ```
 
@@ -333,20 +394,22 @@ The daemon is opt-in via the `daemon_socket` config field:
 
 This allows incremental rollout and easy fallback.
 
-#### Phase 1: Daemon with base VM pool (no workload snapshots)
+#### Phase 1: Daemon with base VM pool
 
 - New crate: `crates/daemon/`
-- VM pool management (restore from base snapshot)
+- Base snapshot creation at daemon startup
+- VM pool management (restore from base snapshot, replenish on acquire)
 - AcquireSandbox / ReleaseSandbox RPCs
 - Shim connects to daemon for VM acquisition
 - Installer deploys daemon binary + systemd unit
 
-#### Phase 2: Workload snapshots via daemon
+#### Phase 2: Warm workload snapshots via shadow VMs
 
-- Move snapshot creation/restore logic from shim to daemon
-- CreateWorkloadSnapshot RPC
+- Shadow VM lifecycle (spawn, warmup, snapshot, destroy)
 - Image-key-based snapshot selection in AcquireSandbox
+- Per-image warmup duration configuration
 - Snapshot eviction policy (LRU, max cache size)
+- No production VM pausing — all snapshots from shadow VMs
 
 #### Phase 3: Observability and optimization
 
