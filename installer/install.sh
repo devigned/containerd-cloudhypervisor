@@ -103,7 +103,7 @@ cat > "$HOST/opt/cloudhv/config.json" << CONFIG
   "kernel_args": "${KERNEL_CONSOLE} root=/dev/vda rw init=/init net.ifnames=0",
   "default_vcpus": 1,
   "max_default_vcpus": 0,
-  "default_memory_mb": 512,
+  "default_memory_mb": 128,
   "max_containers_per_vm": 5,
   "hotplug_memory_mb": 0,
   "hotplug_method": "acpi",
@@ -121,7 +121,7 @@ cat > "$HOST/opt/cloudhv/daemon.json" << DAEMON
   "rootfs_path": "/opt/cloudhv/rootfs.erofs",
   "kernel_args": "${KERNEL_CONSOLE} root=/dev/vda rw init=/init net.ifnames=0",
   "default_vcpus": 1,
-  "default_memory_mb": 512,
+  "default_memory_mb": 128,
   "socket_path": "/run/cloudhv/daemon.sock",
   "state_dir": "/run/cloudhv/daemon"
 }
