@@ -63,6 +63,8 @@ struct SharedVmState {
     agent: OnceCell<cloudhv_proto::AgentServiceClient>,
     /// vsock proxy socket path (from daemon).
     vsock_socket: PathBuf,
+    /// Cloud Hypervisor process PID (for exit watching + cgroup placement).
+    ch_pid: u32,
     /// Container count (sandbox counts as 1).
     container_count: AtomicUsize,
     /// TAP device name (created by shim in pod netns).
@@ -196,11 +198,29 @@ impl Instance for CloudHvInstance {
             }
         }
 
-        // Don't set exit here — the exit watcher (from start_container) will
-        // set it when the container actually exits. Setting it eagerly causes
-        // shimkit's TaskState to transition to Exited prematurely, making
-        // subsequent kill() calls fail with "Exited => Killing" and bricking
-        // the node in a StopPodSandbox retry loop.
+        // For sandbox containers: set exit after a brief wait for the CH process
+        // to die. Sandbox containers have no RunContainer and thus no agent-based
+        // exit watcher. App containers rely on the PID watcher spawned in
+        // start_container.
+        let is_sandbox = self.id == self.sandbox_id;
+        if is_sandbox && (signal == 9 || signal == 15) {
+            let exit = self.exit.clone();
+            if let Some(vm_state) = get_vm(&self.sandbox_id) {
+                let ch_pid = vm_state.ch_pid;
+                if ch_pid > 0 {
+                    // Watch CH PID — when daemon destroys the VM, this fires
+                    tokio::spawn(async move {
+                        wait_for_pid_exit(ch_pid).await;
+                        let _ = exit.set((137, Utc::now()));
+                    });
+                } else {
+                    // No VM acquired yet — set exit immediately
+                    let _ = exit.set((0, Utc::now()));
+                }
+            } else {
+                let _ = exit.set((0, Utc::now()));
+            }
+        }
 
         Ok(())
     }
@@ -328,6 +348,7 @@ impl CloudHvInstance {
         let vm_state = Arc::new(SharedVmState {
             agent: OnceCell::new(),
             vsock_socket: PathBuf::new(),
+            ch_pid: 0,
             container_count: AtomicUsize::new(1),
             tap_name,
             tap_mac,
@@ -440,6 +461,7 @@ impl CloudHvInstance {
             let new_state = Arc::new(SharedVmState {
                 agent: OnceCell::new(),
                 vsock_socket: acquired.vsock_socket.clone(),
+                ch_pid: acquired.ch_pid,
                 container_count: AtomicUsize::new(vm_state.container_count.load(Ordering::SeqCst)),
                 tap_name: vm_state.tap_name.clone(),
                 tap_mac: vm_state.tap_mac.clone(),
@@ -492,21 +514,41 @@ impl CloudHvInstance {
             )
         };
 
-        // Set up exit watcher
-        if !from_snapshot {
-            let agent = get_or_connect_agent(&active_state).await?;
+        // Set up exit watcher — races agent WaitContainer against CH process death.
+        // When either fires, the container is gone.
+        {
             let exit = self.exit.clone();
             let cid = container_id.to_string();
-            tokio::spawn(async move {
-                let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
-                wait_req.container_id = cid.clone();
-                let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(86400));
-                let exit_code = match agent.wait_container(ctx, &wait_req).await {
-                    Ok(resp) => resp.exit_status,
-                    Err(_) => 137,
-                };
-                let _ = exit.set((exit_code, Utc::now()));
-            });
+            let ch_pid = active_state.ch_pid;
+
+            if from_snapshot {
+                // Warm restore — no RunContainer was called, just watch CH PID
+                tokio::spawn(async move {
+                    wait_for_pid_exit(ch_pid).await;
+                    let _ = exit.set((137, Utc::now()));
+                });
+            } else {
+                // Cold path — race agent WaitContainer vs CH PID death
+                let agent = get_or_connect_agent(&active_state).await?;
+                tokio::spawn(async move {
+                    let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
+                    wait_req.container_id = cid.clone();
+                    let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(86400));
+
+                    tokio::select! {
+                        result = agent.wait_container(ctx, &wait_req) => {
+                            let exit_code = match result {
+                                Ok(resp) => resp.exit_status,
+                                Err(_) => 137,
+                            };
+                            let _ = exit.set((exit_code, Utc::now()));
+                        }
+                        _ = wait_for_pid_exit(ch_pid) => {
+                            let _ = exit.set((137, Utc::now()));
+                        }
+                    }
+                });
+            }
         }
 
         active_state.container_count.fetch_add(1, Ordering::SeqCst);
@@ -533,6 +575,17 @@ impl CloudHvInstance {
 struct SandboxSpec {
     netns: Option<String>,
     cgroups_path: Option<String>,
+}
+
+/// Poll /proc/{pid} until the process exits.
+async fn wait_for_pid_exit(pid: u32) {
+    let proc_path = format!("/proc/{pid}");
+    loop {
+        if !std::path::Path::new(&proc_path).exists() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 fn parse_sandbox_spec(spec_path: &std::path::Path) -> SandboxSpec {
