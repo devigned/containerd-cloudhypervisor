@@ -129,7 +129,18 @@ async fn handle_acquire(
         .unwrap_or("");
 
     // Check for warm workload snapshot
-    if !image_key.is_empty() && snapshots.has_snapshot(image_key).await {
+    if !image_key.is_empty()
+        && snapshots
+            .has_snapshot(
+                image_key,
+                if erofs_path.is_empty() {
+                    None
+                } else {
+                    Some(erofs_path)
+                },
+            )
+            .await
+    {
         let vm_id = format!("warm-{}-{}", image_key, std::process::id());
         let state_dir = std::path::PathBuf::from("/run/cloudhv/daemon").join(&vm_id);
         if let Err(e) = std::fs::create_dir_all(&state_dir) {

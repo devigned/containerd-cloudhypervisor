@@ -59,6 +59,11 @@ pub struct DaemonConfig {
     /// Warmup duration in seconds for shadow VMs before snapshotting.
     #[serde(default = "default_warmup_secs")]
     pub warmup_duration_secs: u64,
+
+    /// Maximum number of cached workload snapshots.
+    /// Oldest (LRU) snapshots are evicted when this limit is reached.
+    #[serde(default = "default_max_snapshots")]
+    pub max_snapshots: usize,
 }
 
 fn default_pool_size() -> usize {
@@ -93,6 +98,9 @@ fn default_state_dir() -> String {
 }
 fn default_warmup_secs() -> u64 {
     30
+}
+fn default_max_snapshots() -> usize {
+    20
 }
 
 impl DaemonConfig {

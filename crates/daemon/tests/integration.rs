@@ -253,7 +253,11 @@ fn test_shadow_snapshot_creation() {
     let status = rpc("Status", &serde_json::json!({}));
     let keys: Vec<String> = status["snapshot_keys"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     assert!(
         !keys.contains(&image_key.to_string()),
@@ -278,7 +282,10 @@ fn test_shadow_snapshot_creation() {
         false,
         "first acquire should NOT be from snapshot"
     );
-    println!("First acquire: {}ms (from pool, shadow triggered)", acquire_ms);
+    println!(
+        "First acquire: {}ms (from pool, shadow triggered)",
+        acquire_ms
+    );
 
     let vm_id = resp["vm_id"].as_str().unwrap().to_string();
 
@@ -308,7 +315,11 @@ fn test_shadow_snapshot_creation() {
     let status = rpc("Status", &serde_json::json!({}));
     let keys: Vec<String> = status["snapshot_keys"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     println!("After shadow: snapshot_keys={:?}", keys);
 

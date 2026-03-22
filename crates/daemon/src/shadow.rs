@@ -23,34 +23,75 @@ use tokio::sync::Mutex;
 use crate::config::DaemonConfig;
 use crate::pool::Pool;
 
+/// Metadata for a cached workload snapshot.
+struct SnapshotEntry {
+    /// Path to the snapshot directory.
+    dir: PathBuf,
+    /// Last time this snapshot was used (for LRU eviction).
+    last_used: std::time::Instant,
+    /// mtime of the erofs image when the snapshot was created.
+    erofs_mtime: Option<std::time::SystemTime>,
+}
+
 /// Manages workload snapshots created by shadow VMs.
 pub struct SnapshotManager {
     config: DaemonConfig,
     pool: Arc<Pool>,
-    /// Cached workload snapshots: image_key → snapshot directory
-    snapshots: Mutex<HashMap<String, PathBuf>>,
+    /// Cached workload snapshots: image_key → entry
+    snapshots: Mutex<HashMap<String, SnapshotEntry>>,
     /// Shadow VMs currently running (image_key → task handle)
     active_shadows: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Maximum number of cached snapshots.
+    max_snapshots: usize,
 }
 
 impl SnapshotManager {
     pub fn new(config: DaemonConfig, pool: Arc<Pool>) -> Arc<Self> {
+        let max = config.max_snapshots;
         Arc::new(Self {
             config,
             pool,
             snapshots: Mutex::new(HashMap::new()),
             active_shadows: Mutex::new(HashMap::new()),
+            max_snapshots: max,
         })
     }
 
-    /// Check if a workload snapshot exists for the given image key.
-    pub async fn has_snapshot(&self, image_key: &str) -> bool {
-        self.snapshots.lock().await.contains_key(image_key)
+    /// Check if a valid workload snapshot exists for the given image key.
+    /// Invalidates the snapshot if the erofs image has been modified since
+    /// the snapshot was created (e.g. image upgrade).
+    pub async fn has_snapshot(&self, image_key: &str, erofs_path: Option<&str>) -> bool {
+        let mut snapshots = self.snapshots.lock().await;
+        if let Some(entry) = snapshots.get(image_key) {
+            // Validate erofs mtime — if the image changed, snapshot is stale
+            if let (Some(erofs), Some(snap_mtime)) = (erofs_path, entry.erofs_mtime) {
+                if let Ok(meta) = std::fs::metadata(erofs) {
+                    if let Ok(current_mtime) = meta.modified() {
+                        if current_mtime != snap_mtime {
+                            info!("snapshot {} invalidated: erofs mtime changed", image_key);
+                            let dir = entry.dir.clone();
+                            snapshots.remove(image_key);
+                            let _ = std::fs::remove_dir_all(&dir);
+                            return false;
+                        }
+                    }
+                }
+            }
+            true
+        } else {
+            false
+        }
     }
 
-    /// Get the snapshot directory for an image key.
+    /// Get the snapshot directory and update last-used time.
     pub async fn get_snapshot_dir(&self, image_key: &str) -> Option<PathBuf> {
-        self.snapshots.lock().await.get(image_key).cloned()
+        let mut snapshots = self.snapshots.lock().await;
+        if let Some(entry) = snapshots.get_mut(image_key) {
+            entry.last_used = std::time::Instant::now();
+            Some(entry.dir.clone())
+        } else {
+            None
+        }
     }
 
     /// Restore a VM from a workload snapshot. Returns the VM details.
@@ -91,8 +132,8 @@ impl SnapshotManager {
     /// Trigger shadow VM creation for an image key.
     /// Does nothing if a shadow is already running or a snapshot exists.
     pub async fn trigger_shadow(self: &Arc<Self>, image_key: &str, erofs_path: &str) {
-        // Skip if snapshot already exists
-        if self.has_snapshot(image_key).await {
+        // Skip if snapshot already exists and is valid
+        if self.has_snapshot(image_key, Some(erofs_path)).await {
             return;
         }
 
@@ -203,11 +244,40 @@ impl SnapshotManager {
         // Strip kernel ip= from snapshot (networking is per-pod)
         strip_kernel_ip(&snap_dir)?;
 
-        // 6. Cache the snapshot
-        self.snapshots
-            .lock()
-            .await
-            .insert(image_key.to_string(), snap_dir);
+        // 6. Cache the snapshot with metadata
+        let erofs_mtime = std::fs::metadata(erofs_path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+
+        {
+            let mut snapshots = self.snapshots.lock().await;
+
+            // LRU eviction if at capacity
+            while snapshots.len() >= self.max_snapshots {
+                // Find the least recently used entry
+                let lru_key = snapshots
+                    .iter()
+                    .min_by_key(|(_, e)| e.last_used)
+                    .map(|(k, _)| k.clone());
+                if let Some(key) = lru_key {
+                    if let Some(entry) = snapshots.remove(&key) {
+                        info!("evicting LRU snapshot: {}", key);
+                        let _ = std::fs::remove_dir_all(&entry.dir);
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            snapshots.insert(
+                image_key.to_string(),
+                SnapshotEntry {
+                    dir: snap_dir,
+                    last_used: std::time::Instant::now(),
+                    erofs_mtime,
+                },
+            );
+        }
 
         // 7. Destroy the shadow VM
         self.pool.release(&pool_vm.vm_id).await?;
