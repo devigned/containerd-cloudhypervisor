@@ -13,7 +13,6 @@ use containerd_shimkit::sandbox::instance::{Instance, InstanceConfig};
 use containerd_shimkit::sandbox::sync::WaitableCell;
 use containerd_shimkit::sandbox::Error;
 use log::info;
-use tokio::sync::OnceCell;
 
 use crate::config::load_config;
 use crate::daemon_client::{AcquireRequest, DaemonClient};
@@ -59,10 +58,6 @@ fn get_vm(sandbox_id: &str) -> Option<Arc<SharedVmState>> {
 // ---------------------------------------------------------------------------
 
 struct SharedVmState {
-    /// Agent ttrpc client (connected after daemon acquire).
-    agent: OnceCell<cloudhv_proto::AgentServiceClient>,
-    /// vsock proxy socket path (from daemon).
-    vsock_socket: PathBuf,
     /// Cloud Hypervisor process PID (for exit watching + cgroup placement).
     ch_pid: u32,
     /// Container count (sandbox counts as 1).
@@ -78,61 +73,6 @@ struct SharedVmState {
     daemon_vm_id: String,
     /// Daemon socket path.
     daemon_socket: String,
-}
-
-/// Connect to the guest agent over vsock.
-async fn get_or_connect_agent(
-    vm_state: &SharedVmState,
-) -> Result<cloudhv_proto::AgentServiceClient, Error> {
-    vm_state
-        .agent
-        .get_or_try_init(|| async {
-            let vsock_client = crate::vsock::VsockClient::new(&vm_state.vsock_socket);
-
-            // Tight-poll for first 500ms (fast for warm-restored VMs
-            // where the agent is already running)
-            let tight_poll_deadline =
-                tokio::time::Instant::now() + std::time::Duration::from_millis(500);
-            while tokio::time::Instant::now() < tight_poll_deadline {
-                match vsock_client.connect_ttrpc().await {
-                    Ok((agent, _health)) => return Ok(agent),
-                    Err(_) => tokio::task::yield_now().await,
-                }
-            }
-
-            // Fixed 100ms retry for next 5s (vsock proxy may need time)
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-            let mut last_err = String::new();
-            while tokio::time::Instant::now() < deadline {
-                match vsock_client.connect_ttrpc().await {
-                    Ok((agent, _health)) => return Ok(agent),
-                    Err(e) => {
-                        last_err = format!("{e:#}");
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                }
-            }
-
-            // Last resort: longer backoff for cold boot
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25);
-            for attempt in 0..8u32 {
-                if tokio::time::Instant::now() >= deadline {
-                    break;
-                }
-                match vsock_client.connect_ttrpc().await {
-                    Ok((agent, _health)) => return Ok(agent),
-                    Err(e) => {
-                        last_err = format!("{e:#}");
-                        let delay = (500u64 * 2u64.pow(attempt)).min(3000);
-                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                    }
-                }
-            }
-
-            Err(Error::Any(anyhow::anyhow!("agent connect: {last_err}")))
-        })
-        .await
-        .cloned()
 }
 
 // ---------------------------------------------------------------------------
@@ -186,40 +126,72 @@ impl Instance for CloudHvInstance {
     }
 
     async fn kill(&self, signal: u32) -> Result<(), Error> {
-        info!("CloudHvInstance::kill id={} signal={}", self.id, signal);
+        let t0 = std::time::Instant::now();
+        let is_sandbox = self.id == self.sandbox_id;
+        info!(
+            "TIMING kill_enter {} @{} signal={} is_sandbox={}",
+            self.id,
+            epoch_ms(),
+            signal,
+            is_sandbox
+        );
 
         if let Some(vm_state) = get_vm(&self.sandbox_id) {
-            if let Ok(agent) = get_or_connect_agent(&vm_state).await {
-                let mut req = cloudhv_proto::KillContainerRequest::new();
-                req.container_id = self.id.clone();
-                req.signal = signal;
-                let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(5));
-                let _ = agent.kill_container(ctx, &req).await;
-            }
-        }
+            if is_sandbox && (signal == 9 || signal == 15) {
+                let t_release = std::time::Instant::now();
 
-        // For sandbox containers: set exit after a brief wait for the CH process
-        // to die. Sandbox containers have no RunContainer and thus no agent-based
-        // exit watcher. App containers rely on the PID watcher spawned in
-        // start_container.
-        let is_sandbox = self.id == self.sandbox_id;
-        if is_sandbox && (signal == 9 || signal == 15) {
-            let exit = self.exit.clone();
-            if let Some(vm_state) = get_vm(&self.sandbox_id) {
-                let ch_pid = vm_state.ch_pid;
-                if ch_pid > 0 {
-                    // Watch CH PID — when daemon destroys the VM, this fires
-                    tokio::spawn(async move {
-                        wait_for_pid_exit(ch_pid).await;
-                        let _ = exit.set((137, Utc::now()));
-                    });
-                } else {
-                    // No VM acquired yet — set exit immediately
-                    let _ = exit.set((0, Utc::now()));
+                // Release VM to daemon (if one was acquired)
+                if !vm_state.daemon_vm_id.is_empty() {
+                    let client = DaemonClient::new(&vm_state.daemon_socket);
+                    if let Err(e) = client.release_sandbox(&vm_state.daemon_vm_id).await {
+                        info!("daemon release failed (non-fatal): {e:#}");
+                    }
                 }
+
+                // Always clean up TAP and remove from VMS, even if no VM
+                // was acquired or release failed — prevents leaked resources
+                let t_tap = std::time::Instant::now();
+                if let (Some(ref netns), Some(ref tap)) = (&vm_state.netns, &vm_state.tap_name) {
+                    crate::netns::cleanup_tap(netns, tap).await;
+                }
+                let tap_ms = t_tap.elapsed().as_millis();
+
+                VMS.write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&self.sandbox_id);
+
+                info!(
+                    "TIMING kill_sandbox {} @{}: release={}ms tap={}ms total={}ms",
+                    self.id,
+                    epoch_ms(),
+                    t_release.elapsed().as_millis(),
+                    tap_ms,
+                    t0.elapsed().as_millis()
+                );
+                let _ = self.exit.set((0, Utc::now()));
             } else {
-                let _ = exit.set((0, Utc::now()));
+                // App container signal — proxy through daemon
+                let t_rpc = std::time::Instant::now();
+                let client = DaemonClient::new(&vm_state.daemon_socket);
+                let _ = client
+                    .kill_container(&vm_state.daemon_vm_id, &self.id, signal)
+                    .await;
+                info!(
+                    "TIMING kill_container {} @{}: rpc={}ms total={}ms",
+                    self.id,
+                    epoch_ms(),
+                    t_rpc.elapsed().as_millis(),
+                    t0.elapsed().as_millis()
+                );
             }
+        } else {
+            let _ = self.exit.set((0, Utc::now()));
+            info!(
+                "TIMING kill_no_vm {} @{}: total={}ms",
+                self.id,
+                epoch_ms(),
+                t0.elapsed().as_millis()
+            );
         }
 
         Ok(())
@@ -235,7 +207,7 @@ impl Instance for CloudHvInstance {
             if prev <= 1 {
                 // Last container — release VM to daemon
                 let client = DaemonClient::new(&vm_state.daemon_socket);
-                if let Err(e) = client.release_sandbox(&vm_state.daemon_vm_id) {
+                if let Err(e) = client.release_sandbox(&vm_state.daemon_vm_id).await {
                     info!("daemon release failed (non-fatal): {e:#}");
                 }
 
@@ -256,13 +228,11 @@ impl Instance for CloudHvInstance {
                     t_total.elapsed().as_millis()
                 );
             } else {
-                // Container delete — just notify agent
-                if let Ok(agent) = get_or_connect_agent(&vm_state).await {
-                    let mut req = cloudhv_proto::DeleteContainerRequest::new();
-                    req.container_id = self.id.clone();
-                    let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(5));
-                    let _ = agent.delete_container(ctx, &req).await;
-                }
+                // Container delete — proxy through daemon
+                let client = DaemonClient::new(&vm_state.daemon_socket);
+                let _ = client
+                    .delete_container(&vm_state.daemon_vm_id, &self.id)
+                    .await;
 
                 info!(
                     "TIMING delete {} @{}: total={}ms (container only, {} remaining)",
@@ -279,7 +249,19 @@ impl Instance for CloudHvInstance {
     }
 
     async fn wait(&self) -> (u32, DateTime<Utc>) {
-        *self.exit.wait().await
+        let t0 = std::time::Instant::now();
+        info!("TIMING wait_enter {} @{}", self.id, epoch_ms());
+        {
+            let result = *self.exit.wait().await;
+            info!(
+                "TIMING wait_done {} @{}: took={}ms exit_code={}",
+                self.id,
+                epoch_ms(),
+                t0.elapsed().as_millis(),
+                result.0
+            );
+            result
+        }
     }
 }
 
@@ -346,8 +328,6 @@ impl CloudHvInstance {
 
         // Store sandbox state — no VM yet (daemon provides it in start_container)
         let vm_state = Arc::new(SharedVmState {
-            agent: OnceCell::new(),
-            vsock_socket: PathBuf::new(),
             ch_pid: 0,
             container_count: AtomicUsize::new(1),
             tap_name,
@@ -445,6 +425,7 @@ impl CloudHvInstance {
                     container_id,
                     &config_json,
                 )
+                .await
                 .ctx("daemon add_container")?;
             let acq_ms = t_acquire.elapsed().as_millis();
             (vm_state.clone(), false, acq_ms, resp)
@@ -463,6 +444,7 @@ impl CloudHvInstance {
                     container_id,
                     config_json: &config_json,
                 })
+                .await
                 .ctx("daemon acquire")?;
             let acq_ms = t_acquire.elapsed().as_millis();
 
@@ -477,8 +459,6 @@ impl CloudHvInstance {
 
             // Update shared state with daemon's VM info
             let new_state = Arc::new(SharedVmState {
-                agent: OnceCell::new(),
-                vsock_socket: acquired.vsock_socket.clone(),
                 ch_pid: acquired.ch_pid,
                 container_count: AtomicUsize::new(vm_state.container_count.load(Ordering::SeqCst)),
                 tap_name: vm_state.tap_name.clone(),
@@ -495,34 +475,18 @@ impl CloudHvInstance {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(self.sandbox_id.clone(), new_state.clone());
 
-            // Place CH in pod cgroup
+            // Place CH in the sandbox's cgroup. The sandbox cgroup is created
+            // by containerd before start_sandbox, so it should exist. We place
+            // CH there so containerd can track the VM process for resource
+            // accounting and lifecycle management.
             if let Some(ref cg) = new_state.cgroups_path {
-                if let Err(e) = place_in_pod_cgroup(acquired.ch_pid, cg) {
-                    info!("cgroup placement failed (non-fatal): {e}");
+                match place_in_pod_cgroup(acquired.ch_pid, cg) {
+                    Ok(()) => info!("CH pid {} placed in cgroup {}", acquired.ch_pid, cg),
+                    Err(e) => info!("cgroup placement failed (non-fatal): {e}"),
                 }
             }
 
-            // Configure network on warm restore
-            if acquired.from_snapshot {
-                let agent = get_or_connect_agent(&new_state).await?;
-                if let (Some(ref ip_cidr), Some(ref gw)) = (&new_state.ip_cidr, &new_state.gateway)
-                {
-                    let parts: Vec<&str> = ip_cidr.split('/').collect();
-                    let ip = parts[0];
-                    let prefix: u32 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(24);
-                    let mut req = cloudhv_proto::ConfigureNetworkRequest::new();
-                    req.ip_address = ip.to_string();
-                    req.gateway = gw.clone();
-                    req.prefix_len = prefix;
-                    req.device = "eth0".to_string();
-                    let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
-                    agent
-                        .configure_network(ctx, &req)
-                        .await
-                        .ctx("configure network after warm restore")?;
-                    info!("guest network configured: ip={ip}/{prefix} gw={gw}");
-                }
-            }
+            // Network configuration for warm restore is handled by the daemon
 
             (
                 new_state,
@@ -532,41 +496,36 @@ impl CloudHvInstance {
             )
         };
 
-        // Set up exit watcher — races agent WaitContainer against CH process death.
-        // When either fires, the container is gone.
+        // Set up exit watcher — daemon proxies WaitContainer, CH PID as backup
         {
             let exit = self.exit.clone();
             let cid = container_id.to_string();
             let ch_pid = active_state.ch_pid;
+            let daemon_socket = active_state.daemon_socket.clone();
+            let daemon_vm_id = active_state.daemon_vm_id.clone();
 
-            if from_snapshot {
-                // Warm restore — no RunContainer was called, just watch CH PID
-                tokio::spawn(async move {
-                    wait_for_pid_exit(ch_pid).await;
-                    let _ = exit.set((137, Utc::now()));
-                });
-            } else {
-                // Cold path — race agent WaitContainer vs CH PID death
-                let agent = get_or_connect_agent(&active_state).await?;
-                tokio::spawn(async move {
-                    let mut wait_req = cloudhv_proto::WaitContainerRequest::new();
-                    wait_req.container_id = cid.clone();
-                    let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(86400));
+            tokio::spawn(async move {
+                let t0 = std::time::Instant::now();
+                let client = DaemonClient::new(&daemon_socket);
 
-                    tokio::select! {
-                        result = agent.wait_container(ctx, &wait_req) => {
-                            let exit_code = match result {
-                                Ok(resp) => resp.exit_status,
-                                Err(_) => 137,
-                            };
-                            let _ = exit.set((exit_code, Utc::now()));
-                        }
-                        _ = wait_for_pid_exit(ch_pid) => {
-                            let _ = exit.set((137, Utc::now()));
-                        }
+                tokio::select! {
+                    result = client.wait_container(&daemon_vm_id, &cid) => {
+                        let (exit_code, _) = result.unwrap_or((137, String::new()));
+                        let _ = exit.set((exit_code, Utc::now()));
+                        log::info!(
+                            "TIMING exit_watcher {} @{}: daemon_wait code={} took={}ms",
+                            cid, epoch_ms(), exit_code, t0.elapsed().as_millis()
+                        );
                     }
-                });
-            }
+                    _ = wait_for_pid_exit(ch_pid) => {
+                        let _ = exit.set((137, Utc::now()));
+                        log::info!(
+                            "TIMING exit_watcher {} @{}: ch_pid_exit took={}ms",
+                            cid, epoch_ms(), t0.elapsed().as_millis()
+                        );
+                    }
+                }
+            });
         }
 
         active_state.container_count.fetch_add(1, Ordering::SeqCst);
@@ -750,26 +709,70 @@ pub fn stable_hash_hex(input: &str) -> String {
     format!("{hash:032x}")
 }
 
-/// Place a process in a pod cgroup.
+/// Place a process in a pod cgroup. Supports cgroup v2 (unified) with both
+/// direct paths (/k8s.io/<id>) and systemd-style paths
+/// (kubepods-burstable-pod<uid>.slice:cri-containerd:<id>).
 fn place_in_pod_cgroup(pid: u32, cgroups_path: &str) -> Result<(), String> {
     let cgroup_base = "/sys/fs/cgroup";
+
+    // Direct v2 path (e.g. /k8s.io/<id>)
     let full_path = format!("{cgroup_base}/{cgroups_path}/cgroup.procs");
     if std::path::Path::new(&full_path).exists() {
         std::fs::write(&full_path, pid.to_string()).map_err(|e| format!("{e}"))?;
         return Ok(());
     }
 
-    // Try systemd-style path
+    // Systemd cgroup v2: slice:scope_prefix:id
+    // e.g. kubepods-burstable-pod<uid>.slice:cri-containerd:<id>
+    // maps to: /sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/
+    //          kubepods-burstable-pod<uid>.slice/cri-containerd-<id>.scope
     let parts: Vec<&str> = cgroups_path.split(':').collect();
     if parts.len() == 3 {
-        let path = format!("{cgroup_base}/{}/{}/cgroup.procs", parts[1], parts[2]);
-        if std::path::Path::new(&path).exists() {
-            std::fs::write(&path, pid.to_string()).map_err(|e| format!("{e}"))?;
-            return Ok(());
+        let slice = parts[0]; // kubepods-burstable-pod<uid>.slice
+        let prefix = parts[1]; // cri-containerd
+        let id = parts[2]; // container id
+
+        // Build the systemd cgroup hierarchy from the slice name
+        // kubepods-burstable-pod<uid>.slice → kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod<uid>.slice
+        let hierarchy = build_systemd_cgroup_path(slice);
+        let scope = format!("{prefix}-{id}.scope");
+
+        let path = format!("{cgroup_base}/{hierarchy}/{scope}");
+        let procs_path = format!("{path}/cgroup.procs");
+
+        // Create the cgroup scope if it doesn't exist. Containerd creates
+        // scopes for standard runtimes, but our shim manages CH externally
+        // so we need to create the scope ourselves.
+        if !std::path::Path::new(&procs_path).exists() {
+            std::fs::create_dir_all(&path).map_err(|e| format!("create cgroup {path}: {e}"))?;
         }
+
+        std::fs::write(&procs_path, pid.to_string())
+            .map_err(|e| format!("write to {procs_path}: {e}"))?;
+        return Ok(());
     }
 
     Err(format!(
-        "no cgroup found for path {cgroups_path} (tried v2, v2-systemd)"
+        "no cgroup found for path {cgroups_path} (tried v2 direct, systemd v2)"
     ))
+}
+
+/// Build the systemd cgroup hierarchy from a leaf slice name.
+/// e.g. "kubepods-burstable-pod<uid>.slice"
+///    → "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod<uid>.slice"
+fn build_systemd_cgroup_path(slice: &str) -> String {
+    let name = slice.strip_suffix(".slice").unwrap_or(slice);
+    let mut parts = Vec::new();
+    let mut prefix = String::new();
+
+    for segment in name.split('-') {
+        if prefix.is_empty() {
+            prefix = segment.to_string();
+        } else {
+            prefix = format!("{prefix}-{segment}");
+        }
+        parts.push(format!("{prefix}.slice"));
+    }
+
+    parts.join("/")
 }

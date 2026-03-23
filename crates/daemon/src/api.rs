@@ -1,13 +1,18 @@
 //! ttrpc API server for the sandbox daemon.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use log::{info, warn};
+use tokio::sync::Mutex;
 
 use crate::config::DaemonConfig;
 use crate::pool::Pool;
 use crate::shadow::SnapshotManager;
+
+/// Per-VM agent connection, stored after first container start.
+type AgentRegistry = Arc<Mutex<HashMap<String, cloudhv_proto::AgentServiceClient>>>;
 
 /// The daemon API server. Listens on a Unix socket and serves
 /// AcquireSandbox, ReleaseSandbox, and Status RPCs.
@@ -15,6 +20,7 @@ pub struct ApiServer {
     config: DaemonConfig,
     pool: Arc<Pool>,
     snapshots: Arc<SnapshotManager>,
+    agents: AgentRegistry,
 }
 
 impl ApiServer {
@@ -23,6 +29,7 @@ impl ApiServer {
             config,
             pool,
             snapshots,
+            agents: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -40,8 +47,6 @@ impl ApiServer {
 
         info!("daemon API listening on {}", socket_path);
 
-        // For now, use a simple JSON-over-Unix-socket protocol.
-        // This will be replaced with ttrpc once the proto codegen is wired up.
         let listener = tokio::net::UnixListener::bind(socket_path)?;
 
         loop {
@@ -49,8 +54,10 @@ impl ApiServer {
             let pool = Arc::clone(&self.pool);
             let snapshots = Arc::clone(&self.snapshots);
             let config = self.config.clone();
+            let agents = Arc::clone(&self.agents);
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, &pool, &snapshots, &config).await {
+                if let Err(e) = handle_connection(stream, &pool, &snapshots, &config, &agents).await
+                {
                     log::warn!("client error: {:#}", e);
                 }
             });
@@ -65,10 +72,9 @@ async fn handle_connection(
     pool: &Arc<Pool>,
     snapshots: &Arc<SnapshotManager>,
     config: &DaemonConfig,
+    agents: &AgentRegistry,
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-    log::info!("client connected");
 
     let (reader, mut writer) = stream.into_split();
     let mut buf_reader = BufReader::new(reader);
@@ -78,24 +84,23 @@ async fn handle_connection(
         let request: serde_json::Value = serde_json::from_str(line.trim())?;
         let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
 
-        log::info!(
-            "request: method={} image_key={} container_id={}",
+        log::debug!(
+            "request: method={} vm_id={} container_id={}",
             method,
-            request
-                .get("image_key")
-                .and_then(|v| v.as_str())
-                .unwrap_or("-"),
+            request.get("vm_id").and_then(|v| v.as_str()).unwrap_or("-"),
             request
                 .get("container_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("-")
         );
-        log::debug!("request payload: {}", line.trim());
 
         let response = match method {
-            "AcquireSandbox" => handle_acquire(pool, snapshots, config, &request).await,
-            "ReleaseSandbox" => handle_release(pool, &request).await,
-            "AddContainer" => handle_add_container(pool, &request).await,
+            "AcquireSandbox" => handle_acquire(pool, snapshots, config, agents, &request).await,
+            "ReleaseSandbox" => handle_release(pool, agents, &request).await,
+            "AddContainer" => handle_add_container(pool, agents, &request).await,
+            "KillContainer" => handle_kill_container(agents, &request).await,
+            "WaitContainer" => handle_wait_container(agents, &request).await,
+            "DeleteContainer" => handle_delete_container(agents, &request).await,
             "Status" => handle_status(pool, snapshots).await,
             _ => serde_json::json!({"error": format!("unknown method: {}", method)}),
         };
@@ -115,6 +120,7 @@ async fn handle_acquire(
     pool: &Arc<Pool>,
     snapshots: &Arc<SnapshotManager>,
     config: &DaemonConfig,
+    agents: &AgentRegistry,
     request: &serde_json::Value,
 ) -> serde_json::Value {
     let tap_name = request
@@ -198,6 +204,37 @@ async fn handle_acquire(
                     info!("TAP {} hot-plugged into warm VM {}", tap_name, vm_id);
                 }
 
+                // Connect agent and configure network for warm restore
+                let ip_cidr = _ip_cidr;
+                let gateway = _gateway;
+                if !ip_cidr.is_empty() && !gateway.is_empty() {
+                    match crate::vm_lifecycle::connect_agent(&vsock_socket).await {
+                        Ok((agent, _health)) => {
+                            agents.lock().await.insert(vm_id.clone(), agent.clone());
+
+                            let parts: Vec<&str> = ip_cidr.split('/').collect();
+                            let ip = parts[0];
+                            let prefix: u32 =
+                                parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(24);
+                            let mut net_req = cloudhv_proto::ConfigureNetworkRequest::new();
+                            net_req.ip_address = ip.to_string();
+                            net_req.gateway = gateway.to_string();
+                            net_req.prefix_len = prefix;
+                            net_req.device = "eth0".to_string();
+                            let ctx =
+                                ttrpc::context::with_duration(std::time::Duration::from_secs(30));
+                            if let Err(e) = agent.configure_network(ctx, &net_req).await {
+                                warn!("configure_network failed on warm restore: {e:#}");
+                            } else {
+                                info!("guest network configured: ip={ip}/{prefix} gw={gateway}");
+                            }
+                        }
+                        Err(e) => {
+                            warn!("agent connect failed on warm restore: {e:#}");
+                        }
+                    }
+                }
+
                 // Register as active so release() works correctly
                 pool.register_active(crate::pool::PoolVm {
                     vm_id: vm_id.clone(),
@@ -245,6 +282,8 @@ async fn handle_acquire(
                 match run_container_in_vm(
                     &vm.api_socket,
                     &vm.vsock_socket,
+                    &vm.vm_id,
+                    agents,
                     tap_name,
                     tap_mac,
                     erofs_path,
@@ -280,9 +319,12 @@ async fn handle_acquire(
 
 /// Hot-plug an erofs rootfs and run a container via the guest agent.
 /// If `tap_name` and `tap_mac` are provided, hot-plugs a TAP NIC first.
+#[allow(clippy::too_many_arguments)]
 async fn run_container_in_vm(
     api_socket: &std::path::Path,
     vsock_socket: &std::path::Path,
+    vm_id: &str,
+    agents: &AgentRegistry,
     tap_name: &str,
     tap_mac: &str,
     erofs_path: &str,
@@ -325,10 +367,19 @@ async fn run_container_in_vm(
     .await
     .context("hot-plug rootfs")?;
 
-    // Connect to agent
-    let (agent, _health) = vm_lifecycle::connect_agent(vsock_socket)
-        .await
-        .context("agent connect for container")?;
+    // Connect to agent (or reuse existing connection)
+    let agent = {
+        let existing = agents.lock().await.get(vm_id).cloned();
+        if let Some(a) = existing {
+            a
+        } else {
+            let (a, _health) = vm_lifecycle::connect_agent(vsock_socket)
+                .await
+                .context("agent connect for container")?;
+            agents.lock().await.insert(vm_id.to_string(), a.clone());
+            a
+        }
+    };
 
     // Decode OCI config
     use base64::Engine;
@@ -360,7 +411,11 @@ async fn run_container_in_vm(
     Ok(resp.pid)
 }
 
-async fn handle_add_container(pool: &Arc<Pool>, request: &serde_json::Value) -> serde_json::Value {
+async fn handle_add_container(
+    pool: &Arc<Pool>,
+    agents: &AgentRegistry,
+    request: &serde_json::Value,
+) -> serde_json::Value {
     let vm_id = request.get("vm_id").and_then(|v| v.as_str()).unwrap_or("");
     let erofs_path = request
         .get("erofs_path")
@@ -389,6 +444,8 @@ async fn handle_add_container(pool: &Arc<Pool>, request: &serde_json::Value) -> 
     match run_container_in_vm(
         &vm.api_socket,
         &vm.vsock_socket,
+        vm_id,
+        agents,
         "", // no TAP hot-plug for additional containers
         "",
         erofs_path,
@@ -402,17 +459,106 @@ async fn handle_add_container(pool: &Arc<Pool>, request: &serde_json::Value) -> 
     }
 }
 
-async fn handle_release(pool: &Arc<Pool>, request: &serde_json::Value) -> serde_json::Value {
+async fn handle_release(
+    pool: &Arc<Pool>,
+    agents: &AgentRegistry,
+    request: &serde_json::Value,
+) -> serde_json::Value {
     let vm_id = request.get("vm_id").and_then(|v| v.as_str()).unwrap_or("");
 
     if vm_id.is_empty() {
         return serde_json::json!({"error": "vm_id required"});
     }
 
+    // Remove agent connection for this VM
+    agents.lock().await.remove(vm_id);
+
     match pool.release(vm_id).await {
         Ok(()) => serde_json::json!({"ok": true}),
         Err(e) => serde_json::json!({"error": format!("release failed: {:#}", e)}),
     }
+}
+
+async fn handle_kill_container(
+    agents: &AgentRegistry,
+    request: &serde_json::Value,
+) -> serde_json::Value {
+    let vm_id = request.get("vm_id").and_then(|v| v.as_str()).unwrap_or("");
+    let container_id = request
+        .get("container_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let signal = request.get("signal").and_then(|v| v.as_u64()).unwrap_or(15) as u32;
+
+    let agent = match agents.lock().await.get(vm_id).cloned() {
+        Some(a) => a,
+        None => return serde_json::json!({"error": format!("no agent for VM {vm_id}")}),
+    };
+
+    let mut req = cloudhv_proto::KillContainerRequest::new();
+    req.container_id = container_id.to_string();
+    req.signal = signal;
+    let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(5));
+
+    match agent.kill_container(ctx, &req).await {
+        Ok(_) => serde_json::json!({"ok": true}),
+        Err(e) => serde_json::json!({"error": format!("kill_container: {e}")}),
+    }
+}
+
+async fn handle_wait_container(
+    agents: &AgentRegistry,
+    request: &serde_json::Value,
+) -> serde_json::Value {
+    let vm_id = request.get("vm_id").and_then(|v| v.as_str()).unwrap_or("");
+    let container_id = request
+        .get("container_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let agent = match agents.lock().await.get(vm_id).cloned() {
+        Some(a) => a,
+        None => return serde_json::json!({"error": format!("no agent for VM {vm_id}")}),
+    };
+
+    let mut req = cloudhv_proto::WaitContainerRequest::new();
+    req.container_id = container_id.to_string();
+    let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(86400));
+
+    match agent.wait_container(ctx, &req).await {
+        Ok(resp) => serde_json::json!({
+            "exit_status": resp.exit_status,
+            "exited_at": resp.exited_at,
+        }),
+        Err(e) => serde_json::json!({
+            "exit_status": 137,
+            "exited_at": "",
+            "error": format!("wait_container: {e}"),
+        }),
+    }
+}
+
+async fn handle_delete_container(
+    agents: &AgentRegistry,
+    request: &serde_json::Value,
+) -> serde_json::Value {
+    let vm_id = request.get("vm_id").and_then(|v| v.as_str()).unwrap_or("");
+    let container_id = request
+        .get("container_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let agent = match agents.lock().await.get(vm_id).cloned() {
+        Some(a) => a,
+        None => return serde_json::json!({"ok": true}), // VM already gone, nothing to delete
+    };
+
+    let mut req = cloudhv_proto::DeleteContainerRequest::new();
+    req.container_id = container_id.to_string();
+    let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(5));
+    let _ = agent.delete_container(ctx, &req).await;
+
+    serde_json::json!({"ok": true})
 }
 
 async fn handle_status(pool: &Arc<Pool>, snapshots: &Arc<SnapshotManager>) -> serde_json::Value {

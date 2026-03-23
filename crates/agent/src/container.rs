@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::os::unix::io::FromRawFd;
 use std::path::PathBuf;
 use std::process::Stdio;
 
@@ -531,17 +533,24 @@ impl ContainerManager {
             });
         }
 
-        // Wait for exit in background
+        // Wait for exit in background using pidfd for reliable PID 1 behavior.
+        // Tokio's SIGCHLD-based child.wait() is unreliable as PID 1 because
+        // signals can be lost in the init context. pidfd provides a file
+        // descriptor that becomes readable when the process exits — no signals.
         let container_id_owned = container_id.to_string();
+        let child_pid = pid;
         tokio::spawn(async move {
-            let status = child.wait().await;
-            let code = status.map(|s| s.code().unwrap_or(137)).unwrap_or(137);
+            let code = wait_for_exit_pidfd(child_pid, child).await;
             info!("container exited: id={} code={}", container_id_owned, code);
-            log_buf.lock().await.eof = true;
+
+            // Notify exit BEFORE locking log buffer to avoid blocking
+            // WaitContainer on log mutex contention.
             let _ = tx.send(Some(ExitStatus {
                 code,
                 exited_at: chrono::Utc::now().to_rfc3339(),
             }));
+
+            log_buf.lock().await.eof = true;
         });
 
         self.exit_receivers.insert(container_id.to_string(), rx);
@@ -610,6 +619,30 @@ impl ContainerManager {
         }
 
         Ok(())
+    }
+
+    /// Signal all running containers. Used during agent shutdown to ensure
+    /// the guest kernel can exit quickly without waiting for orphaned processes.
+    pub async fn signal_all(&self, signal: u32) {
+        let ids: Vec<String> = self
+            .containers
+            .iter()
+            .filter(|(_, c)| c.state != ContainerState::Stopped)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for id in &ids {
+            if let Err(e) = self.kill(id, signal).await {
+                info!("signal_all: failed to signal {id}: {e:#}");
+            }
+        }
+        if !ids.is_empty() {
+            info!(
+                "signal_all: sent signal {} to {} containers",
+                signal,
+                ids.len()
+            );
+        }
     }
 
     /// Delete a stopped container.
@@ -839,4 +872,50 @@ async fn wait_for_dev_inotify(dev_path: &str) -> Result<()> {
     .context("inotify task panicked")?;
 
     result
+}
+
+/// Wait for a process to exit using pidfd (Linux 5.3+).
+/// Falls back to tokio child.wait() if pidfd is unavailable.
+///
+/// pidfd is immune to the SIGCHLD delivery issues that affect
+/// tokio::process::Child::wait() when running as PID 1 (init).
+async fn wait_for_exit_pidfd(pid: u32, mut child: tokio::process::Child) -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        // Try pidfd_open
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as i32, 0) };
+        if fd >= 0 {
+            let fd = fd as std::os::unix::io::RawFd;
+            // SAFETY: fd is a valid pidfd from pidfd_open
+            let owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) };
+            match tokio::io::unix::AsyncFd::new(owned) {
+                Ok(async_fd) => {
+                    // Wait for the fd to become readable (process exited)
+                    let _ = async_fd.readable().await;
+                    // Reap the child to get exit code
+                    match child.try_wait() {
+                        Ok(Some(status)) => return status.code().unwrap_or(137),
+                        _ => {
+                            // pidfd signaled but try_wait failed; do blocking wait
+                            match child.wait().await {
+                                Ok(status) => return status.code().unwrap_or(137),
+                                Err(_) => return 137,
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("AsyncFd::new for pidfd failed: {e}, falling back to child.wait()");
+                }
+            }
+        } else {
+            warn!("pidfd_open failed for pid {pid}, falling back to child.wait()");
+        }
+    }
+
+    // Fallback: tokio SIGCHLD-based wait
+    match child.wait().await {
+        Ok(status) => status.code().unwrap_or(137),
+        Err(_) => 137,
+    }
 }

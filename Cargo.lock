@@ -471,7 +471,6 @@ dependencies = [
  "base64",
  "chrono",
  "cloudhv-common",
- "cloudhv-proto",
  "containerd-client 0.8.0",
  "containerd-shimkit",
  "criterion",
@@ -481,7 +480,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "ttrpc",
 ]
 
 [[package]]
@@ -498,7 +496,7 @@ dependencies = [
 [[package]]
 name = "containerd-shimkit"
 version = "0.1.1"
-source = "git+https://github.com/devigned/runwasi.git?branch=shimkit-ttrpc-0.10#40679f43d6909ca4111e1334f443a188b0c547eb"
+source = "git+https://github.com/devigned/runwasi.git?branch=shimkit-ttrpc-0.10#faee81b62728f235a28c81f6db71c4e7f6db1d4a"
 dependencies = [
  "anyhow",
  "caps",

@@ -487,6 +487,11 @@ impl AgentServer {
             _ = sigint.recv() => info!("received SIGINT, shutting down"),
         }
 
+        // Signal all running containers to exit cleanly before stopping
+        // the server. This ensures the guest kernel can shut down quickly
+        // without waiting for orphaned processes.
+        self.container_manager.lock().await.signal_all(15).await;
+
         server
             .shutdown()
             .await
