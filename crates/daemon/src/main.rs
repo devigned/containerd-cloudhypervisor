@@ -6,6 +6,7 @@ use log::info;
 
 mod api;
 mod config;
+mod netns;
 mod pool;
 pub mod shadow;
 mod vm_lifecycle;

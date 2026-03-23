@@ -123,20 +123,8 @@ async fn handle_acquire(
     agents: &AgentRegistry,
     request: &serde_json::Value,
 ) -> serde_json::Value {
-    let tap_name = request
-        .get("tap_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let tap_mac = request
-        .get("tap_mac")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let _ip_cidr = request
-        .get("ip_cidr")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let _gateway = request
-        .get("gateway")
+    let netns = request
+        .get("netns")
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let image_key = request
@@ -183,57 +171,37 @@ async fn handle_acquire(
             Ok((ch_pid, api_socket, vsock_socket)) => {
                 info!("warm restore for image_key={}", image_key);
 
-                // Hot-plug TAP NIC into the restored VM so networking works
-
-                if !tap_name.is_empty() && !tap_mac.is_empty() {
-                    let net_json = serde_json::json!({
-                        "tap": tap_name,
-                        "mac": tap_mac,
-                    });
-                    if let Err(e) = crate::vm_lifecycle::api_request_with_body(
-                        &api_socket,
-                        "PUT",
-                        "/api/v1/vm.add-net",
-                        &net_json.to_string(),
-                    )
-                    .await
-                    {
-                        warn!("TAP hot-plug failed on warm restore: {e:#}");
-                        return serde_json::json!({"error": format!("TAP hot-plug: {e:#}")});
-                    }
-                    info!("TAP {} hot-plugged into warm VM {}", tap_name, vm_id);
-                }
-
-                // Connect agent and configure network for warm restore
-                let ip_cidr = _ip_cidr;
-                let gateway = _gateway;
-                if !ip_cidr.is_empty() && !gateway.is_empty() {
-                    match crate::vm_lifecycle::connect_agent(&vsock_socket).await {
-                        Ok((agent, _health)) => {
-                            agents.lock().await.insert(vm_id.clone(), agent.clone());
-
-                            let parts: Vec<&str> = ip_cidr.split('/').collect();
-                            let ip = parts[0];
-                            let prefix: u32 =
-                                parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(24);
-                            let mut net_req = cloudhv_proto::ConfigureNetworkRequest::new();
-                            net_req.ip_address = ip.to_string();
-                            net_req.gateway = gateway.to_string();
-                            net_req.prefix_len = prefix;
-                            net_req.device = "eth0".to_string();
-                            let ctx =
-                                ttrpc::context::with_duration(std::time::Duration::from_secs(30));
-                            if let Err(e) = agent.configure_network(ctx, &net_req).await {
-                                warn!("configure_network failed on warm restore: {e:#}");
-                            } else {
-                                info!("guest network configured: ip={ip}/{prefix} gw={gateway}");
+                // Set up networking: TAP in host → CH add-net → move to pod netns + TC
+                let tap_name_out = if !netns.is_empty() {
+                    match setup_vm_networking(netns, &vm_id, &api_socket).await {
+                        Ok((tap, net_info)) => {
+                            match crate::vm_lifecycle::connect_agent(&vsock_socket).await {
+                                Ok((agent, _health)) => {
+                                    agents.lock().await.insert(vm_id.clone(), agent.clone());
+                                    if let Err(e) = configure_guest_network(
+                                        &agent,
+                                        &net_info.ip_cidr,
+                                        &net_info.gateway,
+                                    )
+                                    .await
+                                    {
+                                        warn!("configure_network on warm restore: {e:#}");
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("agent connect on warm restore: {e:#}");
+                                }
                             }
+                            tap
                         }
                         Err(e) => {
-                            warn!("agent connect failed on warm restore: {e:#}");
+                            warn!("networking failed on warm restore: {e:#}");
+                            return serde_json::json!({"error": format!("networking: {e:#}")});
                         }
                     }
-                }
+                } else {
+                    String::new()
+                };
 
                 // Register as active so release() works correctly
                 pool.register_active(crate::pool::PoolVm {
@@ -254,6 +222,7 @@ async fn handle_acquire(
                     "ch_pid": ch_pid,
                     "from_snapshot": true,
                     "container_pid": 0,
+                    "tap_name": tap_name_out,
                 });
             }
             Err(e) => {
@@ -278,28 +247,28 @@ async fn handle_acquire(
             }
 
             // Hot-plug rootfs and run container inside the VM
-            let container_pid = if !erofs_path.is_empty() && !container_id.is_empty() {
-                match run_container_in_vm(
-                    &vm.api_socket,
-                    &vm.vsock_socket,
-                    &vm.vm_id,
-                    agents,
-                    tap_name,
-                    tap_mac,
-                    erofs_path,
-                    container_id,
-                    config_json_b64,
-                )
-                .await
-                {
-                    Ok(pid) => pid,
-                    Err(e) => {
-                        return serde_json::json!({"error": format!("run container: {e:#}")});
+            let (container_pid, tap_name_out) =
+                if !erofs_path.is_empty() && !container_id.is_empty() {
+                    match run_container_in_vm(
+                        &vm.api_socket,
+                        &vm.vsock_socket,
+                        &vm.vm_id,
+                        agents,
+                        netns,
+                        erofs_path,
+                        container_id,
+                        config_json_b64,
+                    )
+                    .await
+                    {
+                        Ok((pid, tap)) => (pid, tap),
+                        Err(e) => {
+                            return serde_json::json!({"error": format!("run container: {e:#}")});
+                        }
                     }
-                }
-            } else {
-                0
-            };
+                } else {
+                    (0, String::new())
+                };
 
             serde_json::json!({
                 "vm_id": vm.vm_id,
@@ -309,6 +278,7 @@ async fn handle_acquire(
                 "ch_pid": vm.ch_pid,
                 "from_snapshot": false,
                 "container_pid": container_pid,
+                "tap_name": tap_name_out,
             })
         }
         Err(e) => {
@@ -318,38 +288,28 @@ async fn handle_acquire(
 }
 
 /// Hot-plug an erofs rootfs and run a container via the guest agent.
-/// If `tap_name` and `tap_mac` are provided, hot-plugs a TAP NIC first.
-#[allow(clippy::too_many_arguments)]
+/// If `netns` is non-empty, sets up TAP networking first.
 async fn run_container_in_vm(
     api_socket: &std::path::Path,
     vsock_socket: &std::path::Path,
     vm_id: &str,
     agents: &AgentRegistry,
-    tap_name: &str,
-    tap_mac: &str,
+    netns: &str,
     erofs_path: &str,
     container_id: &str,
     config_json_b64: &str,
-) -> anyhow::Result<u32> {
+) -> anyhow::Result<(u32, String)> {
     use crate::vm_lifecycle;
 
-    // Hot-plug TAP NIC (CH runs on the host and can see the TAP device
-    // created by the shim via `ip link set <tap> netns 1`)
-    if !tap_name.is_empty() && !tap_mac.is_empty() {
-        let net_json = serde_json::json!({
-            "tap": tap_name,
-            "mac": tap_mac,
-        });
-        vm_lifecycle::api_request_with_body(
-            api_socket,
-            "PUT",
-            "/api/v1/vm.add-net",
-            &net_json.to_string(),
-        )
-        .await
-        .context("hot-plug TAP NIC")?;
-        info!("TAP {} hot-plugged into VM", tap_name);
-    }
+    // Set up networking (TAP in host → CH add-net → move to pod netns + TC)
+    let (tap_name, net_info) = if !netns.is_empty() {
+        let (tap, info) = setup_vm_networking(netns, vm_id, api_socket)
+            .await
+            .context("networking setup")?;
+        (tap, Some(info))
+    } else {
+        (String::new(), None)
+    };
 
     // Hot-plug rootfs disk
     let disk_id = format!("ctr-{}", &container_id[..12.min(container_id.len())]);
@@ -381,6 +341,13 @@ async fn run_container_in_vm(
         }
     };
 
+    // Configure guest networking
+    if let Some(info) = &net_info {
+        configure_guest_network(&agent, &info.ip_cidr, &info.gateway)
+            .await
+            .context("configure guest network")?;
+    }
+
     // Decode OCI config
     use base64::Engine;
     let config_json = if config_json_b64.is_empty() {
@@ -408,7 +375,7 @@ async fn run_container_in_vm(
         "container {} started in VM (pid={})",
         container_id, resp.pid
     );
-    Ok(resp.pid)
+    Ok((resp.pid, tap_name))
 }
 
 async fn handle_add_container(
@@ -446,15 +413,14 @@ async fn handle_add_container(
         &vm.vsock_socket,
         vm_id,
         agents,
-        "", // no TAP hot-plug for additional containers
-        "",
+        "", // no networking for additional containers
         erofs_path,
         container_id,
         config_json_b64,
     )
     .await
     {
-        Ok(pid) => serde_json::json!({"container_pid": pid}),
+        Ok((pid, _)) => serde_json::json!({"container_pid": pid}),
         Err(e) => serde_json::json!({"error": format!("add container: {e:#}")}),
     }
 }
@@ -559,6 +525,76 @@ async fn handle_delete_container(
     let _ = agent.delete_container(ctx, &req).await;
 
     serde_json::json!({"ok": true})
+}
+
+/// Set up networking for a VM: create TAP in host → CH add-net → move to pod netns + TC.
+async fn setup_vm_networking(
+    netns: &str,
+    vm_id: &str,
+    api_socket: &std::path::Path,
+) -> anyhow::Result<(String, crate::netns::PodNetInfo)> {
+    let tap_name = format!("tap_{}", &vm_id[..8.min(vm_id.len())]);
+
+    // Phase 1: probe pod netns for veth info, create TAP in host netns
+    let info = {
+        let ns = netns.to_string();
+        let tap = tap_name.clone();
+        tokio::task::spawn_blocking(move || crate::netns::prepare_tap(&ns, &tap))
+            .await
+            .context("prepare_tap panicked")?
+            .context("prepare_tap")?
+    };
+
+    // Phase 2: hot-plug TAP into CH (CH can see it in host netns)
+    let net_json = serde_json::json!({
+        "tap": &tap_name,
+        "mac": &info.mac,
+    });
+    crate::vm_lifecycle::api_request_with_body(
+        api_socket,
+        "PUT",
+        "/api/v1/vm.add-net",
+        &net_json.to_string(),
+    )
+    .await
+    .context("hot-plug TAP")?;
+    info!("TAP {} hot-plugged into VM {}", tap_name, vm_id);
+
+    // Phase 3: move TAP to pod netns, set up TC redirects
+    {
+        let ns = netns.to_string();
+        let tap = tap_name.clone();
+        tokio::task::spawn_blocking(move || crate::netns::activate_tap(&ns, &tap))
+            .await
+            .context("activate_tap panicked")?
+            .context("activate_tap")?
+    };
+    info!("TAP {} moved to pod netns, TC active", tap_name);
+
+    Ok((tap_name, info))
+}
+
+/// Configure the guest's network interface via the agent.
+async fn configure_guest_network(
+    agent: &cloudhv_proto::AgentServiceClient,
+    ip_cidr: &str,
+    gateway: &str,
+) -> anyhow::Result<()> {
+    let parts: Vec<&str> = ip_cidr.split('/').collect();
+    let ip = parts[0];
+    let prefix: u32 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(24);
+    let mut req = cloudhv_proto::ConfigureNetworkRequest::new();
+    req.ip_address = ip.to_string();
+    req.gateway = gateway.to_string();
+    req.prefix_len = prefix;
+    req.device = "eth0".to_string();
+    let ctx = ttrpc::context::with_duration(std::time::Duration::from_secs(30));
+    agent
+        .configure_network(ctx, &req)
+        .await
+        .context("configure_network RPC")?;
+    info!("guest network configured: ip={ip}/{prefix} gw={gateway}");
+    Ok(())
 }
 
 async fn handle_status(pool: &Arc<Pool>, snapshots: &Arc<SnapshotManager>) -> serde_json::Value {

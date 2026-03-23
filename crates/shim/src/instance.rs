@@ -62,11 +62,8 @@ struct SharedVmState {
     ch_pid: u32,
     /// Container count (sandbox counts as 1).
     container_count: AtomicUsize,
-    /// TAP device name (created by shim in pod netns).
+    /// TAP device name (returned by daemon, used for cleanup).
     tap_name: Option<String>,
-    tap_mac: Option<String>,
-    ip_cidr: Option<String>,
-    gateway: Option<String>,
     netns: Option<String>,
     cgroups_path: Option<String>,
     /// VM ID assigned by the daemon (for release).
@@ -270,8 +267,8 @@ impl Instance for CloudHvInstance {
 // ---------------------------------------------------------------------------
 
 impl CloudHvInstance {
-    /// Set up networking for the sandbox. No VM interaction — the daemon
-    /// will provide the VM when the first container starts.
+    /// Set up sandbox state. No VM interaction — the daemon provides the
+    /// VM (including networking) when the first container starts.
     async fn start_sandbox(&self) -> Result<u32, Error> {
         let sandbox_id = self.id.clone();
         let t_total = std::time::Instant::now();
@@ -281,59 +278,11 @@ impl CloudHvInstance {
 
         let config = load_config(None).ctx("config error")?;
 
-        // Set up TAP device in the pod's network namespace
-        let t_tap = std::time::Instant::now();
-        let (tap_name, tap_mac, ip_config) = if let Some(ref netns) = sandbox_spec.netns {
-            let mut result = None;
-            for attempt in 0..5 {
-                match crate::netns::setup_tap(netns, &sandbox_id).await {
-                    Ok(tap_info) => {
-                        if attempt > 0 {
-                            info!("TAP setup succeeded after {attempt} retries");
-                        }
-                        result = Some(tap_info);
-                        break;
-                    }
-                    Err(e) => {
-                        if attempt < 4 {
-                            info!("TAP setup attempt {attempt} failed ({e:#}), retrying...");
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        }
-                    }
-                }
-            }
-            match result {
-                Some(tap_info) => {
-                    info!(
-                        "TAP created: dev={} mac={} ip={} gw={}",
-                        tap_info.tap_name, tap_info.mac, tap_info.ip_cidr, tap_info.gateway
-                    );
-                    (
-                        Some(tap_info.tap_name),
-                        Some(tap_info.mac),
-                        Some((tap_info.ip_cidr, tap_info.gateway)),
-                    )
-                }
-                None => (None, None, None),
-            }
-        } else {
-            (None, None, None)
-        };
-        let tap_ms = t_tap.elapsed().as_millis();
-
-        let (ip_cidr, gateway) = match &ip_config {
-            Some((cidr, gw)) => (Some(cidr.clone()), Some(gw.clone())),
-            None => (None, None),
-        };
-
         // Store sandbox state — no VM yet (daemon provides it in start_container)
         let vm_state = Arc::new(SharedVmState {
             ch_pid: 0,
             container_count: AtomicUsize::new(1),
-            tap_name,
-            tap_mac,
-            ip_cidr,
-            gateway,
+            tap_name: None,
             netns: sandbox_spec.netns.clone(),
             cgroups_path: sandbox_spec.cgroups_path.clone(),
             daemon_vm_id: String::new(),
@@ -345,10 +294,9 @@ impl CloudHvInstance {
             .insert(sandbox_id.clone(), vm_state);
 
         info!(
-            "TIMING start_sandbox {} @{}: tap={}ms total={}ms",
+            "TIMING start_sandbox {} @{}: total={}ms",
             sandbox_id,
             epoch_ms(),
-            tap_ms,
             t_total.elapsed().as_millis()
         );
 
@@ -435,10 +383,7 @@ impl CloudHvInstance {
             let client = DaemonClient::new(&vm_state.daemon_socket);
             let acquired = client
                 .acquire_sandbox(&AcquireRequest {
-                    tap_name: vm_state.tap_name.as_deref().unwrap_or(""),
-                    tap_mac: vm_state.tap_mac.as_deref().unwrap_or(""),
-                    ip_cidr: vm_state.ip_cidr.as_deref().unwrap_or(""),
-                    gateway: vm_state.gateway.as_deref().unwrap_or(""),
+                    netns: vm_state.netns.as_deref().unwrap_or(""),
                     image_key: &image_key,
                     erofs_path: &erofs_path.to_string_lossy(),
                     container_id,
@@ -449,11 +394,12 @@ impl CloudHvInstance {
             let acq_ms = t_acquire.elapsed().as_millis();
 
             info!(
-                "daemon acquired: vm_id={} ch_pid={} from_snapshot={} container_pid={} in {}ms",
+                "daemon acquired: vm_id={} ch_pid={} from_snapshot={} container_pid={} tap={} in {}ms",
                 acquired.vm_id,
                 acquired.ch_pid,
                 acquired.from_snapshot,
                 acquired.container_pid,
+                acquired.tap_name,
                 acq_ms
             );
 
@@ -461,10 +407,11 @@ impl CloudHvInstance {
             let new_state = Arc::new(SharedVmState {
                 ch_pid: acquired.ch_pid,
                 container_count: AtomicUsize::new(vm_state.container_count.load(Ordering::SeqCst)),
-                tap_name: vm_state.tap_name.clone(),
-                tap_mac: vm_state.tap_mac.clone(),
-                ip_cidr: vm_state.ip_cidr.clone(),
-                gateway: vm_state.gateway.clone(),
+                tap_name: if acquired.tap_name.is_empty() {
+                    None
+                } else {
+                    Some(acquired.tap_name.clone())
+                },
                 netns: vm_state.netns.clone(),
                 cgroups_path: vm_state.cgroups_path.clone(),
                 daemon_vm_id: acquired.vm_id.clone(),
@@ -485,8 +432,6 @@ impl CloudHvInstance {
                     Err(e) => info!("cgroup placement failed (non-fatal): {e}"),
                 }
             }
-
-            // Network configuration for warm restore is handled by the daemon
 
             (
                 new_state,

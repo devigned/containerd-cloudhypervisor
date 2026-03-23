@@ -10,10 +10,7 @@ use tokio::net::UnixStream;
 
 /// Parameters for acquiring a sandbox VM from the daemon.
 pub struct AcquireRequest<'a> {
-    pub tap_name: &'a str,
-    pub tap_mac: &'a str,
-    pub ip_cidr: &'a str,
-    pub gateway: &'a str,
+    pub netns: &'a str,
     pub image_key: &'a str,
     pub erofs_path: &'a str,
     pub container_id: &'a str,
@@ -27,6 +24,7 @@ pub struct AcquiredVm {
     pub ch_pid: u32,
     pub from_snapshot: bool,
     pub container_pid: u32,
+    pub tap_name: String,
 }
 
 /// Async client for the sandbox daemon's Unix socket API.
@@ -49,10 +47,7 @@ impl DaemonClient {
         let resp = self
             .rpc(&serde_json::json!({
                 "method": "AcquireSandbox",
-                "tap_name": params.tap_name,
-                "tap_mac": params.tap_mac,
-                "ip_cidr": params.ip_cidr,
-                "gateway": params.gateway,
+                "netns": params.netns,
                 "image_key": params.image_key,
                 "erofs_path": params.erofs_path,
                 "container_id": params.container_id,
@@ -67,6 +62,7 @@ impl DaemonClient {
             ch_pid: resp["ch_pid"].as_u64().context("missing ch_pid")? as u32,
             from_snapshot: resp["from_snapshot"].as_bool().unwrap_or(false),
             container_pid: resp["container_pid"].as_u64().unwrap_or(0) as u32,
+            tap_name: resp["tap_name"].as_str().unwrap_or("").to_string(),
         })
     }
 
