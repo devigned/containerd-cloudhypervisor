@@ -35,9 +35,9 @@ jobs:
         run: |
           bash hacks/build-guest.sh
 
-      - name: Build Containerd shim
+      - name: Build Containerd shim and daemon
         run: |
-          bash hacks/build-static-rust.sh containerd-shim-cloudhv
+          bash hacks/build-static-rust.sh containerd-shim-cloudhv cloudhv-sandbox-daemon
 
       - name: Build extension image
         run: |
@@ -49,6 +49,7 @@ jobs:
           name: build-${{ matrix.arch }}
           path: |
             cloudhv-agent
+            cloudhv-sandbox-daemon
             rootfs.erofs
             vmlinux
             vmlinux.kconfig
@@ -178,6 +179,7 @@ jobs:
           # x86_64
           cd /tmp/artifacts/amd64
           cp -v cloudhv-agent /tmp/release/cloudhv-agent-linux-amd64 
+          cp -v cloudhv-sandbox-daemon /tmp/release/cloudhv-sandbox-daemon-linux-amd64
           cp -v containerd-shim-cloudhv-v1 /tmp/release/containerd-shim-cloudhv-v1-linux-amd64 
           cp -v rootfs.erofs /tmp/release/rootfs-amd64.erofs 
           cp -v vmlinux /tmp/release/vmlinux-amd64
@@ -186,10 +188,12 @@ jobs:
 
           chmod +x /tmp/release/containerd-shim-cloudhv-v1-linux-amd64
           chmod +x /tmp/release/cloudhv-agent-linux-amd64
+          chmod +x /tmp/release/cloudhv-sandbox-daemon-linux-amd64
 
           # aarch64
           cd /tmp/artifacts/arm64
           cp -v cloudhv-agent /tmp/release/cloudhv-agent-linux-arm64 
+          cp -v cloudhv-sandbox-daemon /tmp/release/cloudhv-sandbox-daemon-linux-arm64
           cp -v containerd-shim-cloudhv-v1 /tmp/release/containerd-shim-cloudhv-v1-linux-arm64 
           cp -v rootfs.erofs /tmp/release/rootfs-arm64.erofs 
           cp -v vmlinux /tmp/release/vmlinux-arm64
@@ -198,6 +202,7 @@ jobs:
 
           chmod +x /tmp/release/containerd-shim-cloudhv-v1-linux-arm64
           chmod +x /tmp/release/cloudhv-agent-linux-arm64
+          chmod +x /tmp/release/cloudhv-sandbox-daemon-linux-arm64
 
           # Generate checksums
           cd /tmp/release && sha256sum * > checksums-sha256.txt
