@@ -13,7 +13,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  CH_VERSION: "v44.0"
+  CH_VERSION: "v51.1"
   KERNEL_SERIES: "6.18"
 
 jobs:

@@ -11,7 +11,7 @@ scriptdir="$(cd "$(dirname "$0")"; pwd)"
 source "${scriptdir}/util.inc"
 
 CNI_VERSION="${CNI_VERSION:-v1.9.1}"
-CH_VERSION="${CH_VERSION:-v44.0}"
+CH_VERSION="${CH_VERSION:-v51.1}"
 
 # Runs inside the container
 build() {
@@ -25,6 +25,7 @@ build() {
 
   build_if_missing "$host_user_group" /host/hacks/build-guest.sh -- vmlinux vmlinux.kconfig rootfs.erofs
   build_if_missing "$host_user_group" /host/hacks/build-static-rust.sh containerd-shim-cloudhv -- containerd-shim-cloudhv-v1
+  build_if_missing "$host_user_group" /host/hacks/build-static-rust.sh cloudhv-sandbox-daemon -- cloudhv-sandbox-daemon
   build_if_missing "$host_user_group" /host/hacks/build-host-deps.sh -- mkfs.erofs
 
   cd sysext
@@ -33,8 +34,10 @@ build() {
            root/usr/libexec/cni
 
   cp /host/vmlinux /host/vmlinux.kconfig /host/rootfs.erofs root/usr/share/cloudhv/guest/
-  cp /host/containerd-shim-cloudhv-v1 root/usr/bin
-  cp /host/mkfs.erofs root/usr/bin
+  cp /host/containerd-shim-cloudhv-v1 \
+     /host/cloudhv-sandbox-daemon \
+     /host/mkfs.erofs \
+        root/usr/bin
 
   local arch="$(translate_arch)"
   sed -i "s/^ARCHITECTURE=.*/ARCHITECTURE=${arch}/" \

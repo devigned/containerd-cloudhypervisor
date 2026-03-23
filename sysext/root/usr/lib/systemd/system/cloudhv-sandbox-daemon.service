@@ -1,0 +1,15 @@
+[Unit]
+Description=CloudHV Sandbox Daemon
+After=containerd.service
+Requires=containerd.service
+
+[Service]
+ExecStartPre=/bin/mkdir -p /run/cloudhv/daemon
+Environment=RUST_LOG=info
+ExecStart=/usr/bin/cloudhv-sandbox-daemon /opt/cloudhv/daemon.json
+Restart=always
+RestartSec=5
+MemoryMax=4G
+
+[Install]
+WantedBy=multi-user.target

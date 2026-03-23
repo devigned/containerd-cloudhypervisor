@@ -48,7 +48,7 @@ echo "Running the test (includes Flatcar image download)"
 coproc flatcar { ./bakery.sh boot containerd-cloudhypervisor.raw 2>&1; }
 read_until "${flatcar[0]}" "localhost login:"
 sleep 1
-echo "sudo /usr/share/cloudhv/demo/demo.sh; rc=\"\$?\"; echo 'TEST_IS_DONE'; echo \"TEST_EXIT_CODE=\$rc\"" >&${flatcar[1]}
+echo "sudo /usr/share/cloudhv/demo/demo.sh cleanup; rc=\"\$?\"; echo 'TEST_IS_DONE'; echo \"TEST_EXIT_CODE=\$rc\"" >&${flatcar[1]}
 read_until "${flatcar[0]}" "TEST_IS_DONE" # input is echoed on the console
 read_until "${flatcar[0]}" "TEST_IS_DONE"
 read -ru "${flatcar[0]}" exit_code_line

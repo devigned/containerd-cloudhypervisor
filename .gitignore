@@ -5,6 +5,7 @@ vmlinux*
 rootfs.erofs
 cloudhv-agent
 containerd-shim-cloudhv-v1
+cloudhv-sandbox-daemon
 mkfs.erofs
 containerd-cloudhypervisor.raw
 
