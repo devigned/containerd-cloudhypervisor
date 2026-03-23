@@ -80,12 +80,14 @@ jobs:
           mkdir -p /tmp/image-root-amd64/opt/cloudhv
 
           cp /tmp/artifacts/amd64/containerd-shim-cloudhv-v1 \
+              /tmp/artifacts/amd64/cloudhv-sandbox-daemon \
               /tmp/artifacts/amd64/vmlinux \
               /tmp/artifacts/amd64/rootfs.erofs \
               installer/install.sh \
             /tmp/image-root-amd64/opt/cloudhv/
 
           chmod +x /tmp/image-root-amd64/opt/cloudhv/containerd-shim-cloudhv-v1
+          chmod +x /tmp/image-root-amd64/opt/cloudhv/cloudhv-sandbox-daemon
           chmod +x /tmp/image-root-amd64/opt/cloudhv/install.sh
           ls -lh /tmp/image-root-amd64/opt/cloudhv/
 
@@ -93,12 +95,14 @@ jobs:
         run: |
           mkdir -p /tmp/image-root-arm64/opt/cloudhv
           cp /tmp/artifacts/arm64/containerd-shim-cloudhv-v1 \
+              /tmp/artifacts/arm64/cloudhv-sandbox-daemon \
               /tmp/artifacts/arm64/vmlinux \
               /tmp/artifacts/arm64/rootfs.erofs \
               installer/install.sh \
             /tmp/image-root-arm64/opt/cloudhv/
 
           chmod +x /tmp/image-root-arm64/opt/cloudhv/containerd-shim-cloudhv-v1
+          chmod +x /tmp/image-root-arm64/opt/cloudhv/cloudhv-sandbox-daemon
           chmod +x /tmp/image-root-arm64/opt/cloudhv/install.sh
           ls -lh /tmp/image-root-arm64/opt/cloudhv/
 
