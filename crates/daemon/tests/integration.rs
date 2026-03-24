@@ -428,6 +428,14 @@ fn test_pod_http_connectivity() {
         "ip",
         &["netns", "exec", netns_name, "ip", "link", "set", "lo", "up"],
     );
+    // Add default route so prepare_tap can discover the gateway
+    run_cmd_ok(
+        "ip",
+        &[
+            "netns", "exec", netns_name,
+            "ip", "route", "add", "default", "via", host_ip,
+        ],
+    );
 
     let netns_path = format!("/var/run/netns/{netns_name}");
 
