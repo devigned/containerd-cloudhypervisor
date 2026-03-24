@@ -71,9 +71,16 @@ function demo() {
   cont_id="$(get_cont_id)"
   crictl start "$cont_id"
 
-  sleep 1
+  sleep 2
   announce "Accessing echo container HTTP endpoint"
-  curl -sSL http://"$pod_ip":5678
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    if curl -sSL --connect-timeout 2 http://"$pod_ip":5678; then
+      break
+    fi
+    echo "  curl attempt $attempt failed, retrying..."
+    sleep 1
+  done
 
   announce "Printing container logs"
   for f in /tmp/echo-pod-logs/*; do
