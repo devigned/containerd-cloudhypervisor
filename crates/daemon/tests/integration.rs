@@ -525,7 +525,6 @@ fn run_cmd_ok(cmd: &str, args: &[&str]) {
 
 /// Base64 encode bytes (no external dep needed — test-only).
 fn base64_encode(data: &[u8]) -> String {
-    use std::fmt::Write;
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::with_capacity(data.len() * 4 / 3 + 4);
     for chunk in data.chunks(3) {
