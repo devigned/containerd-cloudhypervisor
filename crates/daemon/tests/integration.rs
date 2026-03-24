@@ -250,9 +250,9 @@ fn test_shadow_snapshot_creation() {
     }
     println!("Using erofs: {}", erofs);
 
-    let image_key = "test-shadow-image";
+    let image_key = format!("test-shadow-{}", std::process::id());
 
-    // Verify no snapshot exists yet
+    // Verify no snapshot exists yet for this key
     let status = rpc("Status", &serde_json::json!({}));
     let keys: Vec<String> = status["snapshot_keys"]
         .as_array()
