@@ -37,7 +37,23 @@ pub fn prepare_tap(netns_path: &str, tap_name: &str) -> Result<PodNetInfo> {
             Ok(None)
         })
         .context("find veth")?;
-        let gw = retry(20, 100, || nl.get_default_gw()).context("find gw")?;
+        // Gateway is optional — some CNI configs (e.g. bridge without
+        // explicit routes) don't add a default route in the pod netns.
+        // When missing, infer the gateway as the first IP in the subnet
+        // (e.g. 10.88.0.2/16 → 10.88.0.1), which matches what bridge
+        // CNI assigns to the cni0 bridge with isGateway: true.
+        let gw = match nl.get_default_gw() {
+            Ok(Some(g)) => g,
+            _ => {
+                let inferred = infer_gateway(&veth.0);
+                log::info!(
+                    "no default gateway in pod netns, inferred {} from {}",
+                    inferred.as_deref().unwrap_or("none"),
+                    veth.0
+                );
+                inferred.unwrap_or_default()
+            }
+        };
         Ok(PodNetInfo {
             ip_cidr: veth.0,
             mac: veth.1,
@@ -145,4 +161,19 @@ fn retry<T>(max: u32, ms: u64, mut f: impl FnMut() -> Result<Option<T>>) -> Resu
         std::thread::sleep(std::time::Duration::from_millis(ms));
     }
     anyhow::bail!("not found after {max} retries")
+}
+
+/// Infer a gateway from a CIDR address by using the first usable IP in the
+/// subnet. For example, "10.88.0.2/16" → "10.88.0.1".
+fn infer_gateway(ip_cidr: &str) -> Option<String> {
+    let parts: Vec<&str> = ip_cidr.split('/').collect();
+    let ip: std::net::Ipv4Addr = parts.first()?.parse().ok()?;
+    let prefix: u32 = parts.get(1)?.parse().ok()?;
+    if prefix > 30 {
+        return None;
+    }
+    let mask = !((1u32 << (32 - prefix)) - 1);
+    let network = u32::from(ip) & mask;
+    let gateway = std::net::Ipv4Addr::from(network + 1);
+    Some(gateway.to_string())
 }

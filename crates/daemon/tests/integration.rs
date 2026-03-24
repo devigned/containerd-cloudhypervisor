@@ -536,6 +536,144 @@ fn test_pod_http_connectivity() {
     println!("Cleaned up test netns");
 }
 
+/// Same as test_pod_http_connectivity but WITHOUT a default gateway in
+/// the pod netns. Verifies that the daemon handles missing gateway
+/// gracefully (bridge CNI without explicit routes).
+#[test]
+fn test_pod_http_no_gateway() {
+    let erofs = erofs_path();
+    if erofs.is_empty() {
+        println!("SKIP: no erofs image available");
+        return;
+    }
+
+    let netns_name = "cloudhv-test-nogw";
+    let veth_host = "veth-nogw-h";
+    let veth_peer = "veth-nogw-p";
+    let veth_ns = "eth0";
+    let pod_ip = "10.99.1.2";
+    let host_ip = "10.99.1.1";
+    let prefix = "24";
+
+    let _ = run_cmd("ip", &["netns", "delete", netns_name]);
+    let _ = run_cmd("ip", &["link", "delete", veth_host]);
+    let _ = run_cmd("ip", &["link", "delete", veth_peer]);
+
+    run_cmd_ok("ip", &["netns", "add", netns_name]);
+    run_cmd_ok(
+        "ip",
+        &[
+            "link", "add", veth_host, "type", "veth", "peer", "name", veth_peer,
+        ],
+    );
+    run_cmd_ok("ip", &["link", "set", veth_peer, "netns", netns_name]);
+    run_cmd_ok(
+        "ip",
+        &[
+            "netns", "exec", netns_name, "ip", "link", "set", veth_peer, "name", veth_ns,
+        ],
+    );
+
+    run_cmd_ok(
+        "ip",
+        &[
+            "addr",
+            "add",
+            &format!("{host_ip}/{prefix}"),
+            "dev",
+            veth_host,
+        ],
+    );
+    run_cmd_ok("ip", &["link", "set", veth_host, "up"]);
+
+    run_cmd_ok(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            netns_name,
+            "ip",
+            "addr",
+            "add",
+            &format!("{pod_ip}/{prefix}"),
+            "dev",
+            veth_ns,
+        ],
+    );
+    run_cmd_ok(
+        "ip",
+        &[
+            "netns", "exec", netns_name, "ip", "link", "set", veth_ns, "up",
+        ],
+    );
+    run_cmd_ok(
+        "ip",
+        &["netns", "exec", netns_name, "ip", "link", "set", "lo", "up"],
+    );
+    // Deliberately NO default route — replicates bridge CNI without routes config
+
+    let netns_path = format!("/var/run/netns/{netns_name}");
+
+    let oci_config = serde_json::json!({
+        "ociVersion": "1.0.0",
+        "process": {
+            "terminal": false,
+            "user": { "uid": 0, "gid": 0 },
+            "args": ["/http-echo", "-text=no-gateway-ok", "-listen=:5678"],
+            "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+            "cwd": "/"
+        },
+        "root": { "path": "rootfs", "readonly": true },
+        "linux": { "namespaces": [{ "type": "mount" }] }
+    });
+    let config_b64 = base64_encode(&serde_json::to_vec(&oci_config).unwrap());
+    let container_id = format!("integ-nogw-{}", std::process::id());
+
+    println!("Acquiring VM WITHOUT gateway...");
+    let t0 = Instant::now();
+    let resp = rpc(
+        "AcquireSandbox",
+        &serde_json::json!({
+            "netns": netns_path,
+            "image_key": "",
+            "erofs_path": erofs,
+            "container_id": container_id,
+            "config_json": config_b64,
+        }),
+    );
+    let acquire_ms = t0.elapsed().as_millis();
+    assert!(resp.get("error").is_none(), "acquire error: {}", resp);
+    let vm_id = resp["vm_id"].as_str().unwrap().to_string();
+    println!("Acquired: vm_id={vm_id} in {acquire_ms}ms");
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    println!("Curling http://{pod_ip}:5678/ ...");
+    let (curl_ok, curl_output) = run_cmd(
+        "curl",
+        &[
+            "-s",
+            "--connect-timeout",
+            "5",
+            &format!("http://{pod_ip}:5678/"),
+        ],
+    );
+    println!("curl output: {curl_output}");
+    assert!(curl_ok, "curl failed: {curl_output}");
+    assert!(
+        curl_output.contains("no-gateway-ok"),
+        "unexpected response: {curl_output}"
+    );
+    println!("✅ HTTP connectivity without gateway verified!");
+
+    let resp = rpc("ReleaseSandbox", &serde_json::json!({"vm_id": vm_id}));
+    assert!(resp.get("error").is_none(), "release error: {resp}");
+
+    let _ = run_cmd("ip", &["link", "delete", veth_host]);
+    let _ = run_cmd("ip", &["netns", "delete", netns_name]);
+    println!("Cleaned up test netns");
+}
+
 /// Run a command and return (success, combined output).
 fn run_cmd(cmd: &str, args: &[&str]) -> (bool, String) {
     match std::process::Command::new(cmd).args(args).output() {

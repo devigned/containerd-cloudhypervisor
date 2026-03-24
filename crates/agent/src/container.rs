@@ -314,9 +314,10 @@ impl ContainerManager {
                 }
 
                 // Retry mount — the device node may exist before the block device
-                // driver is fully initialized (ENXIO). Tight poll for up to 500ms.
+                // driver is fully initialized (ENXIO). Poll for up to 2s with
+                // short sleeps between attempts.
                 let mount_deadline =
-                    std::time::Instant::now() + std::time::Duration::from_millis(500);
+                    std::time::Instant::now() + std::time::Duration::from_millis(2000);
                 loop {
                     match mount(
                         Some(dev.as_str()),
@@ -330,8 +331,7 @@ impl ContainerManager {
                             break;
                         }
                         Err(_e) if std::time::Instant::now() < mount_deadline => {
-                            // Device node exists but driver not ready — yield and retry
-                            tokio::task::yield_now().await;
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                         }
                         Err(e) => {
                             anyhow::bail!("mount erofs {} at {}: {e}", dev, layer_mount.display());
