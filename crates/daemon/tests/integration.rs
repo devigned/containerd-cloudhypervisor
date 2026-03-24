@@ -63,8 +63,9 @@ fn test_acquire_release_cycle() {
     // Check initial pool state
     let status = rpc("Status", &serde_json::json!({}));
     let initial_ready = status["pool_ready"].as_u64().unwrap();
+    let initial_active = status["active_vms"].as_u64().unwrap();
     assert!(initial_ready > 0, "pool must have ready VMs");
-    println!("Initial pool: {} ready", initial_ready);
+    println!("Initial pool: {} ready, {} active", initial_ready, initial_active);
 
     // Acquire
     let t0 = Instant::now();
@@ -85,12 +86,13 @@ fn test_acquire_release_cycle() {
         vm_id, ch_pid, acquire_ms
     );
 
-    // Verify pool decreased
+    // Verify active count increased by 1
     let status = rpc("Status", &serde_json::json!({}));
+    let active_after = status["active_vms"].as_u64().unwrap();
     assert_eq!(
-        status["active_vms"].as_u64().unwrap(),
-        1,
-        "active should be 1"
+        active_after,
+        initial_active + 1,
+        "active should increase by 1 (was {initial_active}, now {active_after})"
     );
     println!(
         "After acquire: pool={} active={}",
