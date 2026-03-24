@@ -104,8 +104,12 @@ pub async fn spawn_ch(config: &DaemonConfig, state_dir: &Path) -> Result<u32> {
     unsafe {
         cmd.pre_exec(|| {
             let mut set: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&mut set);
-            libc::sigprocmask(libc::SIG_SETMASK, &set, std::ptr::null_mut());
+            if libc::sigemptyset(&mut set) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::sigprocmask(libc::SIG_SETMASK, &set, std::ptr::null_mut()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }

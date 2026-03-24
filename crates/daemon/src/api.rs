@@ -1,6 +1,11 @@
-//! ttrpc API server for the sandbox daemon.
+//! JSON-line API server for the sandbox daemon.
+//!
+//! The daemon listens on a Unix socket and serves AcquireSandbox,
+//! ReleaseSandbox, container lifecycle proxies, and Status RPCs
+//! using a newline-delimited JSON protocol.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -10,6 +15,9 @@ use tokio::sync::Mutex;
 use crate::config::DaemonConfig;
 use crate::pool::Pool;
 use crate::shadow::SnapshotManager;
+
+/// Monotonic counter for unique warm VM IDs.
+static WARM_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Per-VM agent connection, stored after first container start.
 type AgentRegistry = Arc<Mutex<HashMap<String, cloudhv_proto::AgentServiceClient>>>;
@@ -65,8 +73,7 @@ impl ApiServer {
     }
 }
 
-/// Handle a single client connection.
-/// Simple JSON request/response protocol (will be replaced with ttrpc).
+/// Handle a single client connection (JSON-line protocol).
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     pool: &Arc<Pool>,
@@ -157,7 +164,8 @@ async fn handle_acquire(
             )
             .await
     {
-        let vm_id = format!("warm-{}-{}", image_key, std::process::id());
+        let seq = WARM_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let vm_id = format!("warm-{}-{}", image_key, seq);
         let state_dir = std::path::PathBuf::from(&config.state_dir).join(&vm_id);
         if let Err(e) = std::fs::create_dir_all(&state_dir) {
             return serde_json::json!({"error": format!("create state dir: {e}")});
@@ -190,6 +198,7 @@ async fn handle_acquire(
                                 }
                                 Err(e) => {
                                     warn!("agent connect on warm restore: {e:#}");
+                                    return serde_json::json!({"error": format!("agent connect: {e:#}")});
                                 }
                             }
                             tap
@@ -250,14 +259,16 @@ async fn handle_acquire(
             let (container_pid, tap_name_out) =
                 if !erofs_path.is_empty() && !container_id.is_empty() {
                     match run_container_in_vm(
-                        &vm.api_socket,
-                        &vm.vsock_socket,
-                        &vm.vm_id,
+                        &RunContainerParams {
+                            api_socket: &vm.api_socket,
+                            vsock_socket: &vm.vsock_socket,
+                            vm_id: &vm.vm_id,
+                            netns,
+                            erofs_path,
+                            container_id,
+                            config_json_b64,
+                        },
                         agents,
-                        netns,
-                        erofs_path,
-                        container_id,
-                        config_json_b64,
                     )
                     .await
                     {
@@ -287,23 +298,28 @@ async fn handle_acquire(
     }
 }
 
+/// Parameters for running a container inside a VM.
+struct RunContainerParams<'a> {
+    api_socket: &'a std::path::Path,
+    vsock_socket: &'a std::path::Path,
+    vm_id: &'a str,
+    netns: &'a str,
+    erofs_path: &'a str,
+    container_id: &'a str,
+    config_json_b64: &'a str,
+}
+
 /// Hot-plug an erofs rootfs and run a container via the guest agent.
 /// If `netns` is non-empty, sets up TAP networking first.
 async fn run_container_in_vm(
-    api_socket: &std::path::Path,
-    vsock_socket: &std::path::Path,
-    vm_id: &str,
+    params: &RunContainerParams<'_>,
     agents: &AgentRegistry,
-    netns: &str,
-    erofs_path: &str,
-    container_id: &str,
-    config_json_b64: &str,
 ) -> anyhow::Result<(u32, String)> {
     use crate::vm_lifecycle;
 
     // Set up networking (TAP in host → CH add-net → move to pod netns + TC)
-    let (tap_name, net_info) = if !netns.is_empty() {
-        let (tap, info) = setup_vm_networking(netns, vm_id, api_socket)
+    let (tap_name, net_info) = if !params.netns.is_empty() {
+        let (tap, info) = setup_vm_networking(params.netns, params.vm_id, params.api_socket)
             .await
             .context("networking setup")?;
         (tap, Some(info))
@@ -312,14 +328,17 @@ async fn run_container_in_vm(
     };
 
     // Hot-plug rootfs disk
-    let disk_id = format!("ctr-{}", &container_id[..12.min(container_id.len())]);
+    let disk_id = format!(
+        "ctr-{}",
+        &params.container_id[..12.min(params.container_id.len())]
+    );
     let disk_json = serde_json::json!({
-        "path": erofs_path,
+        "path": params.erofs_path,
         "readonly": true,
         "id": disk_id,
     });
     vm_lifecycle::api_request_with_body(
-        api_socket,
+        params.api_socket,
         "PUT",
         "/api/v1/vm.add-disk",
         &disk_json.to_string(),
@@ -329,14 +348,17 @@ async fn run_container_in_vm(
 
     // Connect to agent (or reuse existing connection)
     let agent = {
-        let existing = agents.lock().await.get(vm_id).cloned();
+        let existing = agents.lock().await.get(params.vm_id).cloned();
         if let Some(a) = existing {
             a
         } else {
-            let (a, _health) = vm_lifecycle::connect_agent(vsock_socket)
+            let (a, _health) = vm_lifecycle::connect_agent(params.vsock_socket)
                 .await
                 .context("agent connect for container")?;
-            agents.lock().await.insert(vm_id.to_string(), a.clone());
+            agents
+                .lock()
+                .await
+                .insert(params.vm_id.to_string(), a.clone());
             a
         }
     };
@@ -350,17 +372,17 @@ async fn run_container_in_vm(
 
     // Decode OCI config
     use base64::Engine;
-    let config_json = if config_json_b64.is_empty() {
+    let config_json = if params.config_json_b64.is_empty() {
         b"{}".to_vec()
     } else {
         base64::engine::general_purpose::STANDARD
-            .decode(config_json_b64)
+            .decode(params.config_json_b64)
             .unwrap_or_else(|_| b"{}".to_vec())
     };
 
     // Run container
     let mut req = cloudhv_proto::CreateContainerRequest::new();
-    req.container_id = container_id.to_string();
+    req.container_id = params.container_id.to_string();
     req.config_json = config_json;
     req.rootfs_preattached = false;
     req.erofs_layers = 1;
@@ -373,7 +395,7 @@ async fn run_container_in_vm(
 
     info!(
         "container {} started in VM (pid={})",
-        container_id, resp.pid
+        params.container_id, resp.pid
     );
     Ok((resp.pid, tap_name))
 }
@@ -409,14 +431,16 @@ async fn handle_add_container(
     };
 
     match run_container_in_vm(
-        &vm.api_socket,
-        &vm.vsock_socket,
-        vm_id,
+        &RunContainerParams {
+            api_socket: &vm.api_socket,
+            vsock_socket: &vm.vsock_socket,
+            vm_id,
+            netns: "",
+            erofs_path,
+            container_id,
+            config_json_b64,
+        },
         agents,
-        "", // no networking for additional containers
-        erofs_path,
-        container_id,
-        config_json_b64,
     )
     .await
     {

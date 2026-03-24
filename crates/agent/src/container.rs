@@ -891,7 +891,19 @@ async fn wait_for_exit_pidfd(pid: u32, mut child: tokio::process::Child) -> i32 
             match tokio::io::unix::AsyncFd::new(owned) {
                 Ok(async_fd) => {
                     // Wait for the fd to become readable (process exited)
-                    let _ = async_fd.readable().await;
+                    match async_fd.readable().await {
+                        Ok(_ready_guard) => {}
+                        Err(e) => {
+                            warn!(
+                                "async_fd.readable() failed for pid {pid}: {e}, \
+                                 falling back to child.wait()"
+                            );
+                            match child.wait().await {
+                                Ok(status) => return status.code().unwrap_or(137),
+                                Err(_) => return 137,
+                            }
+                        }
+                    }
                     // Reap the child to get exit code
                     match child.try_wait() {
                         Ok(Some(status)) => return status.code().unwrap_or(137),

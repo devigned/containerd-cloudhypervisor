@@ -15,12 +15,12 @@ pub async fn cleanup_tap(netns_path: &str, tap_name: &str) {
     let _ = tokio::task::spawn_blocking(move || {
         let _ = in_netns_nowait(&netns, || {
             if let Ok(nl) = Netlink::open() {
-                if let Ok(links) = nl.dump_links() {
-                    for (idx, name, _) in &links {
-                        if name != "lo" && name != &tap {
-                            let _ = nl.del_ingress_qdisc(*idx);
-                        }
-                    }
+                // Only remove ingress qdisc from the paired veth, not all interfaces
+                if let Ok(Some((_, veth_idx, _, _))) = nl.find_veth(&tap) {
+                    let _ = nl.del_ingress_qdisc(veth_idx);
+                }
+                if let Ok(tap_idx) = nl.get_link_index(&tap) {
+                    let _ = nl.del_ingress_qdisc(tap_idx);
                 }
                 let _ = nl.del_link(&tap);
                 log::info!("cleaned up TAP {tap} via netlink");
