@@ -37,7 +37,16 @@ pub fn prepare_tap(netns_path: &str, tap_name: &str) -> Result<PodNetInfo> {
             Ok(None)
         })
         .context("find veth")?;
-        let gw = retry(20, 100, || nl.get_default_gw()).context("find gw")?;
+        // Gateway is optional — some CNI configs (e.g. bridge without
+        // isDefaultGateway) don't add a default route in the pod netns.
+        // The agent skips adding a default route when gateway is empty.
+        let gw = match nl.get_default_gw() {
+            Ok(Some(g)) => g,
+            _ => {
+                log::info!("no default gateway in pod netns (non-fatal)");
+                String::new()
+            }
+        };
         Ok(PodNetInfo {
             ip_cidr: veth.0,
             mac: veth.1,
