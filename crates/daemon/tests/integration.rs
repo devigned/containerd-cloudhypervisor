@@ -1,17 +1,24 @@
-//! Integration test client for the sandbox daemon.
+//! Integration tests for the sandbox daemon.
 //!
-//! Connects to the daemon's Unix socket, exercises AcquireSandbox,
-//! hot-plugs a container rootfs, runs a workload, and ReleaseSandbox.
-//! Reports per-phase timing.
+//! Tests cover:
+//!   - Daemon socket RPCs (AcquireSandbox, ReleaseSandbox, Status)
+//!   - Pool drain and synchronous restore
+//!   - Shadow snapshot creation and warm restore
+//!   - End-to-end pod networking via containerd (crictl)
 //!
 //! Usage:
-//!   cargo test -p cloudhv-sandbox-daemon --test integration -- --nocapture
+//!   # Daemon-level tests (require daemon + KVM):
+//!   cargo test -p cloudhv-sandbox-daemon --test integration -- --nocapture --test-threads=1
+//!
+//!   # End-to-end networking test (requires containerd + cloudhv runtime):
+//!   cargo test -p cloudhv-sandbox-daemon --test integration test_pod_http_connectivity -- --nocapture
 //!
 //! Requires:
 //!   - Daemon running at /run/cloudhv/daemon.sock (or DAEMON_SOCKET env)
 //!   - Cloud Hypervisor >= v51.0 installed
 //!   - Container image erofs available (or specify ROOTFS_EROFS env)
 //!   - KVM access (/dev/kvm)
+//!   - For pod tests: containerd running with cloudhv runtime configured
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -64,10 +71,7 @@ fn test_acquire_release_cycle() {
     let resp = rpc(
         "AcquireSandbox",
         &serde_json::json!({
-            "tap_name": "",
-            "tap_mac": "",
-            "ip_cidr": "",
-            "gateway": "",
+            "netns": "",
             "image_key": "",
         }),
     );
@@ -120,10 +124,7 @@ fn test_consecutive_lifecycle() {
         let resp = rpc(
             "AcquireSandbox",
             &serde_json::json!({
-                "tap_name": "",
-                "tap_mac": "",
-                "ip_cidr": "",
-                "gateway": "",
+                "netns": "",
                 "image_key": "",
             }),
         );
@@ -179,7 +180,7 @@ fn test_pool_drain_and_sync_restore() {
         let resp = rpc(
             "AcquireSandbox",
             &serde_json::json!({
-                "tap_name": "", "tap_mac": "", "ip_cidr": "", "gateway": "", "image_key": "",
+                "netns": "", "image_key": "",
             }),
         );
         assert!(resp.get("error").is_none(), "drain acquire error: {resp}");
@@ -200,7 +201,7 @@ fn test_pool_drain_and_sync_restore() {
     let resp = rpc(
         "AcquireSandbox",
         &serde_json::json!({
-            "tap_name": "", "tap_mac": "", "ip_cidr": "", "gateway": "", "image_key": "",
+            "netns": "", "image_key": "",
         }),
     );
     let sync_ms = t0.elapsed().as_millis();
@@ -270,7 +271,7 @@ fn test_shadow_snapshot_creation() {
     let resp = rpc(
         "AcquireSandbox",
         &serde_json::json!({
-            "tap_name": "", "tap_mac": "", "ip_cidr": "", "gateway": "",
+            "netns": "",
             "image_key": image_key,
             "erofs_path": erofs,
         }),
@@ -330,7 +331,7 @@ fn test_shadow_snapshot_creation() {
         let resp2 = rpc(
             "AcquireSandbox",
             &serde_json::json!({
-                "tap_name": "", "tap_mac": "", "ip_cidr": "", "gateway": "",
+                "netns": "",
                 "image_key": image_key,
                 "erofs_path": erofs,
             }),
@@ -360,4 +361,190 @@ fn test_status_includes_snapshot_fields() {
     assert!(status.get("shadow_vms_running").is_some());
     assert!(status.get("snapshot_keys").is_some());
     println!("Status: {}", serde_json::to_string_pretty(&status).unwrap());
+}
+
+/// End-to-end networking test: creates a netns with a veth pair, boots a VM
+/// with http-echo, and verifies HTTP connectivity through the TAP bridge.
+///
+/// Requires: daemon running, http-echo erofs image available, `ip` and `curl`
+/// commands installed, root privileges (for netns creation).
+#[test]
+fn test_pod_http_connectivity() {
+    let erofs = erofs_path();
+    if erofs.is_empty() {
+        println!("SKIP: no erofs image available (set EROFS_PATH or populate erofs-cache)");
+        return;
+    }
+
+    let netns_name = "cloudhv-test-net";
+    let veth_host = "veth-test-h";
+    let veth_ns = "eth0";
+    let pod_ip = "10.99.0.2";
+    let host_ip = "10.99.0.1";
+    let prefix = "24";
+
+    // Clean up any leftover test netns
+    let _ = run_cmd("ip", &["netns", "delete", netns_name]);
+    let _ = run_cmd("ip", &["link", "delete", veth_host]);
+
+    // Create netns and veth pair
+    run_cmd_ok("ip", &["netns", "add", netns_name]);
+    run_cmd_ok(
+        "ip",
+        &["link", "add", veth_host, "type", "veth", "peer", "name", veth_ns],
+    );
+    run_cmd_ok(
+        "ip",
+        &["link", "set", veth_ns, "netns", netns_name],
+    );
+
+    // Configure host side
+    run_cmd_ok(
+        "ip",
+        &["addr", "add", &format!("{host_ip}/{prefix}"), "dev", veth_host],
+    );
+    run_cmd_ok("ip", &["link", "set", veth_host, "up"]);
+
+    // Configure netns side (veth gets pod IP, acts like CNI)
+    run_cmd_ok(
+        "ip",
+        &[
+            "netns", "exec", netns_name,
+            "ip", "addr", "add", &format!("{pod_ip}/{prefix}"), "dev", veth_ns,
+        ],
+    );
+    run_cmd_ok(
+        "ip",
+        &["netns", "exec", netns_name, "ip", "link", "set", veth_ns, "up"],
+    );
+    run_cmd_ok(
+        "ip",
+        &["netns", "exec", netns_name, "ip", "link", "set", "lo", "up"],
+    );
+
+    let netns_path = format!("/var/run/netns/{netns_name}");
+
+    // Build a minimal OCI config for http-echo
+    let oci_config = serde_json::json!({
+        "ociVersion": "1.0.0",
+        "process": {
+            "terminal": false,
+            "user": { "uid": 0, "gid": 0 },
+            "args": ["/http-echo", "-text=integration-test-ok", "-listen=:5678"],
+            "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+            "cwd": "/"
+        },
+        "root": { "path": "rootfs", "readonly": true },
+        "linux": {
+            "namespaces": [
+                { "type": "mount" }
+            ]
+        }
+    });
+    let config_json = serde_json::to_vec(&oci_config).unwrap();
+
+    // Encode config as base64
+    let config_b64 = base64_encode(&config_json);
+
+    let container_id = format!("integ-net-{}", std::process::id());
+
+    // Acquire VM with networking
+    println!("Acquiring VM with netns={netns_path} erofs={erofs}...");
+    let t0 = Instant::now();
+    let resp = rpc(
+        "AcquireSandbox",
+        &serde_json::json!({
+            "netns": netns_path,
+            "image_key": "",
+            "erofs_path": erofs,
+            "container_id": container_id,
+            "config_json": config_b64,
+        }),
+    );
+    let acquire_ms = t0.elapsed().as_millis();
+    assert!(
+        resp.get("error").is_none(),
+        "acquire error: {}",
+        resp
+    );
+    let vm_id = resp["vm_id"].as_str().unwrap().to_string();
+    let container_pid = resp["container_pid"].as_u64().unwrap_or(0);
+    println!(
+        "Acquired: vm_id={vm_id} container_pid={container_pid} in {acquire_ms}ms"
+    );
+    assert!(container_pid > 0, "container should be running");
+
+    // Wait for http-echo to start listening
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Curl the container from the host via the veth
+    println!("Curling http://{pod_ip}:5678/ ...");
+    let curl_result = run_cmd("curl", &[
+        "-s", "--connect-timeout", "5",
+        &format!("http://{pod_ip}:5678/"),
+    ]);
+    let (curl_ok, curl_output) = curl_result;
+    println!("curl output: {curl_output}");
+    assert!(curl_ok, "curl failed: {curl_output}");
+    assert!(
+        curl_output.contains("integration-test-ok"),
+        "unexpected response: {curl_output}"
+    );
+    println!("✅ HTTP connectivity verified!");
+
+    // Release VM
+    let resp = rpc("ReleaseSandbox", &serde_json::json!({"vm_id": vm_id}));
+    assert!(resp.get("error").is_none(), "release error: {resp}");
+
+    // Clean up netns
+    let _ = run_cmd("ip", &["link", "delete", veth_host]);
+    let _ = run_cmd("ip", &["netns", "delete", netns_name]);
+    println!("Cleaned up test netns");
+}
+
+/// Run a command and return (success, combined output).
+fn run_cmd(cmd: &str, args: &[&str]) -> (bool, String) {
+    match std::process::Command::new(cmd)
+        .args(args)
+        .output()
+    {
+        Ok(output) => {
+            let out = String::from_utf8_lossy(&output.stdout).to_string()
+                + &String::from_utf8_lossy(&output.stderr);
+            (output.status.success(), out.trim().to_string())
+        }
+        Err(e) => (false, format!("exec error: {e}")),
+    }
+}
+
+/// Run a command and panic on failure.
+fn run_cmd_ok(cmd: &str, args: &[&str]) {
+    let (ok, out) = run_cmd(cmd, args);
+    assert!(ok, "{} {} failed: {}", cmd, args.join(" "), out);
+}
+
+/// Base64 encode bytes (no external dep needed — test-only).
+fn base64_encode(data: &[u8]) -> String {
+    use std::fmt::Write;
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity(data.len() * 4 / 3 + 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        result.push(CHARS[(n >> 18 & 63) as usize] as char);
+        result.push(CHARS[(n >> 12 & 63) as usize] as char);
+        if chunk.len() > 1 {
+            result.push(CHARS[(n >> 6 & 63) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(CHARS[(n & 63) as usize] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    result
 }
