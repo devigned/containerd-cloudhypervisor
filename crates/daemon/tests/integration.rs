@@ -65,7 +65,10 @@ fn test_acquire_release_cycle() {
     let initial_ready = status["pool_ready"].as_u64().unwrap();
     let initial_active = status["active_vms"].as_u64().unwrap();
     assert!(initial_ready > 0, "pool must have ready VMs");
-    println!("Initial pool: {} ready, {} active", initial_ready, initial_active);
+    println!(
+        "Initial pool: {} ready, {} active",
+        initial_ready, initial_active
+    );
 
     // Acquire
     let t0 = Instant::now();
@@ -395,22 +398,29 @@ fn test_pod_http_connectivity() {
     run_cmd_ok("ip", &["netns", "add", netns_name]);
     run_cmd_ok(
         "ip",
-        &["link", "add", veth_host, "type", "veth", "peer", "name", veth_peer],
+        &[
+            "link", "add", veth_host, "type", "veth", "peer", "name", veth_peer,
+        ],
     );
-    run_cmd_ok(
-        "ip",
-        &["link", "set", veth_peer, "netns", netns_name],
-    );
+    run_cmd_ok("ip", &["link", "set", veth_peer, "netns", netns_name]);
     // Rename inside netns to eth0 (what the daemon expects)
     run_cmd_ok(
         "ip",
-        &["netns", "exec", netns_name, "ip", "link", "set", veth_peer, "name", veth_ns],
+        &[
+            "netns", "exec", netns_name, "ip", "link", "set", veth_peer, "name", veth_ns,
+        ],
     );
 
     // Configure host side
     run_cmd_ok(
         "ip",
-        &["addr", "add", &format!("{host_ip}/{prefix}"), "dev", veth_host],
+        &[
+            "addr",
+            "add",
+            &format!("{host_ip}/{prefix}"),
+            "dev",
+            veth_host,
+        ],
     );
     run_cmd_ok("ip", &["link", "set", veth_host, "up"]);
 
@@ -418,13 +428,22 @@ fn test_pod_http_connectivity() {
     run_cmd_ok(
         "ip",
         &[
-            "netns", "exec", netns_name,
-            "ip", "addr", "add", &format!("{pod_ip}/{prefix}"), "dev", veth_ns,
+            "netns",
+            "exec",
+            netns_name,
+            "ip",
+            "addr",
+            "add",
+            &format!("{pod_ip}/{prefix}"),
+            "dev",
+            veth_ns,
         ],
     );
     run_cmd_ok(
         "ip",
-        &["netns", "exec", netns_name, "ip", "link", "set", veth_ns, "up"],
+        &[
+            "netns", "exec", netns_name, "ip", "link", "set", veth_ns, "up",
+        ],
     );
     run_cmd_ok(
         "ip",
@@ -434,8 +453,7 @@ fn test_pod_http_connectivity() {
     run_cmd_ok(
         "ip",
         &[
-            "netns", "exec", netns_name,
-            "ip", "route", "add", "default", "via", host_ip,
+            "netns", "exec", netns_name, "ip", "route", "add", "default", "via", host_ip,
         ],
     );
 
@@ -479,16 +497,10 @@ fn test_pod_http_connectivity() {
         }),
     );
     let acquire_ms = t0.elapsed().as_millis();
-    assert!(
-        resp.get("error").is_none(),
-        "acquire error: {}",
-        resp
-    );
+    assert!(resp.get("error").is_none(), "acquire error: {}", resp);
     let vm_id = resp["vm_id"].as_str().unwrap().to_string();
     let container_pid = resp["container_pid"].as_u64().unwrap_or(0);
-    println!(
-        "Acquired: vm_id={vm_id} container_pid={container_pid} in {acquire_ms}ms"
-    );
+    println!("Acquired: vm_id={vm_id} container_pid={container_pid} in {acquire_ms}ms");
     assert!(container_pid > 0, "container should be running");
 
     // Wait for http-echo to start listening
@@ -496,10 +508,15 @@ fn test_pod_http_connectivity() {
 
     // Curl the container from the host via the veth
     println!("Curling http://{pod_ip}:5678/ ...");
-    let curl_result = run_cmd("curl", &[
-        "-s", "--connect-timeout", "5",
-        &format!("http://{pod_ip}:5678/"),
-    ]);
+    let curl_result = run_cmd(
+        "curl",
+        &[
+            "-s",
+            "--connect-timeout",
+            "5",
+            &format!("http://{pod_ip}:5678/"),
+        ],
+    );
     let (curl_ok, curl_output) = curl_result;
     println!("curl output: {curl_output}");
     assert!(curl_ok, "curl failed: {curl_output}");
@@ -521,10 +538,7 @@ fn test_pod_http_connectivity() {
 
 /// Run a command and return (success, combined output).
 fn run_cmd(cmd: &str, args: &[&str]) -> (bool, String) {
-    match std::process::Command::new(cmd)
-        .args(args)
-        .output()
-    {
+    match std::process::Command::new(cmd).args(args).output() {
         Ok(output) => {
             let out = String::from_utf8_lossy(&output.stdout).to_string()
                 + &String::from_utf8_lossy(&output.stderr);

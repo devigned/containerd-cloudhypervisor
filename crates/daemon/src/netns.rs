@@ -74,8 +74,7 @@ pub fn activate_tap(netns_path: &str, tap_name: &str) -> Result<()> {
         let nl = Netlink::open().context("netlink")?;
         let tap_idx = nl.get_link_index(tap_name).context("TAP index")?;
         nl.set_link_up(tap_idx).context("TAP up")?;
-        let (_, veth_idx, _, _) =
-            retry(20, 100, || nl.find_veth(tap_name)).context("find veth")?;
+        let (_, veth_idx, _, _) = retry(20, 100, || nl.find_veth(tap_name)).context("find veth")?;
         nl.add_ingress_qdisc(veth_idx).context("ingress veth")?;
         nl.add_redirect_filter(veth_idx, tap_idx)
             .context("redir veth→tap")?;

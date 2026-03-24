@@ -130,10 +130,7 @@ async fn handle_acquire(
     agents: &AgentRegistry,
     request: &serde_json::Value,
 ) -> serde_json::Value {
-    let netns = request
-        .get("netns")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let netns = request.get("netns").and_then(|v| v.as_str()).unwrap_or("");
     let image_key = request
         .get("image_key")
         .and_then(|v| v.as_str())
