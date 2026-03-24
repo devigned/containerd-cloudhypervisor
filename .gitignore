@@ -5,8 +5,12 @@ vmlinux*
 rootfs.erofs
 cloudhv-agent
 containerd-shim-cloudhv-v1
+cloudhv-sandbox-daemon
 mkfs.erofs
 containerd-cloudhypervisor.raw
+
+# sysext bakery may be used for local sysext testing
+sysext-bakery
 
 # Cargo lock for binaries is committed
 # Cargo.lock
