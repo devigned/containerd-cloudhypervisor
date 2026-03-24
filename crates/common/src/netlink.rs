@@ -145,6 +145,19 @@ impl Netlink {
         Ok(i32_at(&r, 20) as u32)
     }
 
+    /// Move a network interface to a different network namespace.
+    /// `netns_fd` must be an open fd to the target netns.
+    pub fn set_link_netns_fd(&self, idx: u32, netns_fd: i32) -> Result<()> {
+        // RTM_SETLINK + IFLA_NET_NS_FD (28)
+        let total = 16 + 16 + 8;
+        let mut m = vec![0u8; total];
+        nlhdr(&mut m, total, 16, 5, self.seq());
+        m[20..24].copy_from_slice(&(idx as i32).to_ne_bytes());
+        put_nla(&mut m[32..], 28, 4);
+        m[36..40].copy_from_slice(&netns_fd.to_ne_bytes());
+        self.request(&m)
+    }
+
     pub fn set_link_up(&self, idx: u32) -> Result<()> {
         let mut m = vec![0u8; 32];
         nlhdr(&mut m, 32, 16, 5, self.seq());
@@ -712,4 +725,26 @@ pub fn find_ipv4_nla(data: &[u8], target: u16) -> Option<Ipv4Addr> {
         off += (len + 3) & !3;
     }
     None
+}
+
+/// Create a persistent TAP device in the current network namespace.
+pub fn create_tap(name: &str) -> Result<()> {
+    let c = std::ffi::CString::new("/dev/net/tun")?;
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("open /dev/net/tun");
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut ifr = [0u8; 40];
+    let b = name.as_bytes();
+    ifr[..b.len().min(15)].copy_from_slice(&b[..b.len().min(15)]);
+    // IFF_TAP | IFF_NO_PI
+    ifr[16..18].copy_from_slice(&(0x0002i16 | 0x1000i16).to_ne_bytes());
+    if unsafe { libc::ioctl(fd.as_raw_fd(), 0x400454ca as _, ifr.as_ptr()) } < 0 {
+        return Err(std::io::Error::last_os_error()).context("TUNSETIFF");
+    }
+    if unsafe { libc::ioctl(fd.as_raw_fd(), 0x400454cb as _, 1i32) } < 0 {
+        return Err(std::io::Error::last_os_error()).context("TUNSETPERSIST");
+    }
+    Ok(())
 }

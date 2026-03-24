@@ -10,7 +10,6 @@ name = "containerd-shim-cloudhv-v1"
 path = "src/main.rs"
 
 [dependencies]
-cloudhv-proto = { workspace = true }
 cloudhv-common = { workspace = true }
 
 # containerd shim protocol (via shimkit, without libcontainer/libseccomp/dbus)
@@ -22,8 +21,6 @@ containerd-client = "0.8.0"
 # Async runtime
 tokio = { workspace = true }
 
-# RPC
-ttrpc = { workspace = true }
 
 # Error handling
 anyhow = { workspace = true }

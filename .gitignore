@@ -40,3 +40,4 @@ guest/rootfs/rootfs/
 __.SYMDEF
 lib.rmeta
 *.rcgu.o
+typescript

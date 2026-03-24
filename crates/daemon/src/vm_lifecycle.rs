@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use log::info;
+use log::{info, warn};
 use tokio::net::UnixStream;
 use tokio::process::Command;
 
@@ -91,14 +91,30 @@ pub async fn boot_vm(
 /// Spawn a Cloud Hypervisor process. Returns PID.
 pub async fn spawn_ch(config: &DaemonConfig, state_dir: &Path) -> Result<u32> {
     let api_socket = state_dir.join("api.sock");
-    let mut child = Command::new(&config.cloud_hypervisor_binary)
-        .arg("--api-socket")
+    let mut cmd = Command::new(&config.cloud_hypervisor_binary);
+    cmd.arg("--api-socket")
         .arg(&api_socket)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("spawn cloud-hypervisor")?;
+        .stderr(std::process::Stdio::null());
+
+    // Reset the signal mask before exec. The daemon's tokio runtime blocks
+    // SIGTERM/SIGINT which CH inherits, preventing CH's signal handler from
+    // receiving them. Clear the mask so CH can handle signals normally.
+    unsafe {
+        cmd.pre_exec(|| {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            if libc::sigemptyset(&mut set) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::sigprocmask(libc::SIG_SETMASK, &set, std::ptr::null_mut()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = cmd.spawn().context("spawn cloud-hypervisor")?;
 
     let pid = child.id().context("get CH pid")?;
     // Spawn a background task to reap the child when it exits, avoiding
@@ -268,19 +284,43 @@ pub fn prepare_snapshot(
 }
 
 /// Shutdown and destroy a VM.
-pub async fn shutdown_and_destroy(api_socket: &Path, ch_pid: u32, state_dir: &Path) {
-    // Try graceful shutdown
-    let _ = api_request(api_socket, "PUT", "/api/v1/vm.shutdown", None).await;
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+pub async fn shutdown_and_destroy(_api_socket: &Path, ch_pid: u32, state_dir: &Path) {
+    let t0 = std::time::Instant::now();
 
-    // Force kill if still running
+    // Send SIGTERM to CH. CH handles SIGTERM by shutting down the VM and
+    // exiting cleanly (requires signal mask to be cleared in spawn_ch).
+    unsafe {
+        libc::kill(ch_pid as i32, libc::SIGTERM);
+    }
+
+    // Wait for CH to exit gracefully
+    let proc_path = format!("/proc/{ch_pid}");
+    for _ in 0..200 {
+        if !std::path::Path::new(&proc_path).exists() {
+            info!(
+                "VM {} exited gracefully in {}ms",
+                ch_pid,
+                t0.elapsed().as_millis()
+            );
+            let _ = std::fs::remove_dir_all(state_dir);
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // Fallback: force kill if CH did not exit within 1s
+    warn!(
+        "VM {} did not exit after {}ms, force killing",
+        ch_pid,
+        t0.elapsed().as_millis()
+    );
     unsafe {
         libc::kill(ch_pid as i32, libc::SIGKILL);
     }
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-    // Clean up state directory
     let _ = std::fs::remove_dir_all(state_dir);
+    info!("VM {} destroyed in {}ms", ch_pid, t0.elapsed().as_millis());
 }
 
 /// Send an HTTP request to the CH API socket using hyper.
