@@ -378,6 +378,7 @@ fn test_pod_http_connectivity() {
 
     let netns_name = "cloudhv-test-net";
     let veth_host = "veth-test-h";
+    let veth_peer = "veth-test-p";
     let veth_ns = "eth0";
     let pod_ip = "10.99.0.2";
     let host_ip = "10.99.0.1";
@@ -386,16 +387,22 @@ fn test_pod_http_connectivity() {
     // Clean up any leftover test netns
     let _ = run_cmd("ip", &["netns", "delete", netns_name]);
     let _ = run_cmd("ip", &["link", "delete", veth_host]);
+    let _ = run_cmd("ip", &["link", "delete", veth_peer]);
 
     // Create netns and veth pair
     run_cmd_ok("ip", &["netns", "add", netns_name]);
     run_cmd_ok(
         "ip",
-        &["link", "add", veth_host, "type", "veth", "peer", "name", veth_ns],
+        &["link", "add", veth_host, "type", "veth", "peer", "name", veth_peer],
     );
     run_cmd_ok(
         "ip",
-        &["link", "set", veth_ns, "netns", netns_name],
+        &["link", "set", veth_peer, "netns", netns_name],
+    );
+    // Rename inside netns to eth0 (what the daemon expects)
+    run_cmd_ok(
+        "ip",
+        &["netns", "exec", netns_name, "ip", "link", "set", veth_peer, "name", veth_ns],
     );
 
     // Configure host side
